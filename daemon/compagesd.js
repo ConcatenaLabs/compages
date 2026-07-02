@@ -37,6 +37,18 @@ async function main() {
     throw new Error(`vault operator is ${operator}, but our key is ${eth.wallet.address}`);
   }
   const chainInfo = await seq.node("getblockchaininfo");
+  // Load our wallet if the node has it on disk but not loaded (e.g. after a
+  // node restart), so a reboot never strands the bridge.
+  try {
+    await seq.call("getwalletinfo");
+  } catch {
+    try {
+      await seq.node("loadwallet", { filename: cfg.seqWallet });
+      log(`loaded Sequentia wallet '${cfg.seqWallet}'`);
+    } catch (e) {
+      throw new Error(`Sequentia wallet '${cfg.seqWallet}' is not loaded and could not be loaded: ${e.message}`);
+    }
+  }
   const walletInfo = await seq.call("getwalletinfo");
   log(
     `Compages starting: ${cfg.ethChainName} (chain ${cfg.ethChainId}, vault ${cfg.vaultAddress}, operator ${eth.wallet.address})` +
