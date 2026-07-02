@@ -231,7 +231,7 @@ if (process.env.REGISTRY_URL) {
   const [, ticker, name, precision] = minimal[minted1.assetId];
   check("bridged MUSD registered as ticker MUSD.e", ticker === "MUSD.e", ticker);
   check("registry precision is 8", precision === 8, `${precision}`);
-  check("registry name records the Ethereum origin", /bridged from/i.test(name), name);
+  check("registry name is concise with origin marker", name === "Mock USD (anvil)", name);
   check("bridged ETH registered as ticker ETH.e", minimal[minted3.assetId]?.[1] === "ETH.e", minimal[minted3.assetId]?.[1]);
 
   // The asset was issued committed to SHA256(canonical-JSON(contract)), so the

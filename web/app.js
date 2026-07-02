@@ -182,7 +182,8 @@ function renderChips() {
     box.appendChild(b);
   };
   mk("ETH", "eth");
-  for (const a of assets) mk(a.symbol, a.token);
+  // ETH is already shown above; skip the eth-bridged asset so it isn't listed twice.
+  for (const a of assets) if (a.token !== "eth") mk(a.symbol, a.token);
 }
 
 function updateDepositButton() {

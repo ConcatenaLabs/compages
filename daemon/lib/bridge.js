@@ -295,15 +295,12 @@ export class Bridge {
     return this._issuerPubkey;
   }
 
-  /** The registry contract (metadata) for a bridged token. The name records the
-   *  Ethereum origin; the ticker is suffixed ".e" to mark it bridged. */
+  /** The registry contract (metadata) for a bridged token. The name is the
+   *  token's own name with a concise origin marker; the ".e" ticker and the
+   *  bridge's entity domain already convey that it is Ethereum-bridged. */
   async buildAssetContract(meta) {
-    const origin =
-      meta.symbol === "ETH"
-        ? `Ether bridged from ${this.cfg.ethChainName} via Compages`
-        : `${meta.name} bridged from ${this.cfg.ethChainName} via Compages`;
     return {
-      name: origin.slice(0, 255),
+      name: `${meta.name} (${this.cfg.ethChainName})`.slice(0, 255),
       ticker: bridgedTicker(meta.symbol),
       precision: 8, // bridged assets are issued with 8 decimals on Sequentia
       entity: { domain: this.cfg.assetDomain || "compages.invalid" },
@@ -338,12 +335,25 @@ export class Bridge {
   }
 
   /** Retry registry registration for any bridged asset not yet registered
-   *  (registry was down/misconfigured when it was first issued). */
+   *  (registry was down when first issued, or the asset predates this feature).
+   *  Assets issued before registry integration have no stored contract; build
+   *  one from their recorded metadata so they get a label too. Their on-chain
+   *  contract_hash predates the scheme, so those are operator-asserted (admin)
+   *  entries — consistent with how the admin path already registers. */
   async registerPendingAssets() {
     if (!this.cfg.registryUrl) return;
     for (const m of Object.values(this.state.data.mappings)) {
-      if (m.registered || !m.contract) continue;
+      if (m.registered) continue;
       try {
+        if (!m.contract) {
+          m.contract = await this.buildAssetContract({
+            symbol: m.symbol,
+            name: m.name,
+            decimals: m.decimals,
+          });
+          m.contractHash = contractHash(m.contract);
+          this.state.save();
+        }
         await this.registerAsset(m);
       } catch (e) {
         this.log(`asset ${m.assetId}: registry retry failed: ${e.message}`);
