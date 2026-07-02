@@ -1,18 +1,18 @@
 {
   "ethChainName": "Sepolia",
   "ethChainId": 11155111,
-  "ethRpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "ethRpcUrl": "https://sepolia.drpc.org",
   "vaultAddress": "0x0000000000000000000000000000000000000000",
   "vaultDeployBlock": 0,
   "ethConfirmations": 5,
   "ethLogChunk": 5000,
   "operatorKeyFile": "operator.key",
 
-  "seqRpcUrl": "http://user:pass@127.0.0.1:18886",
+  "seqRpcUrl": "http://user:pass@127.0.0.1:18443",
   "seqWallet": "compages",
   "seqChainLabel": "sequentia-testnet",
   "seqConfirmations": 10,
-  "seqFeeAsset": "bitcoin",
+  "seqFeeAsset": "<hex asset id or label of any accepted fee asset the bridge wallet holds; no need for the Sequence token>",
 
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
