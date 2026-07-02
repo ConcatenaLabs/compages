@@ -9,8 +9,13 @@ const SEL = {
 };
 
 const $ = (id) => document.getElementById(id);
+// Resolve the API relative to this module's own URL, so the app works whether
+// it is served at the site root (local daemon) or behind a path prefix such as
+// /bridge/ (reverse-proxied in production). import.meta.url is the absolute URL
+// of app.js, e.g. https://host/bridge/app.js -> API root https://host/bridge/api/.
+const API_ROOT = new URL("api/", import.meta.url);
 const api = async (path, opts) => {
-  const res = await fetch(`/api/${path}`, opts);
+  const res = await fetch(new URL(path, API_ROOT), opts);
   const body = await res.json();
   if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
   return body;
