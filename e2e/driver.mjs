@@ -130,12 +130,9 @@ check("two bridged assets now", assets.length === 2, `${assets.length}`);
 // ---------------- test 4: redemption releases the original ERC-20 ----------------
 console.log("\n-- redeem 30 MUSD-asset back to Ethereum");
 // the user wallet needs a little of the fee asset to pay the Sequentia fee
-const userFeeAddr = await seqRpc("getnewaddress", {}, "user");
-await seqRpc("sendtoaddress", { address: userFeeAddr, amount: 1 }, "compages");
-await waitFor("user fee funds confirmed", async () =>
-  ((await seqRpc("getbalance", {}, "user"))["bitcoin"] ?? 0) >= 1 ? 1 : null
-);
-
+// The user already holds FEEX (funded by the miner in run-e2e.sh) and pays
+// its own redeem-send fee in FEEX too; no participant but the miner ever
+// touches the policy asset.
 const intent = await api("redeem", {
   method: "POST",
   headers: { "content-type": "application/json" },
@@ -145,7 +142,7 @@ console.log(`redemption address: ${intent.seqAddress}`);
 const recvBefore = await musd.balanceOf(RECEIVER);
 await seqRpc(
   "sendtoaddress",
-  { address: intent.seqAddress, amount: 30, assetlabel: minted1.assetId, fee_asset_label: "bitcoin" },
+  { address: intent.seqAddress, amount: 30, assetlabel: minted1.assetId, fee_asset_label: process.env.FEEX },
   "user"
 );
 
@@ -175,6 +172,15 @@ await waitFor("refund executed", async () => {
 });
 const userMusdAfter = await musd.balanceOf(user.address);
 check("undeliverable deposit fully refunded on Ethereum", userMusdAfter === userMusdBefore);
+
+// ---------------- test 6: the bridge never touched the policy asset --------
+console.log("\n-- fee-asset independence: bridge paid every fee in FEEX, never the policy asset");
+const bridgeBal = await seqRpc("getbalance", {}, "compages");
+check(
+  "bridge wallet holds zero policy asset (all fees paid in FEEX)",
+  (bridgeBal["bitcoin"] ?? 0) === 0,
+  `policy balance ${bridgeBal["bitcoin"] ?? 0}`
+);
 
 // ---------------- summary ----------------
 clearInterval(miner);

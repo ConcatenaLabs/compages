@@ -70,12 +70,27 @@ echo "== starting Sequentia elementsregtest node"
   -con_any_asset_fees=1 -server -daemon -printtoconsole=0
 for _ in $(seq 1 100); do seqcli getblockcount >/dev/null 2>&1 && break; sleep 0.3; done
 
-seqcli createwallet compages >/dev/null
-seqcli createwallet user >/dev/null
-# fund the bridge wallet with block subsidy (matures after 100 blocks)
-MINE_ADDR=$(seqcli -rpcwallet=compages getnewaddress)
+seqcli createwallet miner  >/dev/null   # holds the policy asset (block subsidy)
+seqcli createwallet compages >/dev/null  # the bridge: will hold ONLY a non-policy fee asset
+seqcli createwallet user   >/dev/null
+# Mine the block subsidy into the miner wallet (matures after 100 blocks).
+MINE_ADDR=$(seqcli -rpcwallet=miner getnewaddress)
 seqcli generatetoaddress 110 "$MINE_ADDR" >/dev/null
-echo "   bridge wallet balance: $(seqcli -rpcwallet=compages getbalance | tr -d ' \n')"
+
+# The miner issues a dedicated fee asset FEEX (paying that one bootstrap fee in
+# the policy asset), registers it as an accepted fee asset on the node, then
+# funds the bridge and the user with FEEX. From here on NOTHING but the miner
+# holds the policy asset, so if any bridge step secretly needed it, it fails.
+FEEX=$(seqcli -rpcwallet=miner issueasset 1000000 0 false | python3 -c "import json,sys;print(json.load(sys.stdin)['asset'])")
+seqcli setfeeexchangerates "{\"$FEEX\": 100000000}" >/dev/null
+seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
+BRIDGE_FEE_ADDR=$(seqcli -rpcwallet=compages getnewaddress)
+USER_FEE_ADDR=$(seqcli -rpcwallet=user getnewaddress)
+seqcli -rpcwallet=miner sendtoaddress "$BRIDGE_FEE_ADDR" 100000 "" "" false false 1 unset false "$FEEX" >/dev/null
+seqcli -rpcwallet=miner sendtoaddress "$USER_FEE_ADDR"   1000  "" "" false false 1 unset false "$FEEX" >/dev/null
+seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
+echo "   FEEX asset: $FEEX"
+echo "   bridge wallet holds ONLY FEEX: $(seqcli -rpcwallet=compages getbalance | tr -d ' \n')"
 
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
@@ -92,7 +107,7 @@ cat > "$RUN/config.json" <<EOF
   "seqWallet": "compages",
   "seqChainLabel": "elementsregtest",
   "seqConfirmations": 2,
-  "seqFeeAsset": "bitcoin",
+  "seqFeeAsset": "$FEEX",
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -109,7 +124,7 @@ kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log";
 
 echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
-VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY \
+VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
 node "$HERE/driver.mjs"
 RC=$?

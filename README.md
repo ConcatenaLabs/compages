@@ -94,10 +94,19 @@ forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL \
 
 ## Sequentia-side notes
 
-- **Fees**: Sequentia has an open fee market; transactions can pay fees in
-  any accepted asset, and the wallet defaults to the asset being sent. A
-  freshly bridged asset has no exchange rate on the node yet, so the daemon
-  pins `fee_asset_label` to `seqFeeAsset` on every send.
+- **Fees**: Sequentia has an open fee market; fees are payable in any accepted
+  asset and no asset (including the Sequence token) is privileged. The bridge
+  pays every fee — issuance, reissuance, delivery and the redeem-side burn — in
+  the single asset named by `seqFeeAsset`, whatever the operator chooses; it
+  never needs the policy asset. Pinning the fee asset explicitly is also
+  necessary because the wallet would otherwise default the fee to the asset
+  being sent, and a freshly bridged asset has no exchange rate on the node yet.
+  The end-to-end test proves this by funding the bridge with only a non-policy
+  fee asset and asserting its policy-asset balance stays zero throughout.
+- **Burning in any fee asset**: `destroyamount` only pays its fee in the policy
+  asset, so the redeem-side burn is built as a raw transaction (a `burn` output
+  for the bridged asset plus a fee output in `seqFeeAsset`), blinded, signed and
+  broadcast by the daemon.
 - **Reissuance tokens stay confidential**: consensus accepts a reissuance
   only when the reissuance-token input carries a commitment asset tag, so
   the daemon keeps each asset's reissuance token on a blinded (confidential)

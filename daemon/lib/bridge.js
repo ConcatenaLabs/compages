@@ -163,6 +163,7 @@ export class Bridge {
           assetamount: satsToAmount(sats),
           tokenamount: 1,
           blind: false,
+          ...(this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {}),
         });
       } catch (e) {
         if (typeof e.code === "number") return this.deferMint(dep, "pendingIssue", e);
@@ -208,6 +209,7 @@ export class Bridge {
         re = await this.seq.call("reissueasset", {
           asset: mapping.assetId,
           assetamount: satsToAmount(sats),
+          ...(this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {}),
         });
       } catch (e) {
         if (typeof e.code === "number") return this.deferMint(dep, "pendingMint", e);
@@ -289,6 +291,45 @@ export class Bridge {
       ...(this.cfg.seqFeeAsset ? { fee_asset_label: this.cfg.seqFeeAsset } : {}),
     });
     this.log(`re-blinded reissuance token for ${mapping.symbol} in ${txid}`);
+  }
+
+  /** Destroy (burn) `sats` of `assetId`, keeping circulating supply equal to
+   *  the funds locked on Ethereum. When a fee asset is configured the burn is
+   *  built as a raw transaction paying its fee in that asset, so the bridge
+   *  never needs the policy asset; otherwise it falls back to destroyamount
+   *  (which pays its fee in the policy asset). Returns the burn txid. */
+  async destroyAsset(assetId, sats) {
+    const amount = satsToAmount(sats);
+    if (!this.cfg.seqFeeAsset) {
+      return this.seq.call("destroyamount", { asset: assetId, amount });
+    }
+    // No preset inputs: the any-asset-fee coin selector rejects them, so let
+    // the node choose the asset inputs to burn and the fee-asset inputs.
+    const base = await this.seq.call("createrawtransaction", {
+      inputs: [],
+      outputs: [{ burn: amount, asset: assetId }],
+    });
+    const funded = await this.seq.call("fundrawtransaction", {
+      hexstring: base,
+      options: { fee_asset: this.cfg.seqFeeAsset },
+    });
+    // The wallet gives its change outputs blinding nonces even when receive
+    // addresses are transparent, so blind before signing or the node rejects
+    // the tx ("output has nonce, but is not blinded").
+    const blinded = await this.seq.call("blindrawtransaction", {
+      hexstring: funded.hex,
+      ignoreblindfail: true,
+    });
+    const signed = await this.seq.call("signrawtransactionwithwallet", {
+      hexstring: blinded,
+    });
+    if (!signed.complete) throw new Error("burn transaction signing incomplete");
+    const txid = await this.seq.call("sendrawtransaction", { hexstring: signed.hex });
+    if (!(await this.waitWalletTxVisible(txid))) {
+      await this.seq.call("abandontransaction", { txid }).catch(() => {});
+      throw new Error("burn transaction never reached the mempool");
+    }
+    return txid;
   }
 
   /** Step 4: send the minted amount to the depositor's Sequentia address. */
@@ -497,10 +538,7 @@ export class Bridge {
 
     if (rec.status === "released") {
       try {
-        const burnTxid = await this.seq.call("destroyamount", {
-          asset: rec.assetId,
-          amount: satsToAmount(rec.sats),
-        });
+        const burnTxid = await this.destroyAsset(rec.assetId, rec.sats);
         rec.destroyTxid = burnTxid;
         mapping.mintedSats = (BigInt(mapping.mintedSats) - BigInt(rec.sats)).toString();
         rec.status = "done";
