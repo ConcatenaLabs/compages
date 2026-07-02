@@ -75,6 +75,7 @@ async function main() {
     try {
       await bridge.processDeposits();
       await bridge.retryDeposits();
+      await bridge.registerPendingAssets();
       await bridge.processRefunds();
       await bridge.processRedemptions();
       await bridge.advanceRedemptions();

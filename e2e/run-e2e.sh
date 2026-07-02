@@ -17,6 +17,9 @@ ANVIL_PORT=8545
 SEQ_RPC=18892
 SEQ_P2P=18893
 API_PORT=9950
+REGISTRY_PORT=13005
+REGISTRY_REPO="${REGISTRY_REPO:-$HOME/sequentia-registry}"
+REGISTRY_TOKEN=e2e-admin-token
 
 # anvil's deterministic test accounts
 OPERATOR_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
@@ -29,6 +32,7 @@ seqcli() { "$ELC" -datadir="$RUN/seq" -chain=elementsregtest -rpcport=$SEQ_RPC -
 cleanup() {
   set +e
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+  [ -n "${REGISTRY_PID:-}" ] && kill "$REGISTRY_PID" 2>/dev/null
   seqcli stop >/dev/null 2>&1
   [ -n "${ANVIL_PID:-}" ] && kill "$ANVIL_PID" 2>/dev/null
   sleep 1
@@ -92,6 +96,21 @@ seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
 echo "   FEEX asset: $FEEX"
 echo "   bridge wallet holds ONLY FEEX: $(seqcli -rpcwallet=compages getbalance | tr -d ' \n')"
 
+echo "== starting the Sequentia Asset Registry"
+# admin-seed path (REQUIRE_DOMAIN_PROOF=0, no electrs needed for legacy seed).
+if [ -f "$REGISTRY_REPO/server.js" ]; then
+  PORT=$REGISTRY_PORT DB_DIR="$RUN/registry-db" SEED_FILE=/dev/null \
+    ADMIN_TOKEN=$REGISTRY_TOKEN REQUIRE_DOMAIN_PROOF=0 SEQ_ELECTRS_URL=http://127.0.0.1:1 \
+    node "$REGISTRY_REPO/server.js" > "$RUN/registry.log" 2>&1 &
+  REGISTRY_PID=$!
+  for _ in $(seq 1 40); do curl -s "http://127.0.0.1:$REGISTRY_PORT/health" >/dev/null 2>&1 && break; sleep 0.25; done
+  REGISTRY_URL="http://127.0.0.1:$REGISTRY_PORT"
+  echo "   registry up: $(curl -s http://127.0.0.1:$REGISTRY_PORT/health)"
+else
+  echo "   (registry repo not found at $REGISTRY_REPO; skipping registry checks)"
+  REGISTRY_URL=""
+fi
+
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
 {
@@ -108,6 +127,9 @@ cat > "$RUN/config.json" <<EOF
   "seqChainLabel": "elementsregtest",
   "seqConfirmations": 2,
   "seqFeeAsset": "$FEEX",
+  "registryUrl": "$REGISTRY_URL",
+  "registryAdminToken": "$REGISTRY_TOKEN",
+  "assetDomain": "bridge.compages.test",
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -126,6 +148,7 @@ echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
+REGISTRY_URL=$REGISTRY_URL \
 node "$HERE/driver.mjs"
 RC=$?
 

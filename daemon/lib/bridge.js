@@ -16,12 +16,46 @@
 // If the daemon dies between a chain write and its acknowledgment, the record
 // halts in a *_manual state for operator review instead of double-paying.
 
+import crypto from "node:crypto";
 import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
 import { unitsToSats, satsToUnits } from "./eth.js";
 
 // Per-asset money cap on Sequentia chains (21M * 1e8 sats).
 export const SEQ_MAX_SATS = 2_100_000_000_000_000n;
+
+// Canonical JSON exactly as the Sequentia Asset Registry computes it (object
+// keys sorted lexicographically, no insignificant whitespace). The registry
+// binds metadata to an asset by requiring the asset's on-chain contract_hash to
+// equal SHA256(canonical-JSON(contract)), so the bridge must issue each asset
+// with this exact hash for the metadata to be verifiable.
+export function canonicalizeContract(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalizeContract).join(",") + "]";
+  if (v && typeof v === "object") {
+    return (
+      "{" +
+      Object.keys(v)
+        .sort()
+        .map((k) => JSON.stringify(k) + ":" + canonicalizeContract(v[k]))
+        .join(",") +
+      "}"
+    );
+  }
+  return JSON.stringify(v);
+}
+
+export function contractHash(contract) {
+  return crypto.createHash("sha256").update(canonicalizeContract(contract), "utf8").digest("hex");
+}
+
+// Turn an ERC-20 symbol into a registry ticker: uppercase, keep only [A-Z0-9.-],
+// and suffix ".e" to mark it Ethereum-bridged (and avoid colliding with a native
+// asset of the same symbol). Registry tickers are 1..12 chars.
+export function bridgedTicker(symbol) {
+  let base = String(symbol || "").toUpperCase().replace(/[^A-Z0-9.-]/g, "");
+  if (!base) base = "TOKEN";
+  return `${base.slice(0, 10)}.e`;
+}
 
 export function tokenKeyOf(chainId, token) {
   return token === "eth" || token === ethers.ZeroAddress
@@ -155,6 +189,11 @@ export class Bridge {
     // 3. First bridge of this token: issue a brand-new reissuable asset with
     //    exactly the deposit amount. Later deposits: reissue the same asset.
     if (!mapping) {
+      // Build the registry contract up front and issue the asset committed to
+      // its hash, so the metadata is bound on-chain and independently verifiable.
+      const contract = await this.buildAssetContract(meta);
+      const ch = contractHash(contract);
+
       dep.steps.pendingIssue = true;
       this.state.save();
       let issued;
@@ -163,6 +202,7 @@ export class Bridge {
           assetamount: satsToAmount(sats),
           tokenamount: 1,
           blind: false,
+          contract_hash: ch,
           ...(this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {}),
         });
       } catch (e) {
@@ -186,6 +226,9 @@ export class Bridge {
         issueTxid: issued.txid,
         firstDepositNonce: dep.nonce,
         mintedSats: sats.toString(),
+        contract,
+        contractHash: ch,
+        registered: false,
         createdAt: new Date().toISOString(),
       };
       s.mappings[dep.tokenKey] = mapping;
@@ -193,7 +236,11 @@ export class Bridge {
       dep.steps.issueTxid = issued.txid;
       this.state.save();
       this.log(
-        `deposit #${dep.nonce}: issued NEW Sequentia asset ${issued.asset} for ${meta.symbol} (${dep.tokenKey})`
+        `deposit #${dep.nonce}: issued NEW Sequentia asset ${issued.asset} for ${meta.symbol} as ${contract.ticker} (${dep.tokenKey})`
+      );
+      // Best-effort: label it in the asset registry. Never blocks the mint.
+      await this.registerAsset(mapping).catch((e) =>
+        this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
       );
     } else {
       // Consensus only accepts a reissuance whose token input carries a
@@ -233,6 +280,75 @@ export class Bridge {
     dep.assetId = mapping.assetId;
 
     await this.sendMinted(dep, mapping);
+  }
+
+  // ---- Asset Registry integration --------------------------------------
+
+  /** A compressed pubkey the bridge wallet controls, for the registry contract's
+   *  issuer_pubkey field (cached; any valid non-zero pubkey the issuer holds). */
+  async issuerPubkey() {
+    if (this._issuerPubkey) return this._issuerPubkey;
+    const addr = await this.seq.call("getnewaddress", { label: "compages-issuer" });
+    const info = await this.seq.call("getaddressinfo", { address: addr });
+    if (!info.pubkey) throw new Error("wallet returned no pubkey for the issuer address");
+    this._issuerPubkey = info.pubkey;
+    return this._issuerPubkey;
+  }
+
+  /** The registry contract (metadata) for a bridged token. The name records the
+   *  Ethereum origin; the ticker is suffixed ".e" to mark it bridged. */
+  async buildAssetContract(meta) {
+    const origin =
+      meta.symbol === "ETH"
+        ? `Ether bridged from ${this.cfg.ethChainName} via Compages`
+        : `${meta.name} bridged from ${this.cfg.ethChainName} via Compages`;
+    return {
+      name: origin.slice(0, 255),
+      ticker: bridgedTicker(meta.symbol),
+      precision: 8, // bridged assets are issued with 8 decimals on Sequentia
+      entity: { domain: this.cfg.assetDomain || "compages.invalid" },
+      issuer_pubkey: await this.issuerPubkey(),
+      version: 0,
+    };
+  }
+
+  /** Register (or refresh) an asset's metadata in the Sequentia Asset Registry
+   *  so every surface (wallet, explorer, DEX, node GUI) shows a ticker and name
+   *  instead of a raw asset id. Uses the operator admin endpoint when a token is
+   *  configured (the path the native assets use), else the public verify-on-chain
+   *  endpoint. The asset was issued committed to contractHash(contract), so the
+   *  binding is on-chain-verifiable regardless of which endpoint is used. */
+  async registerAsset(mapping) {
+    if (!this.cfg.registryUrl || !mapping.contract) return;
+    const base = this.cfg.registryUrl.replace(/\/$/, "");
+    const admin = !!this.cfg.registryAdminToken;
+    const res = await fetch(admin ? `${base}/admin/seed` : `${base}/`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(admin ? { authorization: `Bearer ${this.cfg.registryAdminToken}` } : {}),
+      },
+      body: JSON.stringify({ asset_id: mapping.assetId, contract: mapping.contract }),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`registry ${res.status}: ${text.slice(0, 200)}`);
+    mapping.registered = true;
+    this.state.save();
+    this.log(`asset ${mapping.assetId}: registered in the asset registry as ${mapping.contract.ticker}`);
+  }
+
+  /** Retry registry registration for any bridged asset not yet registered
+   *  (registry was down/misconfigured when it was first issued). */
+  async registerPendingAssets() {
+    if (!this.cfg.registryUrl) return;
+    for (const m of Object.values(this.state.data.mappings)) {
+      if (m.registered || !m.contract) continue;
+      try {
+        await this.registerAsset(m);
+      } catch (e) {
+        this.log(`asset ${m.assetId}: registry retry failed: ${e.message}`);
+      }
+    }
   }
 
   /** A mint step failed before anything landed on chain: safe to retry. */

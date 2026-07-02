@@ -13,6 +13,10 @@
   "seqChainLabel": "sequentia-testnet",
   "seqConfirmations": 1,
   "btcAnchorConfirmations": 3,
+
+  "registryUrl": "http://127.0.0.1:3005",
+  "registryAdminToken": "<Asset Registry ADMIN_TOKEN; omit to use the public verify-on-chain endpoint instead>",
+  "assetDomain": "bridge.example.com",
   "seqFeeAsset": "<hex asset id or label of any accepted fee asset the bridge wallet holds; no need for the Sequence token>",
 
   "apiHost": "127.0.0.1",
