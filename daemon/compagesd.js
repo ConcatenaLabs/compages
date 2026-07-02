@@ -77,6 +77,7 @@ async function main() {
       await bridge.retryDeposits();
       await bridge.processRefunds();
       await bridge.processRedemptions();
+      await bridge.advanceRedemptions();
       await bridge.retryRedemptions();
     } catch (e) {
       log(`tick error: ${e.message}`);

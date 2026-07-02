@@ -392,6 +392,10 @@ async function refreshRedemptions(seqAddress) {
     el.className = "event";
     let state, cls;
     switch (ev.status) {
+      case "awaiting_finality":
+        state = "waiting for Bitcoin-anchor finality" + (ev.finality ? ` (${ev.finality})` : "");
+        cls = "wait";
+        break;
       case "new":
       case "releasing":
         state = "releasing on " + status.ethChainName;

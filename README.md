@@ -53,12 +53,30 @@ decimal places, so a token with `d > 8` decimals bridges at a granularity of
    address (one API call; the front-end does it in one click).
 2. They send the bridged asset to that address from any Sequentia wallet; no
    special transaction format is needed.
-3. After N confirmations on the active chain the daemon releases the locked
-   ether or tokens from the vault to the bound Ethereum address, then
+3. Once the burn is **final under Bitcoin anchoring**, the daemon releases the
+   locked ether or tokens from the vault to the bound Ethereum address, then
    destroys the returned Sequentia amount.
 
 Only assets that were bridged in can be redeemed; Compages never mints
 Ethereum-side representations of Sequentia-native assets.
+
+### Finality of a redemption is measured against Bitcoin, not Sequentia blocks
+
+Releasing on Ethereum is irreversible, so the burn that triggers it must be
+final. On Sequentia, **Bitcoin anchoring is the supreme consensus rule**: every
+Sequentia block references a Bitcoin block, and if that Bitcoin block is
+reorged the Sequentia block is discarded in real time — no matter how many
+Sequentia blocks were built on top. A burn buried under many Sequentia blocks
+can therefore still be undone by a Bitcoin reorg.
+
+So the release gate is the burn's **Bitcoin-anchor depth**, not a Sequentia
+block count: `depth = getanchorstatus.anchorheight − getblockheader(burnBlock).anchorheight`,
+required to reach `btcAnchorConfirmations` (default 6). Because consecutive
+Sequentia blocks share a Bitcoin anchor, this depth advances only as Bitcoin
+advances — which is precisely the finality that protects the release. The gate
+also requires the node's `anchorstatus` to be `"ok"` and, when the node reports
+it, the burn block to be committee-certified. On a chain without anchoring
+(e.g. regtest) it falls back to a Sequentia-confirmation count.
 
 ## Layout
 

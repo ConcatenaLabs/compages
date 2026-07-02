@@ -453,7 +453,7 @@ export class Bridge {
       if (tx.category !== "receive") continue;
       const intent = s.redeemIntents[tx.address];
       if (!intent) continue;
-      if (tx.confirmations < this.cfg.seqConfirmations) continue; // next pass
+      if (tx.confirmations < 1) continue; // needs a block before we can read its anchor
       const key = `${tx.txid}:${tx.vout}`;
       if (s.redemptions[key]) continue;
 
@@ -465,7 +465,7 @@ export class Bridge {
         ethAddress: intent.ethAddress,
         assetId: tx.asset,
         sats: amountToSats(tx.amount).toString(),
-        status: "new",
+        status: "awaiting_finality",
         createdAt: new Date().toISOString(),
       };
       s.redemptions[key] = rec;
@@ -477,6 +477,76 @@ export class Bridge {
     // it reappears on the next call, so shallower entries are never lost.
     s.seqLastBlockHash = res.lastblock;
     this.state.save();
+  }
+
+  /** Re-evaluate redemptions still waiting for the burn to become final, so a
+   *  burn that has since accrued enough Bitcoin-anchor depth gets released even
+   *  if no new redemption arrived this tick. */
+  async advanceRedemptions() {
+    for (const rec of Object.values(this.state.data.redemptions)) {
+      if (rec.status !== "awaiting_finality") continue;
+      try {
+        await this.handleRedemption(rec);
+      } catch (e) {
+        this.log(`redemption ${rec.key}: advance failed: ${e.message}`);
+      }
+    }
+  }
+
+  /** Finality of a burn for the purpose of an IRREVERSIBLE Ethereum release.
+   *
+   *  Bitcoin anchoring is supreme on Sequentia: a block whose Bitcoin anchor is
+   *  reorged is discarded in real time, regardless of how many Sequentia blocks
+   *  sit on top. So the burn is only final once its Bitcoin anchor is buried
+   *  deep enough that a Bitcoin reorg cannot orphan it — a Sequentia block count
+   *  is NOT a sufficient measure. Depth = (node's current anchor height) minus
+   *  (the burn block's anchor height); it advances only as Bitcoin advances,
+   *  which is exactly the finality we want. Also requires the node's anchor
+   *  status to be "ok" and, when the node reports it, the block to be
+   *  committee-certified (immediately final on the Sequentia axis).
+   *
+   *  On a chain without Bitcoin anchoring (e.g. regtest) there is no anchor to
+   *  wait on, so it falls back to a Sequentia-confirmation count. */
+  async burnFinality(txid, blockhash) {
+    const gt = await this.seq.call("gettransaction", { txid });
+    // A reorged/conflicted burn shows <1 (often negative) confirmations: never
+    // final, so a reverted burn can never trigger a release.
+    if (!gt.blockhash || gt.confirmations < 1) {
+      return { final: false, reason: `burn not confirmed (${gt.confirmations} conf)` };
+    }
+
+    let anchor = null;
+    try {
+      anchor = await this.seq.node("getanchorstatus");
+    } catch {
+      anchor = null; // chain built without Bitcoin anchoring
+    }
+    if (!anchor || anchor.validateanchor === false) {
+      const need = this.cfg.seqConfirmations ?? 6;
+      return {
+        final: gt.confirmations >= need,
+        reason: `no Bitcoin anchoring; ${gt.confirmations}/${need} Sequentia confirmations`,
+      };
+    }
+    if (anchor.anchorstatus !== "ok") {
+      return { final: false, reason: `node anchor status is ${anchor.anchorstatus}` };
+    }
+
+    const hdr = await this.seq.call("getblockheader", {
+      blockhash: gt.blockhash,
+      verbose: true,
+    });
+    // poscertified is feature-detected: enforce it only when the node reports it
+    // (null on nodes/chains that predate committee certification).
+    if (hdr.poscertified === false) {
+      return { final: false, reason: "burn block not yet committee-certified" };
+    }
+    const depth = Number(anchor.anchorheight) - Number(hdr.anchorheight);
+    const need = this.cfg.btcAnchorConfirmations ?? 6;
+    return {
+      final: depth >= need,
+      reason: `${depth}/${need} Bitcoin-anchor confirmations`,
+    };
   }
 
   async handleRedemption(rec) {
@@ -500,17 +570,19 @@ export class Bridge {
     }
     rec.amountUnits = units.toString();
 
-    // Re-verify the redemption is still confirmed on the active chain right
-    // before paying out; Sequentia follows Bitcoin reorgs in real time, so a
-    // conflicted tx shows negative confirmations here.
-    const gt = await this.seq.call("gettransaction", { txid: rec.txid });
-    if (gt.confirmations < this.cfg.seqConfirmations) {
-      delete s.redemptions[rec.key]; // let a future (re)scan decide
+    // Gate the irreversible release on the burn's Bitcoin-anchor finality, not
+    // a Sequentia block count (anchoring is supreme; see burnFinality).
+    const fin = await this.burnFinality(rec.txid);
+    rec.finality = fin.reason;
+    if (!fin.final) {
+      rec.status = "awaiting_finality";
       this.state.save();
-      this.log(`redemption ${rec.key}: no longer confirmed (${gt.confirmations}), postponed`);
+      this.log(`redemption ${rec.key}: awaiting finality — ${fin.reason}`);
       return;
     }
 
+    rec.status = "new";
+    this.state.save();
     await this.releaseRedemption(rec, mapping);
   }
 

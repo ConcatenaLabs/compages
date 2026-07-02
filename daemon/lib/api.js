@@ -114,6 +114,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           seqChainLabel: cfg.seqChainLabel,
           ethConfirmations: cfg.ethConfirmations,
           seqConfirmations: cfg.seqConfirmations,
+          btcAnchorConfirmations: cfg.btcAnchorConfirmations ?? 6,
           maxSatsPerAsset: SEQ_MAX_SATS.toString(),
           bridgedAssets: Object.keys(state.data.mappings).length,
           deposits: Object.keys(state.data.deposits).length,
@@ -153,7 +154,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(200, {
           seqAddress,
           ethAddress,
-          note: `Send any bridged asset to this Sequentia address from any wallet. After ${cfg.seqConfirmations} confirmations the locked funds are released to ${ethAddress} on ${cfg.ethChainName}.`,
+          note: `Send any bridged asset to this Sequentia address from any wallet. Once the burn is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 6} Bitcoin-anchor confirmations), the locked funds are released to ${ethAddress} on ${cfg.ethChainName}. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
         });
       }
 

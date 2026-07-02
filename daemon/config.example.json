@@ -11,7 +11,8 @@
   "seqRpcUrl": "http://user:pass@127.0.0.1:18443",
   "seqWallet": "compages",
   "seqChainLabel": "sequentia-testnet",
-  "seqConfirmations": 10,
+  "seqConfirmations": 1,
+  "btcAnchorConfirmations": 6,
   "seqFeeAsset": "<hex asset id or label of any accepted fee asset the bridge wallet holds; no need for the Sequence token>",
 
   "apiHost": "127.0.0.1",
