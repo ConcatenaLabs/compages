@@ -597,14 +597,34 @@ export class Bridge {
         rec.status = "releasing";
         this.state.save();
         const tokenAddr = rec.tokenKey.endsWith(":eth") ? ethers.ZeroAddress : mapping.token;
-        const tx = await this.eth.vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
-        await tx.wait(1);
-        rec.releaseTxHash = tx.hash;
-        rec.status = "released";
-        this.state.save();
-        this.log(
-          `redemption ${rec.key}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${tx.hash}`
-        );
+        try {
+          const tx = await this.eth.vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
+          await tx.wait(1);
+          rec.releaseTxHash = tx.hash;
+          rec.status = "released";
+          this.state.save();
+          this.log(
+            `redemption ${rec.key}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${tx.hash}`
+          );
+        } catch (e) {
+          // A CALL_EXCEPTION with revert data is a deterministic contract
+          // rejection (e.g. the recipient rejects ETH -> EtherTransferFailed,
+          // or a token transfer fails): retrying can't help, so flag it for the
+          // operator instead of looping forever. The burn already happened, so
+          // the returned amount is safe in the bridge wallet pending manual
+          // resolution. Transient errors (network/RPC) rethrow and are retried.
+          if (e?.code === "CALL_EXCEPTION" && typeof e.data === "string") {
+            rec.status = "release_failed_manual";
+            rec.error = `release reverted (${e.data})`;
+            this.state.save();
+            this.log(`redemption ${rec.key}: release reverted (${e.data}); flagged for operator, not retrying`);
+            return;
+          }
+          // transient (network/RPC): leave status "releasing" so
+          // retryRedemptions re-drives it (it reconciles against the on-chain
+          // processedRedemptions guard first).
+          throw e;
+        }
       }
     }
 

@@ -415,6 +415,10 @@ async function refreshRedemptions(seqAddress) {
         state = "not a bridged asset; contact the operator";
         cls = "bad";
         break;
+      case "release_failed_manual":
+        state = "release rejected by the recipient address; contact the operator";
+        cls = "bad";
+        break;
       default:
         state = ev.status;
         cls = "wait";
