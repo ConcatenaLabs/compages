@@ -1,0 +1,21 @@
+{
+  "ethChainName": "Sepolia",
+  "ethChainId": 11155111,
+  "ethRpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "vaultAddress": "0x0000000000000000000000000000000000000000",
+  "vaultDeployBlock": 0,
+  "ethConfirmations": 5,
+  "ethLogChunk": 5000,
+  "operatorKeyFile": "operator.key",
+
+  "seqRpcUrl": "http://user:pass@127.0.0.1:18886",
+  "seqWallet": "compages",
+  "seqChainLabel": "sequentia-testnet",
+  "seqConfirmations": 10,
+  "seqFeeAsset": "bitcoin",
+
+  "apiHost": "127.0.0.1",
+  "apiPort": 9950,
+  "pollIntervalMs": 15000,
+  "stateFile": "state/compages-state.json"
+}

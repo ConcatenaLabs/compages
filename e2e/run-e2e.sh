@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Compages end-to-end test: anvil (local Ethereum) + Sequentia elementsregtest
+# + the real daemon + real contract deployments, driven by driver.mjs.
+#
+# Requires: foundry (anvil/forge/cast), node >= 20, a Sequentia build
+# (elementsd/elements-cli), the daemon's node_modules installed.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(dirname "$HERE")"
+RUN="$HERE/run"
+SEQ_REPO="${SEQ_REPO:-$HOME/SequentiaByClaude}"
+ELD="$SEQ_REPO/build-linux/src/elementsd"
+ELC="$SEQ_REPO/build-linux/src/elements-cli"
+
+ANVIL_PORT=8545
+SEQ_RPC=18892
+SEQ_P2P=18893
+API_PORT=9950
+
+# anvil's deterministic test accounts
+OPERATOR_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+OPERATOR_ADDR=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+USER_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+USER_ADDR=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+
+seqcli() { "$ELC" -datadir="$RUN/seq" -chain=elementsregtest -rpcport=$SEQ_RPC -rpcuser=e2e -rpcpassword=e2e "$@"; }
+
+cleanup() {
+  set +e
+  [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+  seqcli stop >/dev/null 2>&1
+  [ -n "${ANVIL_PID:-}" ] && kill "$ANVIL_PID" 2>/dev/null
+  sleep 1
+}
+trap cleanup EXIT
+
+rm -rf "$RUN"
+mkdir -p "$RUN/seq"
+
+echo "== starting anvil"
+anvil --port $ANVIL_PORT --block-time 1 --silent &
+ANVIL_PID=$!
+for _ in $(seq 1 50); do
+  cast block-number --rpc-url http://127.0.0.1:$ANVIL_PORT >/dev/null 2>&1 && break
+  sleep 0.2
+done
+
+echo "== deploying CompagesVault + MockERC20"
+cd "$REPO/contracts"
+VAULT=$(forge create src/CompagesVault.sol:CompagesVault \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args $OPERATOR_ADDR \
+  | awk '/Deployed to:/ {print $3}')
+MUSD=$(forge create test/mocks/MockTokens.sol:MockERC20 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args "Mock USD" "MUSD" 6 \
+  | awk '/Deployed to:/ {print $3}')
+[ -n "$VAULT" ] && [ -n "$MUSD" ] || { echo "deploy failed"; exit 1; }
+echo "   vault: $VAULT   musd: $MUSD"
+cast send "$MUSD" "mint(address,uint256)" $USER_ADDR 1000000000 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
+
+echo "== starting Sequentia elementsregtest node"
+"$ELD" -datadir="$RUN/seq" -chain=elementsregtest \
+  -rpcport=$SEQ_RPC -port=$SEQ_P2P -rpcuser=e2e -rpcpassword=e2e \
+  -validatepegin=0 -con_blocksubsidy=5000000000 \
+  -signblockscript=51 -blindedaddresses=0 -con_default_blinded_addresses=0 \
+  -fallbackfee=0.0001 -walletrbf=1 -txindex=1 -acceptnonstdtxn=1 \
+  -con_any_asset_fees=1 -server -daemon -printtoconsole=0
+for _ in $(seq 1 100); do seqcli getblockcount >/dev/null 2>&1 && break; sleep 0.3; done
+
+seqcli createwallet compages >/dev/null
+seqcli createwallet user >/dev/null
+# fund the bridge wallet with block subsidy (matures after 100 blocks)
+MINE_ADDR=$(seqcli -rpcwallet=compages getnewaddress)
+seqcli generatetoaddress 110 "$MINE_ADDR" >/dev/null
+echo "   bridge wallet balance: $(seqcli -rpcwallet=compages getbalance | tr -d ' \n')"
+
+echo "== writing daemon config"
+cat > "$RUN/config.json" <<EOF
+{
+  "ethChainName": "anvil",
+  "ethChainId": 31337,
+  "ethRpcUrl": "http://127.0.0.1:$ANVIL_PORT",
+  "vaultAddress": "$VAULT",
+  "vaultDeployBlock": 1,
+  "ethConfirmations": 2,
+  "ethLogChunk": 5000,
+  "operatorKeyFile": "operator.key",
+  "seqRpcUrl": "http://e2e:e2e@127.0.0.1:$SEQ_RPC",
+  "seqWallet": "compages",
+  "seqChainLabel": "elementsregtest",
+  "seqConfirmations": 2,
+  "seqFeeAsset": "bitcoin",
+  "apiHost": "127.0.0.1",
+  "apiPort": $API_PORT,
+  "pollIntervalMs": 1500,
+  "stateFile": "state.json"
+}
+EOF
+echo "$OPERATOR_KEY" > "$RUN/operator.key"
+
+echo "== starting compagesd"
+node "$REPO/daemon/compagesd.js" "$RUN/config.json" > "$RUN/daemon.log" 2>&1 &
+DAEMON_PID=$!
+sleep 2
+kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log"; exit 1; }
+
+echo "== running driver"
+ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
+VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY \
+SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
+node "$HERE/driver.mjs"
+RC=$?
+
+echo "== daemon log tail"
+tail -20 "$RUN/daemon.log"
+exit $RC

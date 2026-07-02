@@ -1,0 +1,13 @@
+{
+  "name": "compages-daemon",
+  "version": "0.1.0",
+  "description": "Compages: centralized bridge daemon between Ethereum and the Sequentia network",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node compagesd.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}

@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Compages: bridge Ethereum and Sequentia</title>
+<style>
+  :root {
+    --ink: #0b0e11;
+    --panel: #131820;
+    --panel2: #0f141b;
+    --line: #242c36;
+    --text: #e9ecef;
+    --muted: #93a0ac;
+    --gold: #ffc629;
+    --ether: #8b95fc;
+    --ok: #57c98a;
+    --warn: #ff6f61;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --serif: Georgia, "Times New Roman", serif;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: var(--ink); color: var(--text); }
+  body {
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 16px 64px;
+  }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button { font: inherit; cursor: pointer; }
+  input {
+    font: inherit;
+    color: var(--text);
+    background: var(--panel2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+    width: 100%;
+  }
+  input:focus { outline: 2px solid var(--gold); outline-offset: -1px; border-color: transparent; }
+  input.mono { font-family: var(--mono); font-size: 13.5px; }
+
+  /* header: wordmark as a coupling */
+  header { text-align: center; margin-bottom: 30px; }
+  .wordmark {
+    font-size: 30px;
+    letter-spacing: .34em;
+    font-weight: 650;
+    text-indent: .34em;
+  }
+  .wordmark .pin { color: var(--gold); }
+  .etym {
+    font-family: var(--serif);
+    font-style: italic;
+    color: var(--muted);
+    margin-top: 6px;
+    font-size: 15.5px;
+  }
+  .nets {
+    margin-top: 14px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .net { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; }
+  .net.eth { border-color: color-mix(in srgb, var(--ether) 45%, transparent); color: var(--ether); }
+  .net.seq { border-color: color-mix(in srgb, var(--gold) 45%, transparent); color: var(--gold); }
+  .nets .beam { color: var(--gold); letter-spacing: -1px; }
+
+  /* console */
+  .console { width: 100%; max-width: 640px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  /* direction: two plates joined by the gold pin */
+  .direction { display: grid; grid-template-columns: 1fr auto 1fr; align-items: stretch; border-bottom: 1px solid var(--line); }
+  .plate {
+    background: var(--panel2);
+    border: 0;
+    color: var(--muted);
+    padding: 14px 8px;
+    font-size: 14px;
+    letter-spacing: .02em;
+  }
+  .plate.active { background: var(--panel); color: var(--text); font-weight: 600; }
+  .plate small { display: block; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .joint {
+    width: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--panel2);
+    position: relative;
+  }
+  .joint::before, .joint::after {
+    content: "";
+    position: absolute;
+    left: 0; right: 0;
+    height: 1px;
+    background: var(--line);
+  }
+  .joint::before { top: 30%; }
+  .joint::after { bottom: 30%; }
+  .joint .pin-dot {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--gold);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--gold) 22%, transparent);
+    z-index: 1;
+  }
+
+  .body { padding: 22px; display: flex; flex-direction: column; gap: 18px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 7px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+  .chip {
+    border: 1px solid var(--line);
+    background: var(--panel2);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  .chip.sel { border-color: var(--gold); color: var(--gold); }
+
+  .tokencard {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel2);
+    padding: 12px 14px;
+    font-size: 13.5px;
+  }
+  .tokencard .sym { font-weight: 650; font-size: 15px; }
+  .tokencard .mono { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-family: var(--mono);
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-left: 8px;
+    vertical-align: 1px;
+  }
+  .badge.new { background: color-mix(in srgb, var(--gold) 16%, transparent); color: var(--gold); }
+  .badge.known { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .note { color: var(--muted); font-size: 13px; }
+  .note strong { color: var(--text); font-weight: 600; }
+
+  .action {
+    background: var(--gold);
+    color: #141002;
+    border: 0;
+    border-radius: 10px;
+    padding: 13px;
+    font-weight: 700;
+    font-size: 15px;
+    width: 100%;
+  }
+  .action:disabled { background: var(--line); color: var(--muted); cursor: default; }
+  .action.secondary { background: transparent; border: 1px solid var(--line); color: var(--text); }
+
+  /* progress truss */
+  .truss { display: none; margin-top: 4px; }
+  .truss.on { display: block; }
+  .truss .spans { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .span-seg { height: 6px; border-radius: 3px; background: var(--line); position: relative; overflow: hidden; }
+  .span-seg.active::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--gold) 55%, transparent), transparent);
+    animation: sweep 1.4s linear infinite;
+  }
+  @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+  .span-seg.done { background: var(--gold); }
+  .truss .labels { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 7px; }
+  .truss .labels div { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .truss .labels div.done { color: var(--gold); }
+  @media (prefers-reduced-motion: reduce) { .span-seg.active::after { animation: none; } }
+
+  .statusline { font-size: 13px; color: var(--muted); font-family: var(--mono); word-break: break-all; }
+  .statusline.err { color: var(--warn); }
+  .statusline a { word-break: break-all; }
+
+  .bigaddr {
+    border: 1px dashed color-mix(in srgb, var(--gold) 55%, transparent);
+    background: color-mix(in srgb, var(--gold) 6%, transparent);
+    border-radius: 10px;
+    padding: 14px;
+    font-family: var(--mono);
+    font-size: 14px;
+    word-break: break-all;
+    text-align: center;
+  }
+  .copybtn {
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    border-radius: 7px;
+    padding: 4px 12px;
+    font-size: 12px;
+  }
+  .copybtn:hover { color: var(--gold); border-color: var(--gold); }
+
+  .events { display: flex; flex-direction: column; gap: 8px; }
+  .event {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 13px;
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .event .mono { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .state { font-family: var(--mono); font-size: 12px; }
+  .state.ok { color: var(--ok); }
+  .state.wait { color: var(--gold); }
+  .state.bad { color: var(--warn); }
+
+  footer {
+    max-width: 640px;
+    margin-top: 26px;
+    color: var(--muted);
+    font-size: 12.5px;
+    text-align: center;
+    line-height: 1.7;
+  }
+  footer .mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wordmark">COMPA<span class="pin">&#9679;</span>GES</div>
+  <div class="etym">comp&#257;g&#275;s: a joining together; a framework</div>
+  <div class="nets">
+    <span class="net eth" id="net-eth">Sepolia</span>
+    <span class="beam">&#9552;&#9552;&#9679;&#9552;&#9552;</span>
+    <span class="net seq" id="net-seq">Sequentia testnet</span>
+  </div>
+</header>
+
+<main class="console">
+  <div class="card">
+    <div class="direction" role="tablist">
+      <button class="plate active" id="tab-dep" role="tab" aria-selected="true">
+        Ethereum &#8594; Sequentia
+        <small>lock, then mint</small>
+      </button>
+      <div class="joint" aria-hidden="true"><div class="pin-dot"></div></div>
+      <button class="plate" id="tab-red" role="tab" aria-selected="false">
+        Sequentia &#8594; Ethereum
+        <small>return, then release</small>
+      </button>
+    </div>
+
+    <!-- deposit panel -->
+    <div class="body" id="panel-dep">
+      <div class="field">
+        <label>Ethereum wallet</label>
+        <div class="row">
+          <button class="action secondary" id="btn-connect" style="width:auto;padding:9px 16px">Connect wallet</button>
+          <span class="statusline" id="wallet-line"></span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Asset to bridge</label>
+        <div class="row" id="asset-chips"></div>
+        <div style="margin-top:9px">
+          <input class="mono" id="token-input" placeholder="or paste any ERC-20 contract address (0x&hellip;)" spellcheck="false">
+        </div>
+        <div class="tokencard hide" id="token-card" style="margin-top:10px"></div>
+      </div>
+
+      <div class="field">
+        <label>Amount</label>
+        <input class="mono" id="amount-input" placeholder="0.0" inputmode="decimal" spellcheck="false">
+        <div class="note" id="amount-note" style="margin-top:6px"></div>
+      </div>
+
+      <div class="field">
+        <label>Destination address on Sequentia</label>
+        <input class="mono" id="seqaddr-input" placeholder="tb1&hellip; (your Sequentia wallet address)" spellcheck="false">
+      </div>
+
+      <button class="action" id="btn-deposit" disabled>Deposit</button>
+      <div class="statusline" id="dep-status"></div>
+
+      <div class="truss" id="dep-truss">
+        <div class="spans">
+          <div class="span-seg" id="seg-0"></div>
+          <div class="span-seg" id="seg-1"></div>
+          <div class="span-seg" id="seg-2"></div>
+          <div class="span-seg" id="seg-3"></div>
+        </div>
+        <div class="labels">
+          <div id="lab-0">deposit sent</div>
+          <div id="lab-1">confirming</div>
+          <div id="lab-2">minting on Sequentia</div>
+          <div id="lab-3">delivered</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- redeem panel -->
+    <div class="body hide" id="panel-red">
+      <div class="note">
+        Send a bridged asset back to unlock the original on Ethereum.
+        Create a redemption address bound to your Ethereum address, then send
+        the bridged asset to it from any Sequentia wallet. Once the transfer is
+        confirmed on the Sequentia chain, the vault releases the locked funds.
+      </div>
+
+      <div class="field">
+        <label>Bridged assets you can return</label>
+        <div class="events" id="red-assets"><span class="note">none bridged yet</span></div>
+      </div>
+
+      <div class="field">
+        <label>Your Ethereum address (receives the released funds)</label>
+        <input class="mono" id="ethaddr-input" placeholder="0x&hellip;" spellcheck="false">
+      </div>
+
+      <button class="action" id="btn-intent">Create redemption address</button>
+      <div class="statusline" id="red-status"></div>
+
+      <div class="hide" id="red-result">
+        <div class="field">
+          <label>Send the bridged asset to this Sequentia address</label>
+          <div class="bigaddr" id="red-addr"></div>
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="copybtn" id="btn-copy">copy address</button>
+          </div>
+          <div class="note" id="red-note" style="margin-top:10px"></div>
+        </div>
+        <div class="field">
+          <label>Redemptions on this address</label>
+          <div class="events" id="red-events"><span class="note">nothing received yet</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <div>
+    Compages is a centralized proof-of-concept bridge between Ethereum and the
+    Sequentia network. Deposits are locked in a vault contract; minting on
+    Sequentia and releases on Ethereum are performed by the bridge operator.
+    You are trusting that operator.
+  </div>
+  <div style="margin-top:6px">
+    Vault: <span class="mono" id="vault-line">&hellip;</span>
+  </div>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

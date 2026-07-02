@@ -1,0 +1,11 @@
+# secrets and runtime state: never committed
+daemon/config.json
+daemon/operator.key
+daemon/*.key
+daemon/state/
+e2e/run/
+
+node_modules/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
