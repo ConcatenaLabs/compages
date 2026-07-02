@@ -71,12 +71,20 @@ can therefore still be undone by a Bitcoin reorg.
 
 So the release gate is the burn's **Bitcoin-anchor depth**, not a Sequentia
 block count: `depth = getanchorstatus.anchorheight − getblockheader(burnBlock).anchorheight`,
-required to reach `btcAnchorConfirmations` (default 6). Because consecutive
-Sequentia blocks share a Bitcoin anchor, this depth advances only as Bitcoin
-advances — which is precisely the finality that protects the release. The gate
-also requires the node's `anchorstatus` to be `"ok"` and, when the node reports
-it, the burn block to be committee-certified. On a chain without anchoring
-(e.g. regtest) it falls back to a Sequentia-confirmation count.
+required to reach `btcAnchorConfirmations`. Because consecutive Sequentia blocks
+share a Bitcoin anchor, this depth advances only as Bitcoin advances — which is
+precisely the finality that protects the release. The gate also requires the
+node's `anchorstatus` to be `"ok"` and, when the node reports it, the burn block
+to be committee-certified. On a chain without anchoring (e.g. regtest) it falls
+back to a Sequentia-confirmation count.
+
+Choosing `btcAnchorConfirmations`: it must exceed the deepest Bitcoin reorg you
+are willing to tolerate. On **mainnet**, 3 is a reasonable default (a 3-block
+Bitcoin reorg is already very rare). On the **testnet4 PoC it is set to 100**,
+because testnet4 permits unusually deep reorgs (its min-difficulty rule lets a
+miner rewrite long stretches), so a shallow depth would be unsafe there. Deeper
+means slower redemptions (each confirmation is ~one Bitcoin block), which is the
+honest cost of anchored finality.
 
 ## Layout
 

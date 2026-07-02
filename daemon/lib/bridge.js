@@ -542,7 +542,7 @@ export class Bridge {
       return { final: false, reason: "burn block not yet committee-certified" };
     }
     const depth = Number(anchor.anchorheight) - Number(hdr.anchorheight);
-    const need = this.cfg.btcAnchorConfirmations ?? 6;
+    const need = this.cfg.btcAnchorConfirmations ?? 3;
     return {
       final: depth >= need,
       reason: `${depth}/${need} Bitcoin-anchor confirmations`,

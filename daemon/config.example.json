@@ -12,7 +12,7 @@
   "seqWallet": "compages",
   "seqChainLabel": "sequentia-testnet",
   "seqConfirmations": 1,
-  "btcAnchorConfirmations": 6,
+  "btcAnchorConfirmations": 3,
   "seqFeeAsset": "<hex asset id or label of any accepted fee asset the bridge wallet holds; no need for the Sequence token>",
 
   "apiHost": "127.0.0.1",
