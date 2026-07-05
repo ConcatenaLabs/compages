@@ -305,6 +305,10 @@
         <input class="mono" id="seqaddr-input" placeholder="tb1&hellip; (your Sequentia wallet address)" spellcheck="false">
       </div>
 
+      <!-- T4: pre-commit preview (receive amount, fee, ETA) shown before the
+           irreversible on-chain deposit. -->
+      <div class="tokencard hide" id="dep-preview" style="display:flex;flex-direction:column;gap:5px"></div>
+
       <button class="action" id="btn-deposit" disabled>Deposit</button>
       <div class="statusline" id="dep-status"></div>
 
@@ -322,6 +326,16 @@
           <div id="lab-3">delivered</div>
         </div>
       </div>
+
+      <!-- T11: rehydrate tracking after a refresh (the daemon can look a deposit
+           up by its Ethereum transaction hash). -->
+      <div class="field" style="margin-top:6px">
+        <label>Track an existing deposit</label>
+        <div class="row">
+          <input class="mono" id="resume-dep-input" placeholder="Ethereum transaction hash (0x&hellip;)" spellcheck="false" style="flex:1;min-width:0">
+          <button class="action secondary" id="btn-resume-dep" style="width:auto;padding:10px 16px">Track</button>
+        </div>
+      </div>
     </div>
 
     <!-- redeem panel -->
@@ -329,8 +343,14 @@
       <div class="note">
         Send a bridged asset back to unlock the original on Ethereum.
         Create a redemption address bound to your Ethereum address, then send
-        the bridged asset to it from any Sequentia wallet. Once the transfer is
-        confirmed on the Sequentia chain, the vault releases the locked funds.
+        the bridged asset to it from any Sequentia wallet.
+        <strong>The vault releases the locked funds only after the return
+        transaction's Bitcoin anchor is buried deep enough that a Bitcoin reorg
+        cannot undo it</strong>, not simply once the transfer confirms on
+        Sequentia. On Sequentia, Bitcoin anchoring is the supreme consensus rule,
+        so a confirmed Sequentia transaction can still be reversed until its
+        Bitcoin anchor is final.
+        <span id="red-gate-note"></span>
       </div>
 
       <div class="field">
@@ -345,6 +365,16 @@
 
       <button class="action" id="btn-intent">Create redemption address</button>
       <div class="statusline" id="red-status"></div>
+
+      <!-- T11: rehydrate a redemption after a refresh (look it up by the
+           redemption address the daemon issued). -->
+      <div class="field" style="margin-top:6px">
+        <label>Resume a redemption</label>
+        <div class="row">
+          <input class="mono" id="resume-red-input" placeholder="your redemption address (tb1&hellip;)" spellcheck="false" style="flex:1;min-width:0">
+          <button class="action secondary" id="btn-resume-red" style="width:auto;padding:10px 16px">Look up</button>
+        </div>
+      </div>
 
       <div class="hide" id="red-result">
         <div class="field">

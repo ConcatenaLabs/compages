@@ -489,6 +489,21 @@ export class Bridge {
       }
       throw e;
     }
+    // T8: never mark a deposit "delivered" until the final send is actually
+    // relayed. The wallet can return a txid for a tx the chain rejected (the
+    // issue/reissue/burn steps already guard this) — so confirm mempool/block
+    // visibility before "minted". If it never shows, roll back and retry rather
+    // than reporting a delivery that did not happen.
+    if (!(await this.waitWalletTxVisible(sendTxid))) {
+      await this.seq.call("abandontransaction", { txid: sendTxid }).catch(() => {});
+      delete dep.steps.pendingSend;
+      dep.attempts = (dep.attempts ?? 0) + 1;
+      dep.status = dep.attempts > 10 ? "failed_manual" : "send_retry";
+      dep.error = "send transaction never reached the mempool";
+      this.state.save();
+      this.log(`deposit #${dep.nonce}: send not visible (attempt ${dep.attempts}), will retry`);
+      return;
+    }
     delete dep.steps.pendingSend;
     dep.steps.sendTxid = sendTxid;
     dep.status = "minted";

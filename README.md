@@ -65,14 +65,14 @@ Ethereum-side representations of Sequentia-native assets.
 Releasing on Ethereum is irreversible, so the burn that triggers it must be
 final. On Sequentia, **Bitcoin anchoring is the supreme consensus rule**: every
 Sequentia block references a Bitcoin block, and if that Bitcoin block is
-reorged the Sequentia block is discarded in real time — no matter how many
+reorged the Sequentia block is discarded in real time, no matter how many
 Sequentia blocks were built on top. A burn buried under many Sequentia blocks
 can therefore still be undone by a Bitcoin reorg.
 
 So the release gate is the burn's **Bitcoin-anchor depth**, not a Sequentia
 block count: `depth = getanchorstatus.anchorheight − getblockheader(burnBlock).anchorheight`,
 required to reach `btcAnchorConfirmations`. Because consecutive Sequentia blocks
-share a Bitcoin anchor, this depth advances only as Bitcoin advances — which is
+share a Bitcoin anchor, this depth advances only as Bitcoin advances, which is
 precisely the finality that protects the release. The gate also requires the
 node's `anchorstatus` to be `"ok"` and, when the node reports it, the burn block
 to be committee-certified. On a chain without anchoring (e.g. regtest) it falls
@@ -107,8 +107,8 @@ node compagesd.js config.json
 
 The daemon serves the web app and its API on `apiPort` (default 9950). The
 Sequentia wallet named in `seqWallet` must hold enough of `seqFeeAsset` to
-pay Sequentia fees (any accepted asset works; the testnet deployment uses
-tSEQ), and the operator key must match the vault's `operator()`.
+pay Sequentia fees (any accepted asset works; the operator picks one via
+`seqFeeAsset`), and the operator key must match the vault's `operator()`.
 
 Deploying the vault:
 
@@ -122,7 +122,7 @@ forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL \
 
 - **Fees**: Sequentia has an open fee market; fees are payable in any accepted
   asset and no asset (including the Sequence token) is privileged. The bridge
-  pays every fee — issuance, reissuance, delivery and the redeem-side burn — in
+  pays every fee (issuance, reissuance, delivery and the redeem-side burn) in
   the single asset named by `seqFeeAsset`, whatever the operator chooses; it
   never needs the policy asset. Pinning the fee asset explicitly is also
   necessary because the wallet would otherwise default the fee to the asset
