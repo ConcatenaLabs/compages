@@ -71,6 +71,19 @@ function formatSats(sats) {
   const frac = (s % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
   return `${s / 100000000n}${frac ? "." + frac : ""}`;
 }
+// T4: mirror the daemon's floor conversion (eth.js unitsToSats) so the receive
+// amount can be previewed before the deposit is committed.
+function unitsToSatsBig(units, decimals) {
+  const u = BigInt(units);
+  return decimals >= 8 ? u / 10n ** BigInt(decimals - 8) : u * 10n ** BigInt(8 - decimals);
+}
+// Human ETA for a number of Bitcoin blocks (~10 minutes each).
+function humanEta(blocks) {
+  const mins = blocks * 10;
+  if (mins < 90) return `${mins} minutes`;
+  const hrs = mins / 60;
+  return `${hrs % 1 === 0 ? hrs : hrs.toFixed(1)} hours`;
+}
 
 // ---------- ethereum provider ----------
 const eth = () => {
@@ -165,6 +178,7 @@ async function selectToken(t) {
       ? "Sequentia amounts have 8 decimal places; finer amounts cannot be bridged."
       : "");
   updateDepositButton();
+  renderDepositPreview();
   renderChips();
 }
 
@@ -200,6 +214,44 @@ function updateDepositButton() {
   if (!depositBusy) {
     btn.textContent = token ? `Deposit ${token.symbol}` : "Deposit";
   }
+}
+
+// T4: preview the receive amount, fee and ETA before the irreversible deposit.
+function renderDepositPreview() {
+  const box = $("dep-preview");
+  const raw = $("amount-input").value.trim();
+  if (!token || !status || !raw) {
+    box.classList.add("hide");
+    box.innerHTML = "";
+    return;
+  }
+  let sats;
+  try {
+    const units = parseUnits(raw, token.decimals);
+    sats = unitsToSatsBig(units, token.decimals);
+  } catch (e) {
+    box.classList.remove("hide");
+    box.innerHTML = `<span class="note">${escapeHtml(e.message)}</span>`;
+    return;
+  }
+  const recv = formatSats(sats.toString());
+  const sym = escapeHtml(token.symbol);
+  const confs = status.ethConfirmations;
+  box.classList.remove("hide");
+  box.innerHTML =
+    `<div class="note"><strong>You receive ~ ${recv} ${sym}</strong> on Sequentia` +
+    (token.bridged ? "" : " (issued as a new bridged asset)") +
+    `.</div>` +
+    `<div class="note">No bridge fee. Sequentia network fees are paid by the operator.</div>` +
+    `<div class="note">ETA: about ${confs} Ethereum confirmation${confs === 1 ? "" : "s"}, then minting on Sequentia.</div>`;
+}
+
+// Resolve a bridged asset id to its symbol from the loaded asset list (used when
+// rehydrating tracking without a selected token).
+function symbolForAssetId(assetId) {
+  if (!assetId) return "";
+  const a = assets.find((x) => x.assetId === assetId);
+  return a ? a.symbol : "";
 }
 
 // ---------- deposit flow ----------
@@ -310,36 +362,75 @@ async function trackDeposit(hash) {
     } catch {
       /* not seen by the daemon yet */
     }
-    if (dep) {
-      setSeg(1, "done");
-      if (dep.status === "minted") {
-        setSeg(2, "done");
-        setSeg(3, "done");
-        const sym = escapeHtml(token?.symbol ?? "");
-        statusLine.innerHTML =
-          `delivered: ${formatSats(dep.sats)} ${sym} sent to your Sequentia address` +
-          `<br>Sequentia transaction: ${dep.seqTxid ?? "?"}` +
-          (dep.assetId ? `<br>asset id: ${dep.assetId}` : "");
-        break;
-      } else if (dep.status === "refund_pending" || dep.status === "refunded") {
-        setSeg(2, "");
-        statusLine.textContent = `bridging not possible (${dep.refundReason}); your deposit is being refunded on ${status.ethChainName}`;
-        statusLine.classList.add("err");
-        break;
-      } else if (dep.status === "failed_manual") {
-        statusLine.textContent =
-          "the bridge hit an unexpected error and paused this deposit for operator review; funds are safe in the vault";
-        statusLine.classList.add("err");
-        break;
-      } else {
-        setSeg(2, "active");
-      }
-    }
+    if (dep && applyDepositState(dep, statusLine, scan)) break;
     await sleep(5000);
   }
   depositBusy = false;
   updateDepositButton();
   refreshAssets();
+}
+
+// Render a daemon deposit record into the truss + status line. Returns true once
+// the deposit is terminal (delivered/refunded/failed) so pollers can stop.
+function applyDepositState(dep, statusLine, scan) {
+  setSeg(1, "done");
+  if (dep.status === "minted") {
+    setSeg(2, "done");
+    setSeg(3, "done");
+    const sym = escapeHtml(token?.symbol ?? symbolForAssetId(dep.assetId));
+    statusLine.classList.remove("err");
+    statusLine.innerHTML =
+      `delivered: ${formatSats(dep.sats)} ${sym} sent to your Sequentia address` +
+      `<br>Sequentia transaction: ${dep.seqTxid ? escapeHtml(dep.seqTxid) : "?"}` +
+      (dep.assetId ? `<br>asset id: ${escapeHtml(dep.assetId)}` : "");
+    return true;
+  }
+  if (dep.status === "refund_pending" || dep.status === "refunded") {
+    setSeg(2, "");
+    statusLine.textContent = `bridging not possible (${dep.refundReason}); your deposit is being refunded on ${status.ethChainName}`;
+    statusLine.classList.add("err");
+    return true;
+  }
+  if (dep.status === "failed_manual") {
+    statusLine.textContent =
+      "the bridge hit an unexpected error and paused this deposit for operator review; funds are safe in the vault";
+    statusLine.classList.add("err");
+    return true;
+  }
+  setSeg(2, "active");
+  return false;
+}
+
+// T11: rehydrate deposit tracking after a page refresh, using the daemon's
+// lookup-by-tx-hash endpoint (no wallet connection required).
+async function resumeDeposit(hash) {
+  const statusLine = $("dep-status");
+  statusLine.classList.remove("err");
+  if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) {
+    statusLine.textContent = "enter a valid Ethereum transaction hash (0x + 64 hex characters)";
+    statusLine.classList.add("err");
+    return;
+  }
+  const scan = status ? ETHERSCAN[status.ethChainId] : null;
+  $("dep-truss").classList.add("on");
+  for (let i = 0; i < 4; i++) setSeg(i, "");
+  setSeg(0, "done");
+  statusLine.innerHTML = scan
+    ? `deposit: <a href="${scan}/tx/${hash}" target="_blank" rel="noopener">${hash}</a>`
+    : `deposit: ${escapeHtml(hash)}`;
+  for (;;) {
+    let dep = null;
+    try {
+      const list = await api(`deposit/tx/${hash}`);
+      dep = list[list.length - 1];
+    } catch {
+      statusLine.textContent =
+        "deposit not seen by the bridge yet; it is processed after enough Ethereum confirmations";
+      statusLine.classList.remove("err");
+    }
+    if (dep && applyDepositState(dep, statusLine, scan)) break;
+    await sleep(6000);
+  }
 }
 
 // ---------- redeem flow ----------
@@ -458,6 +549,37 @@ function renderRedeemAssets() {
   }
 }
 
+// T11: rehydrate a redemption after a page refresh, looking it up by the
+// redemption address the daemon issued.
+async function resumeRedemption(addr) {
+  const line = $("red-status");
+  line.classList.remove("err");
+  if (!addr) {
+    line.textContent = "enter your redemption address";
+    line.classList.add("err");
+    return;
+  }
+  let r;
+  try {
+    r = await api(`redeem/${addr}`);
+  } catch {
+    line.textContent = "no redemption found for that address; check it and try again";
+    line.classList.add("err");
+    return;
+  }
+  const seqAddress = r.seqAddress ?? addr;
+  $("red-result").classList.remove("hide");
+  $("red-addr").textContent = seqAddress;
+  $("red-note").textContent = r.ethAddress
+    ? `Releases go to ${r.ethAddress} on ${status.ethChainName} once each return's Bitcoin anchor is final.`
+    : "";
+  line.textContent = "";
+  if (redeemPoll) clearInterval(redeemPoll);
+  const poll = () => refreshRedemptions(seqAddress);
+  redeemPoll = setInterval(poll, 6000);
+  poll();
+}
+
 // ---------- tabs + init ----------
 function showTab(dep) {
   $("panel-dep").classList.toggle("hide", !dep);
@@ -495,6 +617,16 @@ async function init() {
     ? `<a href="${scan}/address/${status.vaultAddress}" target="_blank" rel="noopener">${status.vaultAddress}</a>`
     : status.vaultAddress;
 
+  // T8/T4: state the real Bitcoin-anchor release gate (and an ETA) up front,
+  // before the user commits any funds to a redemption.
+  const anchorConfs = status.btcAnchorConfirmations ?? 3;
+  const gateEl = $("red-gate-note");
+  if (gateEl)
+    gateEl.textContent =
+      ` This gate is ${anchorConfs} Bitcoin-anchor confirmation${anchorConfs === 1 ? "" : "s"}` +
+      ` (about ${anchorConfs} Bitcoin blocks, roughly ${humanEta(anchorConfs)} at ~10 minutes per block),` +
+      ` not a Sequentia block count.`;
+
   await refreshAssets();
 
   $("btn-connect").onclick = () =>
@@ -502,6 +634,8 @@ async function init() {
   $("btn-deposit").onclick = deposit;
   $("btn-intent").onclick = createIntent;
   $("btn-copy").onclick = () => navigator.clipboard.writeText($("red-addr").textContent);
+  $("btn-resume-dep").onclick = () => resumeDeposit($("resume-dep-input").value.trim().toLowerCase());
+  $("btn-resume-red").onclick = () => resumeRedemption($("resume-red-input").value.trim());
   $("tab-dep").onclick = () => showTab(true);
   $("tab-red").onclick = () => showTab(false);
   $("token-input").addEventListener("change", () => {
@@ -511,6 +645,7 @@ async function init() {
   for (const id of ["amount-input", "seqaddr-input"]) {
     $(id).addEventListener("input", updateDepositButton);
   }
+  $("amount-input").addEventListener("input", renderDepositPreview);
 }
 
 init();
