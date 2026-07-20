@@ -19,6 +19,13 @@
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
     --serif: Georgia, "Times New Roman", serif;
   }
+  .netselect { display: flex; align-items: center; gap: 10px; justify-content: center; margin-bottom: 20px; }
+  .netselect label { color: var(--muted); font-size: 13px; }
+  .netselect select {
+    font-family: var(--mono); font-size: 13.5px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; cursor: pointer;
+  }
+  .netselect select:focus { outline: none; border-color: var(--gold); }
   * { box-sizing: border-box; margin: 0; }
   html, body { background: var(--ink); color: var(--text); }
   body {
@@ -262,7 +269,16 @@
 </header>
 
 <main class="console">
-  <div class="card">
+  <!-- Network selector: pick which chain to bridge from, instead of stacking both cards in one view. -->
+  <div class="netselect">
+    <label for="net-choice">Bridge from</label>
+    <select id="net-choice">
+      <option value="eth">Ethereum (Sepolia)</option>
+      <option value="btc">Bitcoin (Testnet4)</option>
+    </select>
+  </div>
+
+  <div class="card" id="eth-card">
     <div class="direction" role="tablist">
       <button class="plate active" id="tab-dep" role="tab" aria-selected="true">
         Ethereum &#8594; Sequentia

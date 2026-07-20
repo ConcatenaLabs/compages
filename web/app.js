@@ -581,6 +581,13 @@ async function resumeRedemption(addr) {
 }
 
 // ---------- tabs + init ----------
+// Network selector: show one bridge card at a time (Ethereum or Bitcoin) instead of stacking both.
+function showNetwork(net) {
+  const btc = net === "btc";
+  $("eth-card").classList.toggle("hide", btc);
+  $("btc-card").classList.toggle("hide", !btc);
+}
+
 function showTab(dep) {
   $("panel-dep").classList.toggle("hide", !dep);
   $("panel-red").classList.toggle("hide", dep);
@@ -702,6 +709,9 @@ async function init() {
   $("btn-resume-red").onclick = () => resumeRedemption($("resume-red-input").value.trim());
   $("tab-dep").onclick = () => showTab(true);
   $("tab-red").onclick = () => showTab(false);
+  // Network selector (Ethereum / Bitcoin) — one card at a time.
+  $("net-choice").onchange = (e) => showNetwork(e.target.value);
+  showNetwork("eth");
   // Bitcoin bridge card
   $("tab-wrap").onclick = () => showBtcTab(true);
   $("tab-unwrap").onclick = () => showBtcTab(false);
