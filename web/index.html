@@ -392,14 +392,70 @@
       </div>
     </div>
   </div>
+
+  <!-- Bitcoin bridge (BTC <-> SBTC). Address-based (no wallet connect): the user sends BTC / SBTC
+       from any wallet to a bridge-allocated address. Proxied to the sbtc-bridge by the daemon. -->
+  <div class="card" id="btc-card">
+    <div class="direction" role="tablist">
+      <button class="plate active" id="tab-wrap" role="tab" aria-selected="true">
+        Bitcoin &#8594; SBTC
+        <small>lock BTC, mint SBTC</small>
+      </button>
+      <div class="joint" aria-hidden="true"><div class="pin-dot"></div></div>
+      <button class="plate" id="tab-unwrap" role="tab" aria-selected="false">
+        SBTC &#8594; Bitcoin
+        <small>burn SBTC, release BTC</small>
+      </button>
+    </div>
+
+    <!-- wrap panel: BTC -> SBTC -->
+    <div class="body" id="panel-wrap">
+      <div class="field">
+        <label>Your Sequentia address (receives SBTC)</label>
+        <input class="mono" id="wrap-seqaddr" placeholder="tb1&hellip; (your Sequentia wallet address)" spellcheck="false">
+      </div>
+      <button class="action" id="btn-wrap">Get a Bitcoin deposit address</button>
+      <div class="statusline" id="wrap-status"></div>
+      <div class="hide" id="wrap-result">
+        <div class="field">
+          <label>Send BTC (testnet4) to this address</label>
+          <div class="bigaddr" id="wrap-addr"></div>
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="copybtn" id="btn-wrap-copy">copy address</button>
+          </div>
+          <div class="note" id="wrap-note" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- unwrap panel: SBTC -> BTC -->
+    <div class="body hide" id="panel-unwrap">
+      <div class="field">
+        <label>Your Bitcoin address (receives BTC)</label>
+        <input class="mono" id="unwrap-btcaddr" placeholder="tb1&hellip; or a testnet4 Bitcoin address" spellcheck="false">
+      </div>
+      <button class="action" id="btn-unwrap">Get an SBTC return address</button>
+      <div class="statusline" id="unwrap-status"></div>
+      <div class="hide" id="unwrap-result">
+        <div class="field">
+          <label>Send SBTC to this Sequentia address</label>
+          <div class="bigaddr" id="unwrap-addr"></div>
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="copybtn" id="btn-unwrap-copy">copy address</button>
+          </div>
+          <div class="note" id="unwrap-note" style="margin-top:10px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </main>
 
 <footer>
   <div>
-    Compages is a centralized proof-of-concept bridge between Ethereum and the
-    Sequentia network. Deposits are locked in a vault contract; minting on
-    Sequentia and releases on Ethereum are performed by the bridge operator.
-    You are trusting that operator.
+    Compages is a centralized proof-of-concept bridge into the Sequentia network,
+    from Ethereum (lock in a vault, mint) and from Bitcoin (SBTC: lock BTC in an
+    operator multisig, mint 1:1). Mints, releases, and BTC custody are performed by
+    the bridge operator. You are trusting that operator.
   </div>
   <div style="margin-top:6px">
     Vault: <span class="mono" id="vault-line">&hellip;</span>

@@ -85,6 +85,19 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     });
   }
 
+  // Proxy a request to the sbtc-bridge (the BTC<->SBTC custody service). The daemon holds the bridge
+  // token so the browser never sees it; the bridge itself enforces 1:1 backing.
+  async function sbtcBridge(bridgePath, body) {
+    const headers = { "content-type": "application/json" };
+    if (cfg.sbtcBridgeToken) headers.authorization = "Bearer " + cfg.sbtcBridgeToken;
+    const res = await fetch(cfg.sbtcBridgeUrl.replace(/\/+$/, "") + bridgePath, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    return res.json().catch(() => ({ ok: false, error: "bad bridge response" }));
+  }
+
   const server = http.createServer(async (req, res) => {
     res.setHeader("access-control-allow-origin", "*");
     res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
@@ -183,6 +196,37 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           });
         }
         return send(200, matches);
+      }
+
+      // --- Bitcoin bridge (BTC <-> SBTC) -------------------------------------------------------
+      // Compages is the unified public wrap/unwrap front (Ethereum today, Bitcoin here, Solana +
+      // others coming). Unlike ETH (MetaMask), BTC wrap/unwrap is ADDRESS-based: the user sends
+      // BTC / SBTC from any wallet to a bridge-allocated address. We proxy to the sbtc-bridge, which
+      // holds custody and mints/burns SBTC 1:1; the daemon holds the bridge token so the browser
+      // never sees it.
+      if (req.method === "POST" && parts[1] === "btc" && parts[2] === "wrap") {
+        if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.seqAddress) return send(400, { error: "seqAddress required" });
+        const r = await sbtcBridge("/pegin", { seq_recipient: String(body.seqAddress) });
+        if (!r.ok || !r.deposit_address) return send(502, { error: r.error || "bridge error" });
+        return send(200, {
+          depositAddress: r.deposit_address,
+          seqAddress: body.seqAddress,
+          note: `Send BTC (testnet4) to this address from any Bitcoin wallet. After ${cfg.btcConfirmations ?? 2} confirmations you receive the same amount of SBTC at ${body.seqAddress}, 1:1.`,
+        });
+      }
+      if (req.method === "POST" && parts[1] === "btc" && parts[2] === "unwrap") {
+        if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
+        const body = JSON.parse((await readBody(req)) || "{}");
+        if (!body.btcAddress) return send(400, { error: "btcAddress required" });
+        const r = await sbtcBridge("/pegout", { btc_dest: String(body.btcAddress) });
+        if (!r.ok || !r.sbtc_address) return send(502, { error: r.error || "bridge error" });
+        return send(200, {
+          sbtcAddress: r.sbtc_address,
+          btcAddress: body.btcAddress,
+          note: `Send SBTC to this Sequentia address from any wallet. It is burned and the same amount of real BTC is released to ${body.btcAddress}, 1:1.`,
+        });
       }
 
       return send(404, { error: "not found" });

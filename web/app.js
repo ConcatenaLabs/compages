@@ -590,6 +590,70 @@ function showTab(dep) {
   $("tab-red").setAttribute("aria-selected", !dep);
 }
 
+// ---------- Bitcoin bridge (BTC <-> SBTC) ----------
+// Address-based, no wallet connect: request a bridge-allocated address, then send BTC / SBTC to it
+// from any wallet. The daemon proxies to the sbtc-bridge (custody + 1:1 mint/burn).
+function showBtcTab(wrap) {
+  $("panel-wrap").classList.toggle("hide", !wrap);
+  $("panel-unwrap").classList.toggle("hide", wrap);
+  $("tab-wrap").classList.toggle("active", wrap);
+  $("tab-unwrap").classList.toggle("active", !wrap);
+  $("tab-wrap").setAttribute("aria-selected", wrap);
+  $("tab-unwrap").setAttribute("aria-selected", !wrap);
+}
+
+async function wrapBtc() {
+  const line = $("wrap-status");
+  line.classList.remove("err");
+  const seqAddress = $("wrap-seqaddr").value.trim();
+  if (!seqAddress) {
+    line.textContent = "enter your Sequentia address (it receives the SBTC)";
+    line.classList.add("err");
+    return;
+  }
+  line.textContent = "requesting a deposit address…";
+  try {
+    const r = await api("btc/wrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seqAddress }),
+    });
+    $("wrap-result").classList.remove("hide");
+    $("wrap-addr").textContent = r.depositAddress;
+    $("wrap-note").textContent = r.note;
+    line.textContent = "";
+  } catch (e) {
+    line.textContent = e.message;
+    line.classList.add("err");
+  }
+}
+
+async function unwrapBtc() {
+  const line = $("unwrap-status");
+  line.classList.remove("err");
+  const btcAddress = $("unwrap-btcaddr").value.trim();
+  if (!btcAddress) {
+    line.textContent = "enter your Bitcoin address (it receives the BTC)";
+    line.classList.add("err");
+    return;
+  }
+  line.textContent = "requesting a return address…";
+  try {
+    const r = await api("btc/unwrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ btcAddress }),
+    });
+    $("unwrap-result").classList.remove("hide");
+    $("unwrap-addr").textContent = r.sbtcAddress;
+    $("unwrap-note").textContent = r.note;
+    line.textContent = "";
+  } catch (e) {
+    line.textContent = e.message;
+    line.classList.add("err");
+  }
+}
+
 async function refreshAssets() {
   try {
     assets = await api("assets");
@@ -638,6 +702,13 @@ async function init() {
   $("btn-resume-red").onclick = () => resumeRedemption($("resume-red-input").value.trim());
   $("tab-dep").onclick = () => showTab(true);
   $("tab-red").onclick = () => showTab(false);
+  // Bitcoin bridge card
+  $("tab-wrap").onclick = () => showBtcTab(true);
+  $("tab-unwrap").onclick = () => showBtcTab(false);
+  $("btn-wrap").onclick = wrapBtc;
+  $("btn-unwrap").onclick = unwrapBtc;
+  $("btn-wrap-copy").onclick = () => navigator.clipboard.writeText($("wrap-addr").textContent);
+  $("btn-unwrap-copy").onclick = () => navigator.clipboard.writeText($("unwrap-addr").textContent);
   $("token-input").addEventListener("change", () => {
     const v = $("token-input").value.trim();
     if (/^0x[0-9a-fA-F]{40}$/.test(v)) selectToken(v.toLowerCase());

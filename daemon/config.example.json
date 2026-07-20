@@ -19,6 +19,10 @@
   "assetDomain": "bridge.example.com",
   "seqFeeAsset": "<hex asset id or label of any accepted fee asset the bridge wallet holds; no need for the Sequence token>",
 
+  "sbtcBridgeUrl": "http://127.0.0.1:9987",
+  "sbtcBridgeToken": "<the sbtc-bridge HTTP token; the daemon proxies /btc/wrap + /btc/unwrap to it so the browser never holds a secret. Omit to disable the Bitcoin bridge.>",
+  "btcConfirmations": 2,
+
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
   "pollIntervalMs": 15000,
