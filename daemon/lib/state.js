@@ -19,6 +19,16 @@ const DEFAULTS = () => ({
   redeemIntents: {},
   // "txid:vout" -> redemption record
   redemptions: {},
+  // Solana leg. Next deposit-address derivation index:
+  solIntentIndex: 0,
+  // solana deposit address -> { index, seqAddress, seen: [signature], createdAt, sweep? }
+  solWrapIntents: {},
+  // solana tx signature -> deposit record
+  solDeposits: {},
+  // sequentia redeem address -> { solAddress, createdAt }
+  solRedeemIntents: {},
+  // "txid:vout" -> redemption record
+  solRedemptions: {},
 });
 
 export class State {
