@@ -182,20 +182,46 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             decimals: s.decimals,
             escrowedUnits: s.escrowedUnits ?? "0",
           }));
-          // Escrow is denominated in each source's base units; atoms are the
-          // common denominator, so convert before summing across chains.
-          let escrowedAtoms = 0n;
-          for (const s of sources) {
-            escrowedAtoms += unitsToAtoms(s.escrowedUnits ?? "0", s.decimals, m.precision);
+          // An escrow ledger only exists for sources that keep one. Assets
+          // bridged before it did have no recorded escrow, and reporting their
+          // escrow as zero would be a claim, not a measurement, so their
+          // backing is reported as unknown instead of asserted.
+          const escrowTracked = sources.length > 0 && sources.every((s) => s.escrowedUnits !== undefined);
+          let escrowedAtoms = null;
+          if (escrowTracked) {
+            escrowedAtoms = 0n;
+            for (const s of sources) {
+              escrowedAtoms += unitsToAtoms(s.escrowedUnits, s.decimals, m.precision);
+            }
           }
+
           let chainSupply = null;
           let chainError = null;
           try {
-            chainSupply = (await bridge.chainSupplyAtoms(m.assetId)).toString();
+            const supply = await bridge.chainSupplyAtoms(m.assetId);
+            if (supply < 0n) {
+              // More burned than issued is impossible on a chain that can see
+              // the whole history, so this means the history is not visible:
+              // typically an asset issued before a chain reset, whose issuance
+              // no longer exists. Refuse to report a supply rather than report
+              // a negative one.
+              chainError =
+                "more burned than issued is visible for this asset; its issuance is not on this chain " +
+                "(an asset issued before a chain reset will do this)";
+            } else {
+              chainSupply = supply.toString();
+            }
           } catch (e) {
             chainError = e.message;
           }
+
           const ledger = BigInt(m.mintedSats ?? "0");
+          // Backing must never be short. In flight, a deposit is escrowed
+          // before it is minted and a redemption is burned before it is
+          // released, so escrow may legitimately EXCEED circulation briefly;
+          // the reverse would mean unbacked units exist. A verdict is only
+          // given when both sides of the comparison were actually measured.
+          const comparable = escrowedAtoms !== null && chainSupply !== null;
           out.push({
             assetId: m.assetId,
             symbol: m.symbol,
@@ -203,15 +229,12 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             precision: m.precision ?? 8,
             unified: m.unified ?? false,
             sources,
-            escrowedAtoms: escrowedAtoms.toString(),
+            escrowTracked,
+            escrowedAtoms: escrowedAtoms === null ? null : escrowedAtoms.toString(),
             ledgerCirculatingAtoms: ledger.toString(),
             chainCirculatingAtoms: chainSupply,
             chainSupplyError: chainError,
-            // Backing must never be short. In flight, a deposit is escrowed
-            // before it is minted and a redemption is burned before it is
-            // released, so escrow may legitimately EXCEED circulation for a
-            // while; the reverse would mean unbacked units exist.
-            backed: chainSupply === null ? null : escrowedAtoms >= BigInt(chainSupply),
+            backed: comparable ? escrowedAtoms >= BigInt(chainSupply) : null,
             ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
           });
         }
