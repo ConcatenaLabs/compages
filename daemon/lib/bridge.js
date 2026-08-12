@@ -384,23 +384,34 @@ export class Bridge {
     this.log(`asset ${mapping.assetId}: registered in the asset registry as ${mapping.contract.ticker}`);
   }
 
-  /** Retry registry registration for any bridged asset not yet registered
-   *  (registry was down when first issued, or the asset predates this feature).
-   *  Assets issued before registry integration have no stored contract; build
-   *  one from their recorded metadata so they get a label too. Their on-chain
-   *  contract_hash predates the scheme, so those are operator-asserted (admin)
-   *  entries — consistent with how the admin path already registers. */
+  /** Retry registry registration for any bridged asset the registry does not
+   *  actually have. The local `registered` flag alone is NOT proof: the
+   *  registry can be redeployed or purged out from under us (it has been,
+   *  which silently stripped the Ethereum-leg assets of their labels), so
+   *  each pass consults the registry's own index and re-registers whatever is
+   *  missing. Assets issued before registry integration have no stored
+   *  contract; build one from their recorded metadata so they get a label too
+   *  (operator-asserted admin entries, consistent with the admin path). */
   async registerPendingAssets() {
     if (!this.cfg.registryUrl) return;
+    let index = null;
+    try {
+      const res = await fetch(`${this.cfg.registryUrl.replace(/\/$/, "")}/index.minimal.json`);
+      if (res.ok) index = await res.json();
+    } catch {
+      // Registry unreachable: unregistered mappings still retry below, and
+      // registered ones are left alone rather than spammed blindly.
+    }
     for (const m of Object.values(this.state.data.mappings)) {
-      if (m.registered) continue;
+      if (m.registered && (!index || index[m.assetId])) continue;
       try {
         if (!m.contract) {
-          m.contract = await this.buildAssetContract({
-            symbol: m.symbol,
-            name: m.name,
-            decimals: m.decimals,
-          });
+          const isSol = m.chainId === (this.cfg.solChainLabel ?? "solana-devnet");
+          m.contract = await this.buildAssetContract(
+            { symbol: m.symbol, name: m.name, decimals: m.decimals },
+            isSol ? this.cfg.solChainName ?? "Solana devnet" : this.cfg.ethChainName,
+            isSol ? ".s" : ".e"
+          );
           m.contractHash = contractHash(m.contract);
           this.state.save();
         }
