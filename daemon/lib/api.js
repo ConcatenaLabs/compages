@@ -247,7 +247,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           return send(200, {
             depositAddress,
             seqAddress: body.seqAddress,
-            note: `Send SOL (${solName}) to this address from any Solana wallet; at least 0.001 SOL, with at most 8 decimal places (Sequentia amounts have 8; a 9th decimal place of SOL is dropped). Once the transfer is finalized on Solana and picked up by the bridge, usually under a minute, the SOL.s is minted to ${body.seqAddress}.`,
+            note: `Send SOL or any SPL token (${solName}) to this address from any Solana wallet; SOL deposits need at least 0.001 SOL. Sequentia amounts have 8 decimal places, so decimals beyond 8 are dropped. Once the transfer is finalized on Solana and picked up by the bridge, usually under a minute, the matching .s asset is minted to ${body.seqAddress}: SOL as SOL.s, a token under its own ticker, issued on first bridge exactly like the Ethereum leg's ERC-20s.`,
           });
         }
         if (req.method === "GET" && parts[2] === "wrap" && parts[3]) {
@@ -279,7 +279,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           return send(200, {
             seqAddress,
             solAddress: body.solAddress,
-            note: `Send at least 0.001 SOL.s to this Sequentia address from any wallet (smaller amounts cannot create a Solana account and are parked for the operator). Once the burn is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 3} Bitcoin-anchor confirmations), the SOL is released to ${body.solAddress} on ${solName}. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
+            note: `Send any Solana-bridged asset (SOL.s or a bridged token) to this Sequentia address from any wallet; SOL.s returns need at least 0.001 (a smaller lamport release cannot create a Solana account and is parked for the operator). Once the burn is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 3} Bitcoin-anchor confirmations), the original SOL or tokens are released to ${body.solAddress} on ${solName}. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
           });
         }
         if (req.method === "GET" && parts[2] === "redeem" && parts[3]) {

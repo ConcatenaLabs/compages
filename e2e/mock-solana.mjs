@@ -11,7 +11,19 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { b58encode, b58decode, ed25519Verify, keypairFromSeed, SYSTEM_PROGRAM } from "../daemon/lib/sol.js";
+import {
+  b58encode,
+  b58decode,
+  ed25519Verify,
+  keypairFromSeed,
+  findProgramAddress,
+  ataAddress,
+  SYSTEM_PROGRAM,
+  TOKEN_PROGRAM,
+  ATA_PROGRAM,
+  METADATA_PROGRAM,
+  TOKEN_ACCOUNT_RENT_LAMPORTS,
+} from "../daemon/lib/sol.js";
 
 const port = Number(process.argv[process.argv.indexOf("--port") + 1] || 18999);
 
@@ -20,11 +32,37 @@ const FAUCET = keypairFromSeed(crypto.createHash("sha256").update("mock-solana-f
 const FEE = 5000n;
 
 const balances = new Map([[FAUCET, 10n ** 15n]]); // address -> lamports
-const ledger = new Map(); // signature -> { slot, blockTime, err, accountKeys, preBalances, postBalances }
+const mints = new Map(); // mint address -> { decimals }
+const tokenAccounts = new Map(); // address -> { mint, owner, amount }
+const metadataAccounts = new Map(); // address -> Buffer (Metaplex layout)
+const ledger = new Map(); // signature -> { slot, blockTime, err, accountKeys, preBalances, postBalances, preTok, postTok }
 const byAddress = new Map(); // address -> [signature, ...] newest first
 const blockhashes = new Map(); // blockhash -> lastValidBlockHeight
 let height = 1000;
 setInterval(() => { height++; }, 100).unref?.();
+
+// pre/postTokenBalances entries as real nodes shape them, for every account
+// key that is a token account at snapshot time.
+function tokenSnapshot(keys) {
+  const out = [];
+  keys.forEach((k, i) => {
+    const ta = tokenAccounts.get(k);
+    if (!ta) return;
+    const decimals = mints.get(ta.mint)?.decimals ?? 0;
+    out.push({
+      accountIndex: i,
+      mint: ta.mint,
+      owner: ta.owner,
+      uiTokenAmount: {
+        amount: ta.amount.toString(),
+        decimals,
+        uiAmount: Number(ta.amount) / 10 ** decimals,
+        uiAmountString: (Number(ta.amount) / 10 ** decimals).toString(),
+      },
+    });
+  });
+  return out;
+}
 
 function currentBlockhash() {
   const bh = b58encode(crypto.createHash("sha256").update(`mock-bh:${Math.floor(height / 20)}`).digest());
@@ -32,7 +70,7 @@ function currentBlockhash() {
   return { blockhash: bh, lastValidBlockHeight: blockhashes.get(bh) };
 }
 
-function record(sig, accountKeys, pre, post, err) {
+function record(sig, accountKeys, pre, post, err, preTok = [], postTok = []) {
   ledger.set(sig, {
     slot: height,
     blockTime: Math.floor(Date.now() / 1000),
@@ -40,6 +78,8 @@ function record(sig, accountKeys, pre, post, err) {
     accountKeys,
     preBalances: pre.map(Number),
     postBalances: post.map(Number),
+    preTok,
+    postTok,
   });
   for (const k of accountKeys) {
     if (!byAddress.has(k)) byAddress.set(k, []);
@@ -97,31 +137,80 @@ function sendTransaction(b64) {
   }
   const lastValid = blockhashes.get(t.blockhash);
   if (lastValid === undefined || height > lastValid) throw rpcErr(-32002, "Blockhash not found");
+  const signerKeys = t.keys.slice(0, t.numRequired);
 
-  // Simulate on a scratch copy (preflight): any failure rejects the whole tx.
+  // Simulate on scratch copies (preflight): any failure rejects the whole tx,
+  // and later instructions see the effects of earlier ones (create + transfer
+  // in one transaction is the normal wallet shape).
   const work = new Map();
   const get = (k) => (work.has(k) ? work.get(k) : balances.get(k) ?? 0n);
   const set = (k, v) => work.set(k, v);
+  const tokWork = new Map();
+  const getTok = (k) => {
+    if (!tokWork.has(k)) {
+      const cur = tokenAccounts.get(k);
+      tokWork.set(k, cur ? { ...cur } : null);
+    }
+    return tokWork.get(k);
+  };
   const feePayer = t.keys[0];
   const fee = FEE * BigInt(t.numRequired);
   if (get(feePayer) < fee) throw rpcErr(-32002, "insufficient funds for fee");
   set(feePayer, get(feePayer) - fee);
   for (const ins of t.instrs) {
-    if (t.keys[ins.progIdx] !== SYSTEM_PROGRAM) throw rpcErr(-32002, "unsupported program");
-    if (ins.data.readUInt32LE(0) !== 2) throw rpcErr(-32002, "unsupported system instruction");
-    const lamports = ins.data.readBigUInt64LE(4);
-    const from = t.keys[ins.accounts[0]];
-    const to = t.keys[ins.accounts[1]];
-    if (get(from) < lamports) {
-      throw rpcErr(-32002, "Transaction simulation failed: insufficient lamports");
+    const program = t.keys[ins.progIdx];
+    if (program === SYSTEM_PROGRAM) {
+      if (ins.data.readUInt32LE(0) !== 2) throw rpcErr(-32002, "unsupported system instruction");
+      const lamports = ins.data.readBigUInt64LE(4);
+      const from = t.keys[ins.accounts[0]];
+      const to = t.keys[ins.accounts[1]];
+      if (get(from) < lamports) {
+        throw rpcErr(-32002, "Transaction simulation failed: insufficient lamports");
+      }
+      set(from, get(from) - lamports);
+      set(to, get(to) + lamports);
+    } else if (program === ATA_PROGRAM) {
+      // [payer, ata, owner, mint, system, tokenProgram]; data [1] = idempotent
+      const [payer, ata, owner, mint] = ins.accounts.map((i) => t.keys[i]);
+      if (!mints.has(mint)) throw rpcErr(-32002, "unknown mint");
+      if (getTok(ata)) {
+        if (ins.data.length && ins.data[0] === 1) continue; // idempotent no-op
+        throw rpcErr(-32002, "token account exists");
+      }
+      if (ata !== ataAddress(owner, mint)) throw rpcErr(-32002, "associated token address mismatch");
+      if (!signerKeys.includes(payer)) throw rpcErr(-32002, "ata payer must sign");
+      if (get(payer) < TOKEN_ACCOUNT_RENT_LAMPORTS) {
+        throw rpcErr(-32002, "insufficient lamports for token account rent");
+      }
+      set(payer, get(payer) - TOKEN_ACCOUNT_RENT_LAMPORTS);
+      set(ata, get(ata) + TOKEN_ACCOUNT_RENT_LAMPORTS);
+      tokWork.set(ata, { mint, owner, amount: 0n });
+    } else if (program === TOKEN_PROGRAM) {
+      if (ins.data[0] !== 12) throw rpcErr(-32002, "unsupported token instruction");
+      const amount = ins.data.readBigUInt64LE(1);
+      const decimals = ins.data[9];
+      const [source, mint, dest, owner] = ins.accounts.map((i) => t.keys[i]);
+      const src = getTok(source);
+      const dst = getTok(dest);
+      if (!src || !dst) throw rpcErr(-32002, "missing token account");
+      if (src.mint !== mint || dst.mint !== mint) throw rpcErr(-32002, "mint mismatch");
+      if (mints.get(mint)?.decimals !== decimals) throw rpcErr(-32002, "decimals mismatch");
+      if (src.owner !== owner) throw rpcErr(-32002, "owner mismatch");
+      if (!signerKeys.includes(owner)) throw rpcErr(-32002, "owner must sign");
+      if (src.amount < amount) throw rpcErr(-32002, "insufficient token balance");
+      src.amount -= amount;
+      dst.amount += amount;
+    } else {
+      throw rpcErr(-32002, "unsupported program");
     }
-    set(from, get(from) - lamports);
-    set(to, get(to) + lamports);
   }
   const pre = t.keys.map((k) => balances.get(k) ?? 0n);
+  const preTok = tokenSnapshot(t.keys);
   for (const [k, v] of work) balances.set(k, v);
+  for (const [k, v] of tokWork) if (v) tokenAccounts.set(k, v);
   const post = t.keys.map((k) => balances.get(k) ?? 0n);
-  record(sig, t.keys, pre, post, null);
+  const postTok = tokenSnapshot(t.keys);
+  record(sig, t.keys, pre, post, null, preTok, postTok);
   return sig;
 }
 
@@ -161,9 +250,108 @@ const methods = {
     return {
       slot: e.slot,
       blockTime: e.blockTime,
-      meta: { err: e.err, fee: Number(FEE), preBalances: e.preBalances, postBalances: e.postBalances },
+      meta: {
+        err: e.err,
+        fee: Number(FEE),
+        preBalances: e.preBalances,
+        postBalances: e.postBalances,
+        preTokenBalances: e.preTok ?? [],
+        postTokenBalances: e.postTok ?? [],
+      },
       transaction: { message: { accountKeys: e.accountKeys } },
     };
+  },
+  getTokenAccountsByOwner: ([owner, filter]) => ({
+    context: { slot: height },
+    // The mock keeps every token under the classic program; a token-2022
+    // query legitimately returns nothing.
+    value:
+      filter?.programId === TOKEN_PROGRAM
+        ? [...tokenAccounts.entries()]
+            .filter(([, ta]) => ta.owner === owner)
+            .map(([pubkey, ta]) => ({
+              pubkey,
+              account: {
+                owner: TOKEN_PROGRAM,
+                data: {
+                  program: "spl-token",
+                  parsed: {
+                    type: "account",
+                    info: {
+                      mint: ta.mint,
+                      owner: ta.owner,
+                      tokenAmount: {
+                        amount: ta.amount.toString(),
+                        decimals: mints.get(ta.mint)?.decimals ?? 0,
+                      },
+                    },
+                  },
+                },
+              },
+            }))
+        : [],
+  }),
+  getAccountInfo: ([addr]) => {
+    if (mints.has(addr)) {
+      return {
+        context: { slot: height },
+        value: {
+          owner: TOKEN_PROGRAM,
+          data: { program: "spl-token", parsed: { type: "mint", info: { decimals: mints.get(addr).decimals } } },
+        },
+      };
+    }
+    if (metadataAccounts.has(addr)) {
+      return {
+        context: { slot: height },
+        value: { owner: METADATA_PROGRAM, data: [metadataAccounts.get(addr).toString("base64"), "base64"] },
+      };
+    }
+    return { context: { slot: height }, value: null };
+  },
+  // Test-only bootstrap (no real-cluster equivalent; the driver plays "mint
+  // authority" with these instead of implementing InitializeMint/MintTo):
+  mockCreateMint: ([decimals]) => {
+    const addr = keypairFromSeed(crypto.randomBytes(32)).address;
+    mints.set(addr, { decimals });
+    return addr;
+  },
+  mockSetMetadata: ([mint, name, symbol]) => {
+    const metaAddr = findProgramAddress(
+      [Buffer.from("metadata"), b58decode(METADATA_PROGRAM), b58decode(mint)],
+      METADATA_PROGRAM
+    ).address;
+    const padded = (s, n) => {
+      const b = Buffer.alloc(n);
+      Buffer.from(s, "utf8").copy(b);
+      return b;
+    };
+    const len = (n) => {
+      const b = Buffer.alloc(4);
+      b.writeUInt32LE(n, 0);
+      return b;
+    };
+    metadataAccounts.set(
+      metaAddr,
+      Buffer.concat([
+        Buffer.from([4]), // key: MetadataV1
+        Buffer.alloc(32), // update authority
+        b58decode(mint),
+        len(32),
+        padded(name, 32),
+        len(10),
+        padded(symbol, 10),
+      ])
+    );
+    return metaAddr;
+  },
+  mockMintTo: ([mint, owner, amount]) => {
+    if (!mints.has(mint)) throw rpcErr(-32002, "unknown mint");
+    const ata = ataAddress(owner, mint);
+    const ta = tokenAccounts.get(ata) ?? { mint, owner, amount: 0n };
+    ta.amount += BigInt(amount);
+    tokenAccounts.set(ata, ta);
+    return ata;
   },
   getSignatureStatuses: ([sigs]) => ({
     context: { slot: height },

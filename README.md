@@ -11,8 +11,9 @@ from three chains:
 - **Bitcoin**: send BTC to a bridge address and receive SBTC 1:1 (custody and
   mint/burn are performed by the sbtc-bridge service; Compages is the public
   front for it).
-- **Solana**: send SOL to a bridge address and receive SOL.s; sending it back
-  releases the SOL.
+- **Solana**: send SOL or any SPL token to a bridge address and receive the
+  matching Sequentia asset (SOL.s, or the token under its own `.s` ticker);
+  sending it back releases the original.
 
 It is a proof of concept running on the **Sepolia** testnet, **Bitcoin
 testnet4** and the **Solana devnet** against the **Sequentia public testnet**,
@@ -62,7 +63,7 @@ Within that assumption, the design removes every failure mode it can:
 | Sequentia → Ethereum (return, then release) | Implemented and exercised end-to-end in `e2e/run-e2e.sh`; live redemptions wait for 100 Bitcoin-anchor confirmations before releasing (see "Finality") |
 | Vault contract | `CompagesVault` deployed on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41); 13 Foundry unit tests |
 | Bitcoin ↔ SBTC (wrap, unwrap) | Live; address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
-| Solana ↔ SOL.s (wrap, sweep, unwrap) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) and exercised end-to-end against a mock Solana RPC in `e2e/run-e2e.sh` |
+| Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) and exercised end-to-end against a mock Solana RPC in `e2e/run-e2e.sh` |
 | Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
 | Web front-end | Live at https://sequentiatestnet.com/bridge/, served by the daemon itself |
 
@@ -110,20 +111,23 @@ in the "Bridge from" selector:
 
 1. **Wrap**: enter the Sequentia address that should receive the bridged
    asset; the bridge returns a deposit address on the origin chain. Send BTC
-   (testnet4) or SOL (devnet) to it from any wallet. After 2 Bitcoin
-   confirmations you receive SBTC 1:1; a SOL deposit is minted as SOL.s once
-   it is finalized on Solana and picked up by the bridge, usually under a
-   minute.
+   (testnet4), or SOL **or any SPL token** (devnet), to it from any wallet.
+   After 2 Bitcoin confirmations you receive SBTC 1:1; a Solana deposit is
+   minted once it is finalized and picked up by the bridge, usually under a
+   minute: SOL as SOL.s, a token under its own origin-suffixed ticker, with
+   the first deposit issuing the asset and later deposits by anyone minting
+   more of the same one, exactly like the Ethereum leg's ERC-20s.
 2. **Unwrap**: enter the Bitcoin or Solana address that should receive the
    released funds; the bridge returns a Sequentia address. Send SBTC or SOL.s
    to it from any wallet, and once the burn is final under Bitcoin anchoring
    the original BTC or SOL is released.
 
-Solana amounts should be at least 0.001 in both directions (below Solana's
-rent-exempt minimum a transfer cannot create the destination account; smaller
-SOL.s returns are parked for the operator) and carry at most 8 decimal
-places: Sequentia amounts have 8, so a 9th decimal place of SOL is dropped
-when minting.
+SOL amounts should be at least 0.001 in both directions (below Solana's
+rent-exempt minimum a lamport transfer cannot create the destination account;
+smaller SOL.s returns are parked for the operator). Token amounts have no
+such floor: the treasury funds the recipient's associated token account on
+release. Sequentia amounts carry 8 decimal places, so decimals beyond 8 are
+dropped when minting (SOL has 9; most SPL mints have 6 or 9).
 
 Only assets that were bridged in can be redeemed; Compages never mints
 Ethereum-side or Solana-side representations of Sequentia-native assets, and
@@ -164,16 +168,26 @@ The Solana leg reuses the redemption-intent idea in both directions. A wrap
 intent binds a fresh operator-derived deposit address (HMAC of a master seed
 and an index, so every address is recoverable from the seed) to a
 pre-validated Sequentia destination; the daemon watches it at `finalized`
-commitment, mints the deposited amount as SOL.s through the same
-issue-or-reissue machinery as the Ethereum leg, and sweeps the lamports into
-the operator treasury (the treasury pays the sweep fee, so the swept amount
-arrives whole). An unwrap intent binds a fresh Sequentia address to a Solana
-destination; SOL.s arriving there is released from the treasury after the
-Bitcoin-anchor finality gate, then destroyed. All Solana-side transaction
-building (legacy transactions, ed25519 via `node:crypto`, base58) is
-hand-rolled in `daemon/lib/sol.js` and byte-for-byte verified against
-`@solana/web3.js` during development; the e2e mock RPC independently decodes
-and signature-checks every submitted transaction.
+commitment and mints whatever arrives through the same issue-or-reissue
+machinery as the Ethereum leg: native SOL from the address's own signature
+stream, and any SPL token from the streams of the token accounts the address
+owns (token transfers to an existing token account do not reference the
+owner, so each token account is scanned with its own cursor). Deposits are
+swept into the operator treasury, which pays every fee and the rent of its
+own associated token accounts, so swept amounts arrive whole. Token identity
+is the mint address; decimals come from the mint account, and the name and
+symbol from the Metaplex metadata account when one exists, else a
+mint-address-prefix fallback (the Ethereum leg's bytes32 fallback, in
+Solana form). An unwrap intent binds a fresh Sequentia address to a Solana
+destination; any Solana-bridged asset arriving there is released from the
+treasury after the Bitcoin-anchor finality gate (creating the recipient's
+associated token account when needed), then destroyed. All Solana-side
+transaction building (legacy transactions, program-derived addresses with
+the ed25519 on-curve check, SPL `transferChecked`, ed25519 via
+`node:crypto`, base58) is hand-rolled in `daemon/lib/sol.js` and
+byte-for-byte verified against `@solana/web3.js` and `@solana/spl-token`
+during development; the e2e mock RPC independently decodes and
+signature-checks every submitted transaction.
 
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
@@ -428,8 +442,12 @@ keys; they hold nothing on any real network.
 - **Single hot key and single process.** The operator keys (Ethereum,
   Solana) sit on the bridge host; state is one JSON file
   (`daemon/lib/state.js`), fine for a PoC, not for volume.
-- **The Solana leg bridges native SOL only.** SPL tokens would need Metaplex
-  metadata resolution and per-mint token accounts; out of scope for the PoC.
+- **Exotic token-2022 extensions are handled honestly but not specially.**
+  Transfer-fee mints bridge and release at the actually-received amounts
+  (detection reads balance deltas, not instruction amounts); transfer-hook or
+  non-transferable mints may leave a deposit unsweepable or a release
+  unexecutable, in which case the record parks for the operator instead of
+  looping.
 - **Unauthenticated intents.** Anyone can create redemption intents; each one
   allocates a wallet address. Harmless at PoC scale, a griefing surface at
   real scale.

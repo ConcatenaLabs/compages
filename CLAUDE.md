@@ -1,10 +1,10 @@
 # Compages
 
 A centralized, operator-run bridge into the Sequentia testnet from three chains: Ethereum
-(Sepolia; lock ether or an ERC-20 in a vault contract, mint a matching Sequentia asset),
+(Sepolia; lock ether or any ERC-20 in a vault contract, mint a matching Sequentia asset),
 Bitcoin (testnet4; BTC to SBTC, proxied to the sbtc-bridge custody service), and Solana
-(devnet; SOL to SOL.s, custody native to the daemon). Sending a bridged asset back releases
-the original funds.
+(devnet; SOL or any SPL token to matching `.s` assets, custody native to the daemon).
+Sending a bridged asset back releases the original funds.
 
 `README.md` states the trust model plainly and documents both flows. Read it first — this file
 covers only the mechanics of working on the code.

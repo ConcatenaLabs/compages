@@ -3,7 +3,15 @@
 
 import { ethers } from "ethers";
 import crypto from "node:crypto";
-import { Sol, keypairFromSeed, transferTx } from "../daemon/lib/sol.js";
+import {
+  Sol,
+  keypairFromSeed,
+  transferTx,
+  buildTx,
+  ataCreateIdempotent,
+  splTransferChecked,
+  ataAddress,
+} from "../daemon/lib/sol.js";
 
 // Asset-id derivation from (issuance prevout, contract_hash), mirroring the
 // registry's deriveAssetId (Elements GenerateAssetEntropy/CalculateAsset via
@@ -222,6 +230,7 @@ check(
 
 // ---------------- test 7: the Solana leg (wrap, sweep, unwrap) ----------------
 let solAssetId = null;
+let msuAssetId = null;
 if (process.env.SOL_RPC) {
   console.log("\n-- Solana leg: wrap SOL into SOL.s, sweep, unwrap back");
   const solUserSeed = crypto.createHash("sha256").update("e2e-sol-user").digest();
@@ -377,6 +386,104 @@ if (process.env.SOL_RPC) {
     assets.find((a) => a.assetId === solAssetId)?.mintedSats
   );
 
+  // ---- SPL parity: any mint bridges like any ERC-20 ----
+  console.log("\n-- SPL: bridge a token with Metaplex metadata (MSU, 6 decimals)");
+  const msu = await sol.rpc("mockCreateMint", [6]);
+  await sol.rpc("mockSetMetadata", [msu, "Mock Sol USD", "MSU"]);
+  await sol.rpc("mockMintTo", [msu, solUser.address, 500_000_000]); // 500 MSU
+  const userMsuAta = ataAddress(solUser.address, msu);
+  const intentMsuAta = ataAddress(wrap.depositAddress, msu);
+  bh = await sol.latestBlockhash();
+  // The same deposit address takes tokens too; the driver plays a normal
+  // wallet: create the recipient's token account, then transferChecked.
+  const msuDep = buildTx({
+    feePayer: solUser,
+    recentBlockhash: bh.blockhash,
+    instructions: [
+      ataCreateIdempotent({ payer: solUser.address, ata: intentMsuAta, owner: wrap.depositAddress, mint: msu }),
+      splTransferChecked({ source: userMsuAta, mint: msu, dest: intentMsuAta, owner: solUser.address, amount: 123_456_789n, decimals: 6 }),
+    ],
+  });
+  await sol.send(msuDep.tx);
+  const msuState = await waitFor("MSU deposit minted", async () => {
+    const r = await api(`sol/wrap/${wrap.depositAddress}`);
+    const d = r.deposits.find((x) => x.mint === msu);
+    return d?.status === "minted" ? d : null;
+  });
+  msuAssetId = msuState.assetId;
+  check("123.456789 MSU -> 123.45678900 on Sequentia", msuState.sats === "12345678900", msuState.sats);
+  assets = await api("assets");
+  const msuMapping = assets.find((a) => a.assetId === msuAssetId);
+  check(
+    "MSU mapping carries the Metaplex metadata and an .s ticker",
+    msuMapping?.symbol === "MSU" && msuMapping?.decimals === 6 && msuMapping?.ticker === "MSU.s",
+    JSON.stringify([msuMapping?.symbol, msuMapping?.decimals, msuMapping?.ticker])
+  );
+  await waitFor("user wallet sees the MSU.s", async () =>
+    (await seqAssetBalance("user", msuAssetId)) === 12345678900 ? 1 : null
+  );
+  check("user Sequentia wallet holds the minted MSU.s", true);
+  await waitFor("intent token account swept to the treasury", async () => {
+    const accts = await sol.tokenAccountsByOwner(wrap.depositAddress);
+    const ta = accts.find((a) => a.mint === msu);
+    return ta && ta.amount === 0n ? 1 : null;
+  });
+  const treasuryMsu = (await sol.tokenAccountsByOwner(solStatus.solTreasury)).find((a) => a.mint === msu);
+  check("treasury token account holds the swept MSU whole", treasuryMsu?.amount === 123_456_789n, `${treasuryMsu?.amount}`);
+
+  console.log("\n-- SPL: unwrap MSU.s back to a fresh Solana wallet");
+  const msuReceiver = keypairFromSeed(crypto.createHash("sha256").update("e2e-msu-receiver").digest());
+  const msuUnwrap = await api("sol/unwrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ solAddress: msuReceiver.address }),
+  });
+  await seqRpc(
+    "sendtoaddress",
+    { address: msuUnwrap.seqAddress, amount: 23.456789, assetlabel: msuAssetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  const msuRedemption = await waitFor(
+    "MSU redemption released + destroyed",
+    async () => {
+      const r = await api(`sol/redeem/${msuUnwrap.seqAddress}`);
+      return r.redemptions[0]?.status === "done" ? r.redemptions[0] : null;
+    },
+    120_000
+  );
+  const recvMsu = (await sol.tokenAccountsByOwner(msuReceiver.address)).find((a) => a.mint === msu);
+  check("receiver got exactly 23.456789 MSU (token account auto-created)", recvMsu?.amount === 23_456_789n, `${recvMsu?.amount}`);
+  check("MSU redemption destroyed the returned MSU.s", !!msuRedemption.destroyTxid);
+  assets = await api("assets");
+  check(
+    "MSU.s circulating supply decreased to 100",
+    assets.find((a) => a.assetId === msuAssetId).mintedSats === "10000000000",
+    assets.find((a) => a.assetId === msuAssetId)?.mintedSats
+  );
+
+  console.log("\n-- SPL: a mint with no metadata gets fallback naming");
+  const anon = await sol.rpc("mockCreateMint", [9]);
+  await sol.rpc("mockMintTo", [anon, solUser.address, 5_000_000_000]);
+  bh = await sol.latestBlockhash();
+  const anonDep = buildTx({
+    feePayer: solUser,
+    recentBlockhash: bh.blockhash,
+    instructions: [
+      ataCreateIdempotent({ payer: solUser.address, ata: ataAddress(wrap.depositAddress, anon), owner: wrap.depositAddress, mint: anon }),
+      splTransferChecked({ source: ataAddress(solUser.address, anon), mint: anon, dest: ataAddress(wrap.depositAddress, anon), owner: solUser.address, amount: 5_000_000_000n, decimals: 9 }),
+    ],
+  });
+  await sol.send(anonDep.tx);
+  const anonState = await waitFor("no-metadata deposit minted", async () => {
+    const r = await api(`sol/wrap/${wrap.depositAddress}`);
+    const d = r.deposits.find((x) => x.mint === anon);
+    return d?.status === "minted" ? d : null;
+  });
+  assets = await api("assets");
+  const anonMapping = assets.find((a) => a.assetId === anonState.assetId);
+  check("fallback symbol is a mint prefix", anonMapping?.symbol === anon.slice(0, 8), anonMapping?.symbol);
+  check("fallback ticker is origin-suffixed", /\.s$/.test(anonMapping?.ticker ?? ""), anonMapping?.ticker);
+
   // Cross-leg guards: an asset sent to the wrong leg's redemption address must
   // park for the operator, never release on the other chain.
   await seqRpc(
@@ -428,6 +535,15 @@ if (process.env.REGISTRY_URL) {
     const [, solTicker, solName] = withSol[solAssetId];
     check("bridged SOL registered as ticker SOL.s", solTicker === "SOL.s", solTicker);
     check("SOL registry name carries the chain origin", solName === "SOL (mock-solana)", solName);
+  }
+  if (msuAssetId) {
+    const withMsu = await waitFor("registry has the SPL-bridged asset", async () => {
+      const m = await reg("/index.minimal.json");
+      return m[msuAssetId] ? m : null;
+    });
+    const [, msuTicker, msuName] = withMsu[msuAssetId];
+    check("bridged SPL token registered as ticker MSU.s", msuTicker === "MSU.s", msuTicker);
+    check("SPL registry name is the Metaplex name with origin", msuName === "Mock Sol USD (mock-solana)", msuName);
   }
 
   // The asset was issued committed to SHA256(canonical-JSON(contract)), so the
