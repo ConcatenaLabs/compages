@@ -3,7 +3,9 @@
 # + the real daemon + real contract deployments, driven by driver.mjs.
 #
 # Requires: foundry (anvil/forge/cast), node >= 20, a Sequentia build
-# (elementsd/elements-cli), the daemon's node_modules installed.
+# (elementsd/elements-cli, v23.3.8 or later: earlier consensus rejects the
+# unblinded reissuance the bridge now performs), the daemon's node_modules
+# installed.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,10 +13,20 @@ REPO="$(dirname "$HERE")"
 RUN="$HERE/run"
 # The node repo lives at ~/Sequentia (renamed from ~/SequentiaByClaude); the
 # binaries sit in build-linux/src on an out-of-tree build, or src/ in-tree.
+SEQ_REPO_SET="${SEQ_REPO:-}"
 SEQ_REPO="${SEQ_REPO:-$HOME/Sequentia}"
 [ -d "$SEQ_REPO" ] || SEQ_REPO="$HOME/SequentiaByClaude"
 SEQ_BIN="$SEQ_REPO/build-linux/src"
 [ -x "$SEQ_BIN/elementsd" ] || SEQ_BIN="$SEQ_REPO/src"
+# A downloaded release build (with its shared libs beside it) beats a stale
+# in-tree binary; set SEQ_REPO explicitly to override either.
+if [ -z "${SEQ_REPO_SET:-}" ] && [ -x "$HOME/seq-binaries-23.3.8/src/elementsd" ]; then
+  case "$("$SEQ_BIN/elementsd" --version 2>/dev/null | head -1)" in
+    *v23.3.[89]*|*v23.4*|*v24*) : ;; # in-tree binary is new enough
+    *) SEQ_BIN="$HOME/seq-binaries-23.3.8/src"
+       export LD_LIBRARY_PATH="$HOME/seq-binaries-23.3.8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+  esac
+fi
 ELD="$SEQ_BIN/elementsd"
 ELC="$SEQ_BIN/elements-cli"
 
@@ -93,15 +105,16 @@ seqcli generatetoaddress 110 "$MINE_ADDR" >/dev/null
 # funds the bridge and the user with FEEX. From here on NOTHING but the miner
 # holds the policy asset, so if any bridge step secretly needed it, it fails.
 # Current node builds accept a fee asset only if it has an explicit exchange
-# rate, INCLUDING the policy asset, so register that before the bootstrap fee.
+# rate, INCLUDING the policy asset, so register that before the bootstrap fee;
+# and since 23.3.8 no transaction has a default fee asset, so name it always.
 seqcli setfeeexchangerates '{"bitcoin": 100000000}' >/dev/null
-FEEX=$(seqcli -rpcwallet=miner issueasset 1000000 0 false | python3 -c "import json,sys;print(json.load(sys.stdin)['asset'])")
+FEEX=$(seqcli -rpcwallet=miner -named issueasset assetamount=1000000 tokenamount=0 blind=false fee_asset=bitcoin | python3 -c "import json,sys;print(json.load(sys.stdin)['asset'])")
 seqcli setfeeexchangerates "{\"bitcoin\": 100000000, \"$FEEX\": 100000000}" >/dev/null
 seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
 BRIDGE_FEE_ADDR=$(seqcli -rpcwallet=compages getnewaddress)
 USER_FEE_ADDR=$(seqcli -rpcwallet=user getnewaddress)
-seqcli -rpcwallet=miner sendtoaddress "$BRIDGE_FEE_ADDR" 100000 "" "" false false 1 unset false "$FEEX" >/dev/null
-seqcli -rpcwallet=miner sendtoaddress "$USER_FEE_ADDR"   1000  "" "" false false 1 unset false "$FEEX" >/dev/null
+seqcli -rpcwallet=miner -named sendtoaddress address="$BRIDGE_FEE_ADDR" amount=100000 assetlabel="$FEEX" fee_asset_label="$FEEX" >/dev/null
+seqcli -rpcwallet=miner -named sendtoaddress address="$USER_FEE_ADDR" amount=1000 assetlabel="$FEEX" fee_asset_label="$FEEX" >/dev/null
 seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
 echo "   FEEX asset: $FEEX"
 echo "   bridge wallet holds ONLY FEEX: $(seqcli -rpcwallet=compages getbalance | tr -d ' \n')"
