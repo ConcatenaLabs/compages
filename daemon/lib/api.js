@@ -175,22 +175,27 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         const out = [];
         for (const m of Object.values(state.data.mappings)) {
           if (only && m.assetId !== only && m.symbol !== only) continue;
-          const sources = Object.values(sourcesOf(m)).map((s) => ({
+          // Read the raw sources, not a defaulted copy: whether a source keeps
+          // an escrow ledger at all is the very thing being reported, and
+          // substituting zero for "never tracked" would erase the distinction
+          // before it could be measured.
+          const rawSources = Object.values(sourcesOf(m));
+          const escrowTracked = rawSources.length > 0 && rawSources.every((s) => s.escrowedUnits !== undefined);
+          const sources = rawSources.map((s) => ({
             tokenKey: s.tokenKey,
             chainId: s.chainId,
             token: s.token,
             decimals: s.decimals,
-            escrowedUnits: s.escrowedUnits ?? "0",
+            escrowedUnits: s.escrowedUnits ?? null,
           }));
-          // An escrow ledger only exists for sources that keep one. Assets
-          // bridged before it did have no recorded escrow, and reporting their
-          // escrow as zero would be a claim, not a measurement, so their
-          // backing is reported as unknown instead of asserted.
-          const escrowTracked = sources.length > 0 && sources.every((s) => s.escrowedUnits !== undefined);
+          // Assets bridged before the escrow ledger existed have no figure at
+          // all, and printing zero would turn "never tracked" into "nothing
+          // there", so their backing is reported as unknown rather than
+          // asserted.
           let escrowedAtoms = null;
           if (escrowTracked) {
             escrowedAtoms = 0n;
-            for (const s of sources) {
+            for (const s of rawSources) {
               escrowedAtoms += unitsToAtoms(s.escrowedUnits, s.decimals, m.precision);
             }
           }
