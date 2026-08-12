@@ -1,8 +1,10 @@
 # Compages
 
-A centralized, operator-run bridge between Ethereum (Sepolia) and the Sequentia testnet. Users
-lock ether or an ERC-20 in a vault contract and receive a matching Sequentia asset; sending the
-bridged asset back releases the original funds.
+A centralized, operator-run bridge into the Sequentia testnet from three chains: Ethereum
+(Sepolia; lock ether or an ERC-20 in a vault contract, mint a matching Sequentia asset),
+Bitcoin (testnet4; BTC to SBTC, proxied to the sbtc-bridge custody service), and Solana
+(devnet; SOL to SOL.s, custody native to the daemon). Sending a bridged asset back releases
+the original funds.
 
 `README.md` states the trust model plainly and documents both flows. Read it first — this file
 covers only the mechanics of working on the code.
@@ -15,9 +17,9 @@ Node and consensus conventions live in the
 | Path | What |
 |---|---|
 | `contracts/` | Foundry project. One contract, `src/CompagesVault.sol`, with `test/CompagesVault.t.sol` and `script/Deploy.s.sol`. |
-| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,seqrpc,state}.js`. Node with one dependency, `ethers`. It also serves the web front-end. |
+| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,seqrpc,state}.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format; keep it dependency-free). It also serves the web front-end. |
 | `web/` | `index.html` + `app.js`, served by the daemon. |
-| `e2e/` | `run-e2e.sh` and `driver.mjs`. |
+| `e2e/` | `run-e2e.sh`, `driver.mjs`, and `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions). |
 
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
@@ -30,7 +32,8 @@ server.
 ## Finality is measured against Bitcoin, not Sequentia blocks
 
 This is the design decision the whole bridge rests on, and it is easy to "simplify" into a fund
-loss. Releasing on Ethereum is irreversible, so the Sequentia burn that triggers it must be final.
+loss. Releasing on Ethereum or Solana is irreversible, so the Sequentia burn that triggers it
+must be final.
 Bitcoin anchoring is Sequentia's supreme consensus rule: a burn buried under many Sequentia blocks
 is still undone if its Bitcoin anchor is reorged.
 
@@ -59,6 +62,13 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   was a specific fix; Sequentia has an open fee market and no privileged unit.
 - Chain ids, RPC endpoints, the vault address and confirmation depths are all configuration, and
   asset mappings are keyed per chain id. Keep it that way.
+- **Solana transfers are replay-guarded by precomputed signatures.** A Solana transaction's id is
+  its fee payer's signature, known before broadcast; the daemon persists it (with the blockhash's
+  `lastValidBlockHeight`) BEFORE sending, and after a crash the chain itself answers whether the
+  transfer landed or can never land. Never "simplify" this into send-then-record.
+- **An asset returned to the wrong leg's redemption address parks as `ignored_wrong_network`.**
+  SOL.s must never reach the Ethereum vault release path, nor an Ethereum-bridged asset the
+  Solana treasury; both directions are guarded and e2e-tested.
 
 ## Secrets
 

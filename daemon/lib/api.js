@@ -131,6 +131,11 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           ethConfirmations: cfg.ethConfirmations,
           seqConfirmations: cfg.seqConfirmations,
           btcAnchorConfirmations: cfg.btcAnchorConfirmations ?? 3,
+          btcChainName: cfg.btcChainName ?? "Bitcoin testnet4",
+          btcConfigured: !!cfg.sbtcBridgeUrl,
+          solChainName: cfg.solChainName ?? "Solana devnet",
+          solConfigured: !!bridge.sol,
+          ...(bridge.sol ? { solTreasury: bridge.sol.treasury.address } : {}),
           maxSatsPerAsset: SEQ_MAX_SATS.toString(),
           bridgedAssets: Object.keys(state.data.mappings).length,
           deposits: Object.keys(state.data.deposits).length,
@@ -176,7 +181,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
 
       if (req.method === "GET" && parts[1] === "redeem" && parts[2]) {
         const seqAddress = parts[2];
-        const intent = state.data.redeemIntents[seqAddress];
+        const intent = Object.hasOwn(state.data.redeemIntents, seqAddress)
+          ? state.data.redeemIntents[seqAddress]
+          : null;
         if (!intent) return send(404, { error: "unknown redemption address" });
         const events = Object.values(state.data.redemptions).filter(
           (r) => r.seqAddress === seqAddress
@@ -206,7 +213,8 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       // never sees it.
       if (req.method === "POST" && parts[1] === "btc" && parts[2] === "wrap") {
         if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = parseJson(await readBody(req));
+        if (!body) return send(400, { error: "invalid JSON body" });
         if (!body.seqAddress) return send(400, { error: "seqAddress required" });
         const r = await sbtcBridge("/pegin", { seq_recipient: String(body.seqAddress) });
         if (!r.ok || !r.deposit_address) return send(502, { error: r.error || "bridge error" });
@@ -216,9 +224,82 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           note: `Send BTC (testnet4) to this address from any Bitcoin wallet. After ${cfg.btcConfirmations ?? 2} confirmations you receive the same amount of SBTC at ${body.seqAddress}, 1:1.`,
         });
       }
+      // --- Solana bridge (SOL <-> SOL.s) --------------------------------------------------------
+      // Address-based like the Bitcoin leg (no wallet extension: the user sends
+      // SOL / SOL.s from any wallet to a bridge-allocated address), but custody
+      // is native to this daemon: intent addresses are operator-derived,
+      // deposits are minted as SOL.s and swept to the operator treasury, and
+      // releases are paid from it.
+      if (parts[1] === "sol") {
+        if (!bridge.sol) return send(503, { error: "the Solana bridge is not configured" });
+        const solName = cfg.solChainName ?? "Solana devnet";
+        if (req.method === "POST" && parts[2] === "wrap" && !parts[3]) {
+          const body = parseJson(await readBody(req));
+          if (!body) return send(400, { error: "invalid JSON body" });
+          if (!body.seqAddress) return send(400, { error: "seqAddress required" });
+          let depositAddress;
+          try {
+            depositAddress = await bridge.createSolWrapIntent(String(body.seqAddress));
+          } catch (e) {
+            if (e.badRequest) return send(400, { error: e.message });
+            throw e;
+          }
+          return send(200, {
+            depositAddress,
+            seqAddress: body.seqAddress,
+            note: `Send SOL (${solName}) to this address from any Solana wallet; at least 0.001 SOL, with at most 8 decimal places (Sequentia amounts have 8; a 9th decimal place of SOL is dropped). Once the transfer is finalized on Solana and picked up by the bridge, usually under a minute, the SOL.s is minted to ${body.seqAddress}.`,
+          });
+        }
+        if (req.method === "GET" && parts[2] === "wrap" && parts[3]) {
+          const intent = Object.hasOwn(state.data.solWrapIntents, parts[3])
+            ? state.data.solWrapIntents[parts[3]]
+            : null;
+          if (!intent) return send(404, { error: "unknown deposit address" });
+          const deposits = Object.values(state.data.solDeposits)
+            .filter((d) => d.address === parts[3])
+            .map(publicDeposit);
+          return send(200, {
+            depositAddress: parts[3],
+            seqAddress: intent.seqAddress,
+            createdAt: intent.createdAt,
+            deposits,
+          });
+        }
+        if (req.method === "POST" && parts[2] === "unwrap" && !parts[3]) {
+          const body = parseJson(await readBody(req));
+          if (!body) return send(400, { error: "invalid JSON body" });
+          if (!body.solAddress) return send(400, { error: "solAddress required" });
+          let seqAddress;
+          try {
+            seqAddress = await bridge.createSolRedeemIntent(String(body.solAddress));
+          } catch (e) {
+            if (e.badRequest) return send(400, { error: e.message });
+            throw e;
+          }
+          return send(200, {
+            seqAddress,
+            solAddress: body.solAddress,
+            note: `Send at least 0.001 SOL.s to this Sequentia address from any wallet (smaller amounts cannot create a Solana account and are parked for the operator). Once the burn is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 3} Bitcoin-anchor confirmations), the SOL is released to ${body.solAddress} on ${solName}. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
+          });
+        }
+        if (req.method === "GET" && parts[2] === "redeem" && parts[3]) {
+          const seqAddress = parts[3];
+          const intent = Object.hasOwn(state.data.solRedeemIntents, seqAddress)
+            ? state.data.solRedeemIntents[seqAddress]
+            : null;
+          if (!intent) return send(404, { error: "unknown redemption address" });
+          const redemptions = Object.values(state.data.solRedemptions).filter(
+            (r) => r.seqAddress === seqAddress
+          );
+          return send(200, { seqAddress, ...intent, redemptions });
+        }
+        return send(404, { error: "not found" });
+      }
+
       if (req.method === "POST" && parts[1] === "btc" && parts[2] === "unwrap") {
         if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = parseJson(await readBody(req));
+        if (!body) return send(400, { error: "invalid JSON body" });
         if (!body.btcAddress) return send(400, { error: "btcAddress required" });
         const r = await sbtcBridge("/pegout", { btc_dest: String(body.btcAddress) });
         if (!r.ok || !r.sbtc_address) return send(502, { error: r.error || "bridge error" });
@@ -247,9 +328,24 @@ function readBody(req) {
     let data = "";
     req.on("data", (c) => {
       data += c;
-      if (data.length > 65536) reject(new Error("body too large"));
+      if (data.length > 65536) {
+        // Settle AND stop the stream: rejecting alone would keep buffering
+        // whatever the client cares to send until its timeout.
+        reject(new Error("body too large"));
+        req.destroy();
+      }
     });
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
+}
+
+/** JSON.parse that answers null for malformed bodies (a client error, not a
+ *  server fault: callers turn it into a 400). */
+function parseJson(raw) {
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return null;
+  }
 }

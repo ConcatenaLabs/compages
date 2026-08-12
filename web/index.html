@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Compages: bridge Ethereum and Sequentia</title>
+<title>Compages: bridge into the Sequentia network</title>
 <style>
   :root {
     --ink: #0b0e11;
@@ -14,6 +14,8 @@
     --muted: #93a0ac;
     --gold: #ffc629;
     --ether: #8b95fc;
+    --btc: #f7931a;
+    --sol: #9d6cff;
     --ok: #57c98a;
     --warn: #ff6f61;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
@@ -79,6 +81,8 @@
   }
   .net { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; }
   .net.eth { border-color: color-mix(in srgb, var(--ether) 45%, transparent); color: var(--ether); }
+  .net.btc { border-color: color-mix(in srgb, var(--btc) 45%, transparent); color: var(--btc); }
+  .net.sol { border-color: color-mix(in srgb, var(--sol) 45%, transparent); color: var(--sol); }
   .net.seq { border-color: color-mix(in srgb, var(--gold) 45%, transparent); color: var(--gold); }
   .nets .beam { color: var(--gold); letter-spacing: -1px; }
 
@@ -261,8 +265,9 @@
 <header>
   <div class="wordmark">COMPA<span class="pin">&#9679;</span>GES</div>
   <div class="etym">comp&#257;g&#275;s: a joining together; a framework</div>
+  <!-- The left pill follows the "Bridge from" selector (app.js showNetwork). -->
   <div class="nets">
-    <span class="net eth" id="net-eth">Sepolia</span>
+    <span class="net eth" id="net-from">Sepolia</span>
     <span class="beam">&#9552;&#9552;&#9679;&#9552;&#9552;</span>
     <span class="net seq" id="net-seq">Sequentia testnet</span>
   </div>
@@ -275,6 +280,7 @@
     <select id="net-choice">
       <option value="eth">Ethereum (Sepolia)</option>
       <option value="btc">Bitcoin (Testnet4)</option>
+      <option value="sol">Solana (Devnet)</option>
     </select>
   </div>
 
@@ -411,7 +417,7 @@
 
   <!-- Bitcoin bridge (BTC <-> SBTC). Address-based (no wallet connect): the user sends BTC / SBTC
        from any wallet to a bridge-allocated address. Proxied to the sbtc-bridge by the daemon. -->
-  <div class="card" id="btc-card">
+  <div class="card hide" id="btc-card">
     <div class="direction" role="tablist">
       <button class="plate active" id="tab-wrap" role="tab" aria-selected="true">
         Bitcoin &#8594; SBTC
@@ -464,14 +470,86 @@
       </div>
     </div>
   </div>
+
+  <!-- Solana bridge (SOL <-> SOL.s). Address-based like the Bitcoin leg: the user sends SOL / SOL.s
+       from any wallet to a bridge-allocated address. Custody is the daemon's own devnet treasury. -->
+  <div class="card hide" id="sol-card">
+    <div class="direction" role="tablist">
+      <button class="plate active" id="tab-sol-wrap" role="tab" aria-selected="true">
+        Solana &#8594; Sequentia
+        <small>lock SOL, mint SOL.s</small>
+      </button>
+      <div class="joint" aria-hidden="true"><div class="pin-dot"></div></div>
+      <button class="plate" id="tab-sol-unwrap" role="tab" aria-selected="false">
+        Sequentia &#8594; Solana
+        <small>burn SOL.s, release SOL</small>
+      </button>
+    </div>
+
+    <!-- wrap panel: SOL -> SOL.s -->
+    <div class="body" id="panel-sol-wrap">
+      <div class="field">
+        <label>Your Sequentia address (receives SOL.s)</label>
+        <input class="mono" id="sol-wrap-seqaddr" placeholder="tb1&hellip; (your Sequentia wallet address)" spellcheck="false">
+      </div>
+      <button class="action" id="btn-sol-wrap">Get a Solana deposit address</button>
+      <div class="statusline" id="sol-wrap-status"></div>
+      <div class="hide" id="sol-wrap-result">
+        <div class="field">
+          <label>Send SOL (devnet) to this address</label>
+          <div class="bigaddr" id="sol-wrap-addr"></div>
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="copybtn" id="btn-sol-wrap-copy">copy address</button>
+          </div>
+          <div class="note" id="sol-wrap-note" style="margin-top:10px"></div>
+        </div>
+        <div class="field">
+          <label>Deposits to this address</label>
+          <div class="events" id="sol-wrap-events"><span class="note">nothing received yet</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- unwrap panel: SOL.s -> SOL -->
+    <div class="body hide" id="panel-sol-unwrap">
+      <div class="note">
+        <strong>The SOL is released only after the return transaction's Bitcoin
+        anchor is buried deep enough that a Bitcoin reorg cannot undo it</strong>,
+        not simply once the transfer confirms on Sequentia. On Sequentia, Bitcoin
+        anchoring is the supreme consensus rule, so a confirmed Sequentia
+        transaction can still be reversed until its Bitcoin anchor is final.
+      </div>
+      <div class="field">
+        <label>Your Solana address (receives SOL)</label>
+        <input class="mono" id="sol-unwrap-addr-input" placeholder="your Solana devnet wallet address" spellcheck="false">
+      </div>
+      <button class="action" id="btn-sol-unwrap">Get a SOL.s return address</button>
+      <div class="statusline" id="sol-unwrap-status"></div>
+      <div class="hide" id="sol-unwrap-result">
+        <div class="field">
+          <label>Send SOL.s to this Sequentia address</label>
+          <div class="bigaddr" id="sol-unwrap-addr"></div>
+          <div class="row" style="justify-content:center;margin-top:8px">
+            <button class="copybtn" id="btn-sol-unwrap-copy">copy address</button>
+          </div>
+          <div class="note" id="sol-unwrap-note" style="margin-top:10px"></div>
+        </div>
+        <div class="field">
+          <label>Redemptions on this address</label>
+          <div class="events" id="sol-unwrap-events"><span class="note">nothing received yet</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </main>
 
 <footer>
   <div>
-    Compages is a centralized proof-of-concept bridge into the Sequentia network,
-    from Ethereum (lock in a vault, mint) and from Bitcoin (SBTC: lock BTC in an
-    operator multisig, mint 1:1). Mints, releases, and BTC custody are performed by
-    the bridge operator. You are trusting that operator.
+    Compages is a centralized proof-of-concept bridge into the Sequentia network:
+    from Ethereum (lock in a vault, mint), from Bitcoin (SBTC: lock BTC in an
+    operator multisig, mint 1:1), and from Solana (lock SOL with the operator,
+    mint SOL.s 1:1). Mints, releases, and custody are performed by the bridge
+    operator. You are trusting that operator.
   </div>
   <div style="margin-top:6px">
     Vault: <span class="mono" id="vault-line">&hellip;</span>

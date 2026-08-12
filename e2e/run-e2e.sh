@@ -9,14 +9,20 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 RUN="$HERE/run"
-SEQ_REPO="${SEQ_REPO:-$HOME/SequentiaByClaude}"
-ELD="$SEQ_REPO/build-linux/src/elementsd"
-ELC="$SEQ_REPO/build-linux/src/elements-cli"
+# The node repo lives at ~/Sequentia (renamed from ~/SequentiaByClaude); the
+# binaries sit in build-linux/src on an out-of-tree build, or src/ in-tree.
+SEQ_REPO="${SEQ_REPO:-$HOME/Sequentia}"
+[ -d "$SEQ_REPO" ] || SEQ_REPO="$HOME/SequentiaByClaude"
+SEQ_BIN="$SEQ_REPO/build-linux/src"
+[ -x "$SEQ_BIN/elementsd" ] || SEQ_BIN="$SEQ_REPO/src"
+ELD="$SEQ_BIN/elementsd"
+ELC="$SEQ_BIN/elements-cli"
 
 ANVIL_PORT=8545
 SEQ_RPC=18892
 SEQ_P2P=18893
 API_PORT=9950
+SOL_PORT=18999
 REGISTRY_PORT=13005
 REGISTRY_REPO="${REGISTRY_REPO:-$HOME/sequentia-registry}"
 REGISTRY_TOKEN=e2e-admin-token
@@ -33,6 +39,7 @@ cleanup() {
   set +e
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
   [ -n "${REGISTRY_PID:-}" ] && kill "$REGISTRY_PID" 2>/dev/null
+  [ -n "${SOL_PID:-}" ] && kill "$SOL_PID" 2>/dev/null
   seqcli stop >/dev/null 2>&1
   [ -n "${ANVIL_PID:-}" ] && kill "$ANVIL_PID" 2>/dev/null
   sleep 1
@@ -85,8 +92,11 @@ seqcli generatetoaddress 110 "$MINE_ADDR" >/dev/null
 # the policy asset), registers it as an accepted fee asset on the node, then
 # funds the bridge and the user with FEEX. From here on NOTHING but the miner
 # holds the policy asset, so if any bridge step secretly needed it, it fails.
+# Current node builds accept a fee asset only if it has an explicit exchange
+# rate, INCLUDING the policy asset, so register that before the bootstrap fee.
+seqcli setfeeexchangerates '{"bitcoin": 100000000}' >/dev/null
 FEEX=$(seqcli -rpcwallet=miner issueasset 1000000 0 false | python3 -c "import json,sys;print(json.load(sys.stdin)['asset'])")
-seqcli setfeeexchangerates "{\"$FEEX\": 100000000}" >/dev/null
+seqcli setfeeexchangerates "{\"bitcoin\": 100000000, \"$FEEX\": 100000000}" >/dev/null
 seqcli generatetoaddress 1 "$MINE_ADDR" >/dev/null
 BRIDGE_FEE_ADDR=$(seqcli -rpcwallet=compages getnewaddress)
 USER_FEE_ADDR=$(seqcli -rpcwallet=user getnewaddress)
@@ -111,6 +121,20 @@ else
   REGISTRY_URL=""
 fi
 
+echo "== starting mock solana"
+# A mock Solana RPC (in-memory ledger; decodes + signature-checks submitted
+# transactions). Must be up before the daemon: compagesd verifies the genesis
+# hash at startup.
+node "$HERE/mock-solana.mjs" --port $SOL_PORT > "$RUN/solana.log" 2>&1 &
+SOL_PID=$!
+for _ in $(seq 1 40); do
+  curl -s -X POST -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' \
+    "http://127.0.0.1:$SOL_PORT" 2>/dev/null | grep -q result && break
+  sleep 0.25
+done
+echo "   $(head -1 "$RUN/solana.log")"
+
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
 {
@@ -130,6 +154,11 @@ cat > "$RUN/config.json" <<EOF
   "registryUrl": "$REGISTRY_URL",
   "registryAdminToken": "$REGISTRY_TOKEN",
   "assetDomain": "bridge.compages.test",
+  "solChainName": "mock-solana",
+  "solChainLabel": "solana-mock",
+  "solRpcUrl": "http://127.0.0.1:$SOL_PORT",
+  "solGenesisHash": "3NKPKdsWGec7jmBYUwyXr326VY74s4z8hwu6QAiRco1P",
+  "solKeyFile": "solana.key",
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -148,7 +177,7 @@ echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
-REGISTRY_URL=$REGISTRY_URL \
+REGISTRY_URL=$REGISTRY_URL SOL_RPC=http://127.0.0.1:$SOL_PORT \
 node "$HERE/driver.mjs"
 RC=$?
 

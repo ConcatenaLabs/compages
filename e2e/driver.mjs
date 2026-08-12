@@ -3,6 +3,7 @@
 
 import { ethers } from "ethers";
 import crypto from "node:crypto";
+import { Sol, keypairFromSeed, transferTx } from "../daemon/lib/sol.js";
 
 // Asset-id derivation from (issuance prevout, contract_hash), mirroring the
 // registry's deriveAssetId (Elements GenerateAssetEntropy/CalculateAsset via
@@ -219,7 +220,193 @@ check(
   `policy balance ${bridgeBal["bitcoin"] ?? 0}`
 );
 
-// ---------------- test 7: asset registry integration ----------------
+// ---------------- test 7: the Solana leg (wrap, sweep, unwrap) ----------------
+let solAssetId = null;
+if (process.env.SOL_RPC) {
+  console.log("\n-- Solana leg: wrap SOL into SOL.s, sweep, unwrap back");
+  const solUserSeed = crypto.createHash("sha256").update("e2e-sol-user").digest();
+  const solUser = keypairFromSeed(solUserSeed);
+  const sol = new Sol({ solRpcUrl: process.env.SOL_RPC }, solUserSeed);
+  const solStatus = await api("status");
+  check(
+    "status reports the Solana leg configured",
+    solStatus.solConfigured === true && !!solStatus.solTreasury,
+    solStatus.solTreasury
+  );
+  // Fund the user, and the daemon treasury (it pays sweep fees and releases).
+  await sol.requestAirdrop(solUser.address, 2_000_000_000);
+  await sol.requestAirdrop(solStatus.solTreasury, 1_000_000_000);
+  await waitFor("airdrops finalized", async () =>
+    (await sol.balance(solUser.address)) >= 2_000_000_000n ? 1 : null
+  );
+
+  const wrapSeqAddr = await seqRpc("getnewaddress", {}, "user");
+  const wrap = await api("sol/wrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ seqAddress: wrapSeqAddr }),
+  });
+  check("wrap intent returns a Solana deposit address", !!wrap.depositAddress, wrap.depositAddress);
+  // This leg validates the Sequentia destination up front instead of refunding.
+  const badWrap = await fetch(`${API}/sol/wrap`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ seqAddress: "zzzzzzzzzzzzzzzzzzzzzzzz" }),
+  });
+  check("wrap intent rejects an invalid Sequentia address up front", badWrap.status === 400);
+  const badJson = await fetch(`${API}/sol/wrap`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{not json",
+  });
+  check("malformed JSON body is a 400, not a 500", badJson.status === 400, `${badJson.status}`);
+  const wrapAgain = await api("sol/wrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ seqAddress: wrapSeqAddr }),
+  });
+  check(
+    "re-requesting a wrap for the same destination revives the same address",
+    wrapAgain.depositAddress === wrap.depositAddress,
+    wrapAgain.depositAddress
+  );
+
+  // Deposit 0.5 SOL "from any wallet": the driver builds its own transfer.
+  let bh = await sol.latestBlockhash();
+  const solDep1 = transferTx({
+    feePayer: solUser,
+    source: solUser,
+    dest: wrap.depositAddress,
+    lamports: 500_000_000n,
+    recentBlockhash: bh.blockhash,
+  });
+  await sol.send(solDep1.tx);
+  const wrapState = await waitFor("SOL deposit minted", async () => {
+    const r = await api(`sol/wrap/${wrap.depositAddress}`);
+    return r.deposits[0]?.status === "minted" ? r : null;
+  });
+  const solDep = wrapState.deposits[0];
+  solAssetId = solDep.assetId;
+  check("0.5 SOL -> 0.50000000 SOL.s", solDep.sats === "50000000", solDep.sats);
+  await waitFor("user wallet sees 0.5 SOL.s", async () =>
+    (await seqAssetBalance("user", solAssetId)) === 50000000 ? 1 : null
+  );
+  check("user Sequentia wallet holds the minted SOL.s", true);
+  assets = await api("assets");
+  check("three bridged assets now (MUSD.e, ETH.e, SOL.s)", assets.length === 3, `${assets.length}`);
+  const solMapping = assets.find((a) => a.assetId === solAssetId);
+  check(
+    "SOL mapping metadata (symbol, decimals, origin-suffixed ticker)",
+    solMapping.symbol === "SOL" && solMapping.decimals === 9 && solMapping.ticker === "SOL.s",
+    JSON.stringify([solMapping.symbol, solMapping.decimals, solMapping.ticker])
+  );
+
+  // A second deposit to the same address must reissue the same asset.
+  bh = await sol.latestBlockhash();
+  const solDep2 = transferTx({
+    feePayer: solUser,
+    source: solUser,
+    dest: wrap.depositAddress,
+    lamports: 250_000_000n,
+    recentBlockhash: bh.blockhash,
+  });
+  await sol.send(solDep2.tx);
+  await waitFor("second SOL deposit minted", async () => {
+    const r = await api(`sol/wrap/${wrap.depositAddress}`);
+    return r.deposits.length === 2 && r.deposits.every((d) => d.status === "minted") ? r : null;
+  });
+  assets = await api("assets");
+  check(
+    "second SOL deposit reissued the SAME asset (supply 0.75)",
+    assets.filter((a) => a.symbol === "SOL").length === 1 &&
+      assets.find((a) => a.assetId === solAssetId).mintedSats === "75000000",
+    assets.find((a) => a.assetId === solAssetId)?.mintedSats
+  );
+
+  // Deposits are swept into the treasury; the treasury pays each sweep's fee
+  // (10,000 lamports: a sweep carries two signatures at 5000 each), so the
+  // swept amounts arrive whole. 1 or 2 sweeps depending on tick timing.
+  await waitFor("deposit address swept to the treasury", async () =>
+    (await sol.balance(wrap.depositAddress)) === 0n ? 1 : null
+  );
+  const treasuryAfterSweep = await sol.balance(solStatus.solTreasury);
+  check(
+    "treasury holds both deposits minus only sweep fees",
+    treasuryAfterSweep >= 1_750_000_000n - 20_000n && treasuryAfterSweep <= 1_750_000_000n - 10_000n,
+    `${treasuryAfterSweep}`
+  );
+
+  // Unwrap: send SOL.s back; SOL must arrive at a fresh Solana address.
+  const solReceiver = keypairFromSeed(crypto.createHash("sha256").update("e2e-sol-receiver").digest());
+  const unwrap = await api("sol/unwrap", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ solAddress: solReceiver.address }),
+  });
+  console.log(`SOL.s return address: ${unwrap.seqAddress}`);
+  const badUnwrap = await fetch(`${API}/sol/unwrap`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ solAddress: "not-base58!" }),
+  });
+  check("unwrap intent rejects an invalid Solana address", badUnwrap.status === 400);
+  await seqRpc(
+    "sendtoaddress",
+    { address: unwrap.seqAddress, amount: 0.3, assetlabel: solAssetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  const solRedemption = await waitFor(
+    "SOL redemption released + destroyed",
+    async () => {
+      const r = await api(`sol/redeem/${unwrap.seqAddress}`);
+      return r.redemptions[0]?.status === "done" ? r.redemptions[0] : null;
+    },
+    120_000
+  );
+  check(
+    "receiver got exactly 0.3 SOL on Solana",
+    (await sol.balance(solReceiver.address)) === 300_000_000n,
+    `${await sol.balance(solReceiver.address)}`
+  );
+  check("SOL redemption destroyed the returned SOL.s", !!solRedemption.destroyTxid);
+  check("SOL redemption recorded its release signature", !!solRedemption.releaseSig, solRedemption.releaseSig?.slice(0, 12));
+  assets = await api("assets");
+  check(
+    "SOL.s circulating supply decreased to 0.45",
+    assets.find((a) => a.assetId === solAssetId).mintedSats === "45000000",
+    assets.find((a) => a.assetId === solAssetId)?.mintedSats
+  );
+
+  // Cross-leg guards: an asset sent to the wrong leg's redemption address must
+  // park for the operator, never release on the other chain.
+  await seqRpc(
+    "sendtoaddress",
+    { address: unwrap.seqAddress, amount: 1, assetlabel: minted1.assetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  await waitFor("MUSD.e to a Solana unwrap address parks as wrong-network", async () => {
+    const r = await api(`sol/redeem/${unwrap.seqAddress}`);
+    return r.redemptions.find((x) => x.assetId === minted1.assetId && x.status === "ignored_wrong_network") ? 1 : null;
+  });
+  check("Ethereum-bridged asset to a Solana unwrap address is parked, not released", true);
+  const ethIntent2 = await api("redeem", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ethAddress: RECEIVER }),
+  });
+  await seqRpc(
+    "sendtoaddress",
+    { address: ethIntent2.seqAddress, amount: 0.05, assetlabel: solAssetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  await waitFor("SOL.s to an Ethereum redemption address parks as wrong-network", async () => {
+    const r = await api(`redeem/${ethIntent2.seqAddress}`);
+    return r.redemptions.find((x) => x.assetId === solAssetId && x.status === "ignored_wrong_network") ? 1 : null;
+  });
+  check("SOL.s to an Ethereum redemption address is parked, not released", true);
+}
+
+// ---------------- test 8: asset registry integration ----------------
 if (process.env.REGISTRY_URL) {
   console.log("\n-- asset registry: bridged assets registered with human-readable metadata");
   const reg = async (p) => (await fetch(`${process.env.REGISTRY_URL}${p}`)).json();
@@ -233,6 +420,15 @@ if (process.env.REGISTRY_URL) {
   check("registry precision is 8", precision === 8, `${precision}`);
   check("registry name is concise with origin marker", name === "Mock USD (anvil)", name);
   check("bridged ETH registered as ticker ETH.e", minimal[minted3.assetId]?.[1] === "ETH.e", minimal[minted3.assetId]?.[1]);
+  if (solAssetId) {
+    const withSol = await waitFor("registry has the SOL-bridged asset", async () => {
+      const m = await reg("/index.minimal.json");
+      return m[solAssetId] ? m : null;
+    });
+    const [, solTicker, solName] = withSol[solAssetId];
+    check("bridged SOL registered as ticker SOL.s", solTicker === "SOL.s", solTicker);
+    check("SOL registry name carries the chain origin", solName === "SOL (mock-solana)", solName);
+  }
 
   // The asset was issued committed to SHA256(canonical-JSON(contract)), so the
   // metadata is bound on-chain, not just asserted by the operator.

@@ -2,11 +2,21 @@
 
 *compāgēs: a joining together; a framework.*
 
-Compages is a centralized, operator-run bridge between **Ethereum** and the
-**Sequentia network**. Users lock ether or any ERC-20 token in a vault contract
-on Ethereum and receive a matching asset on Sequentia; sending the bridged
-asset back releases the original funds on Ethereum. It is a proof of concept
-running on the **Sepolia** testnet and the **Sequentia public testnet**, live at:
+Compages is a centralized, operator-run bridge into the **Sequentia network**
+from three chains:
+
+- **Ethereum**: lock ether or any ERC-20 in a vault contract, receive a
+  matching Sequentia asset (`SYMBOL.e`); sending it back releases the
+  original funds.
+- **Bitcoin**: send BTC to a bridge address and receive SBTC 1:1 (custody and
+  mint/burn are performed by the sbtc-bridge service; Compages is the public
+  front for it).
+- **Solana**: send SOL to a bridge address and receive SOL.s; sending it back
+  releases the SOL.
+
+It is a proof of concept running on the **Sepolia** testnet, **Bitcoin
+testnet4** and the **Solana devnet** against the **Sequentia public testnet**,
+live at:
 
 > **https://sequentiatestnet.com/bridge/**
 
@@ -32,9 +42,17 @@ Within that assumption, the design removes every failure mode it can:
 - Redeemed Sequentia amounts are destroyed, keeping the circulating bridged
   supply equal to the locked Ethereum funds.
 - Deposits that cannot be delivered (invalid Sequentia address, amount not
-  representable) are refunded automatically on Ethereum.
-- Releases on Ethereum are gated on **Bitcoin-anchor finality** of the
-  Sequentia burn, not on a Sequentia block count (see below).
+  representable) are refunded automatically on Ethereum. The Solana leg
+  removes the failure mode instead: the Sequentia destination is validated
+  before a deposit address is ever handed out.
+- Irreversible releases (on Ethereum and on Solana alike) are gated on
+  **Bitcoin-anchor finality** of the Sequentia burn, not on a Sequentia block
+  count (see below).
+- Solana transfers have no vault contract to replay-guard them, so the daemon
+  uses the chain itself: a Solana transaction's id is its fee payer's
+  signature, known before broadcast, and every outbound transfer's signature
+  is persisted before sending. After a crash the recorded signature answers,
+  on chain, whether the transfer landed or can never land.
 
 ## Status
 
@@ -43,7 +61,9 @@ Within that assumption, the design removes every failure mode it can:
 | Ethereum → Sequentia (lock, then mint) | Working on the live deployment; ETH and ERC-20 deposits, first-bridge issuance, duplicate-free reissuance, automatic refunds |
 | Sequentia → Ethereum (return, then release) | Implemented and exercised end-to-end in `e2e/run-e2e.sh`; live redemptions wait for 100 Bitcoin-anchor confirmations before releasing (see "Finality") |
 | Vault contract | `CompagesVault` deployed on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41); 13 Foundry unit tests |
-| Asset Registry integration | Bridged assets are registered with `SYMBOL.e` tickers, bound on-chain via the issuance contract hash |
+| Bitcoin ↔ SBTC (wrap, unwrap) | Live; address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
+| Solana ↔ SOL.s (wrap, sweep, unwrap) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) and exercised end-to-end against a mock Solana RPC in `e2e/run-e2e.sh` |
+| Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
 | Web front-end | Live at https://sequentiatestnet.com/bridge/, served by the daemon itself |
 
 Chain ids, RPC endpoints, the vault address and confirmation depths are all
@@ -83,8 +103,32 @@ code pins it to a particular network. It has only ever run on testnets.
    Sequentia amount is destroyed. The page shows each redemption's progress;
    "Resume a redemption" looks a redemption up again by its address.
 
+### Bitcoin ↔ SBTC and Solana ↔ SOL.s
+
+Both legs are address-based; no wallet extension is involved. Pick the chain
+in the "Bridge from" selector:
+
+1. **Wrap**: enter the Sequentia address that should receive the bridged
+   asset; the bridge returns a deposit address on the origin chain. Send BTC
+   (testnet4) or SOL (devnet) to it from any wallet. After 2 Bitcoin
+   confirmations you receive SBTC 1:1; a SOL deposit is minted as SOL.s once
+   it is finalized on Solana and picked up by the bridge, usually under a
+   minute.
+2. **Unwrap**: enter the Bitcoin or Solana address that should receive the
+   released funds; the bridge returns a Sequentia address. Send SBTC or SOL.s
+   to it from any wallet, and once the burn is final under Bitcoin anchoring
+   the original BTC or SOL is released.
+
+Solana amounts should be at least 0.001 in both directions (below Solana's
+rent-exempt minimum a transfer cannot create the destination account; smaller
+SOL.s returns are parked for the operator) and carry at most 8 decimal
+places: Sequentia amounts have 8, so a 9th decimal place of SOL is dropped
+when minting.
+
 Only assets that were bridged in can be redeemed; Compages never mints
-Ethereum-side representations of Sequentia-native assets.
+Ethereum-side or Solana-side representations of Sequentia-native assets, and
+an asset returned to the wrong leg's redemption address is parked for the
+operator, never released on the wrong chain.
 
 ## How it works
 
@@ -114,10 +158,27 @@ daemon refunds a deposit too small to represent).
    `release()` on the vault to pay the locked ether or tokens to the bound
    Ethereum address, then destroys the returned Sequentia amount.
 
+### Solana ↔ Sequentia (intent-based, no contract)
+
+The Solana leg reuses the redemption-intent idea in both directions. A wrap
+intent binds a fresh operator-derived deposit address (HMAC of a master seed
+and an index, so every address is recoverable from the seed) to a
+pre-validated Sequentia destination; the daemon watches it at `finalized`
+commitment, mints the deposited amount as SOL.s through the same
+issue-or-reissue machinery as the Ethereum leg, and sweeps the lamports into
+the operator treasury (the treasury pays the sweep fee, so the swept amount
+arrives whole). An unwrap intent binds a fresh Sequentia address to a Solana
+destination; SOL.s arriving there is released from the treasury after the
+Bitcoin-anchor finality gate, then destroyed. All Solana-side transaction
+building (legacy transactions, ed25519 via `node:crypto`, base58) is
+hand-rolled in `daemon/lib/sol.js` and byte-for-byte verified against
+`@solana/web3.js` during development; the e2e mock RPC independently decodes
+and signature-checks every submitted transaction.
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
-Releasing on Ethereum is irreversible, so the burn that triggers it must be
-final. On Sequentia, **Bitcoin anchoring is the supreme consensus rule**:
+Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
+must be final. On Sequentia, **Bitcoin anchoring is the supreme consensus rule**:
 every Sequentia block references a Bitcoin block, and if that Bitcoin block is
 reorged the Sequentia block is discarded in real time, no matter how many
 Sequentia blocks were built on top. A burn buried under many Sequentia blocks
@@ -145,9 +206,10 @@ anchored finality.
 
 Each bridged asset is registered in the
 [Sequentia Asset Registry](https://github.com/GracedEternalKingCabbageMan/sequentia-registry)
-with the ticker `SYMBOL.e` (the `.e` marks it Ethereum-bridged and avoids
-colliding with native assets) and the name `<token name> (<chain name>)`, e.g.
-`Ether (Sepolia)` as `ETH.e`. The asset is issued committed to
+with an origin-suffixed ticker (`.e` marks it Ethereum-bridged, `.s`
+Solana-bridged; the suffix avoids colliding with native assets) and the name
+`<token name> (<chain name>)`, e.g. `Ether (Sepolia)` as `ETH.e` and
+`SOL (Solana devnet)` as `SOL.s`. The asset is issued committed to
 `SHA256(canonical-JSON(contract))` as its contract hash, so the metadata is
 bound on-chain and independently verifiable, not just asserted by the
 operator. Registration is best-effort and retried; it never blocks a mint.
@@ -204,12 +266,20 @@ secrets, and the only mutating call creates a redemption intent.
 | `POST /api/redeem` `{"ethAddress": "0x..."}` | Create a redemption intent; returns the Sequentia address to send bridged assets to |
 | `GET /api/redeem/<seqAddress>` | A redemption address's bound Ethereum address and the status of every redemption seen on it |
 | `GET /api/deposit/tx/<ethTxHash>` | Look up deposits by their Ethereum transaction hash (used to track and resume deposits) |
+| `POST /api/btc/wrap` `{"seqAddress": "..."}` | Bitcoin deposit address for a BTC → SBTC wrap (proxied to the sbtc-bridge) |
+| `POST /api/btc/unwrap` `{"btcAddress": "..."}` | Sequentia return address for an SBTC → BTC unwrap (proxied to the sbtc-bridge) |
+| `POST /api/sol/wrap` `{"seqAddress": "..."}` | Solana deposit address for a SOL → SOL.s wrap (the Sequentia address is validated up front) |
+| `GET /api/sol/wrap/<solAddress>` | A wrap intent's bound Sequentia address and the status of every deposit seen on it |
+| `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
+| `GET /api/sol/redeem/<seqAddress>` | A Solana unwrap address's bound Solana destination and the status of every redemption seen on it |
 
 Deposit records move through the statuses `minting`, `mint_retry`,
 `send_retry`, `minted` (delivered), `refund_pending`, `refunded`, and
-`failed_manual` (paused for operator review). Redemption records move through
+`failed_manual` (paused for operator review; Solana deposits use `dust_manual`
+instead of the refund states). Redemption records move through
 `awaiting_finality`, `new`, `releasing`, `released`, `destroy_pending`, `done`,
-plus the terminal `dust_ignored`, `ignored_unknown_asset` and
+plus the terminal `dust_ignored`, `ignored_unknown_asset`,
+`ignored_wrong_network` (an asset returned to the wrong leg's address) and
 `release_failed_manual`.
 
 Try it against the live instance:
@@ -265,6 +335,12 @@ Configuration reference (`daemon/config.example.json`):
 | `btcAnchorConfirmations` | Bitcoin-anchor depth required before a release (see "Finality") |
 | `registryUrl`, `registryAdminToken`, `assetDomain` | Asset Registry endpoint, optional admin token, and the entity domain written into asset contracts |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
+| `sbtcBridgeUrl`, `sbtcBridgeToken`, `btcConfirmations` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg) |
+| `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |
+| `solGenesisHash` | Expected cluster genesis hash, verified before the leg acts (the Ethereum chain-id check's Solana equivalent) |
+| `solKeyFile` | 32-byte hex seed for the Solana treasury and deposit-address derivation; generated on first boot, never commit it |
+| `solWatchDays` | How long a wrap intent's deposit address is polled (default 7 days); re-requesting a wrap for the same Sequentia address revives it |
+| `solMinReleaseSats` | Smallest SOL.s return that is released (default 100000 sats = 0.001 SOL, clear of Solana's rent-exempt minimum) |
 | `apiHost`, `apiPort` | Where the API + web app listen |
 | `pollIntervalMs` | Main loop interval |
 | `stateFile` | Path of the JSON state file |
@@ -303,9 +379,9 @@ The daemon is crash-safe by design (state file + on-chain replay guards), so
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule) |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server) |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server) |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
-| `e2e/` | Full-stack end-to-end test: anvil + Sequentia `elementsregtest` + the real daemon and contracts |
+| `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
 
 The daemon's only runtime dependency is `ethers`.
 
@@ -325,13 +401,16 @@ Full end-to-end test:
 e2e/run-e2e.sh
 ```
 
-Brings up anvil, deploys the vault and a mock ERC-20, starts a Sequentia
-`elementsregtest` node and the daemon, then drives the full lifecycle:
-first-bridge issuance, duplicate-free reissuance, native ether bridging,
-redemption with exact release and supply destruction, automatic refund of an
-undeliverable deposit, fee-asset independence (the bridge wallet never touches
-the policy asset), and registry metadata binding. Requires foundry, node >= 20
-and a build of the Sequentia node (set `SEQ_REPO` to your checkout of the
+Brings up anvil, a mock Solana RPC (an in-memory ledger that independently
+decodes and signature-checks every submitted transaction), deploys the vault
+and a mock ERC-20, starts a Sequentia `elementsregtest` node and the daemon,
+then drives the full lifecycle: first-bridge issuance, duplicate-free
+reissuance, native ether bridging, redemption with exact release and supply
+destruction, automatic refund of an undeliverable deposit, the Solana leg
+(wrap, reissue, sweep, unwrap, and the cross-leg wrong-network guards),
+fee-asset independence (the bridge wallet never touches the policy asset),
+and registry metadata binding. Requires foundry, node >= 20 and a build of
+the Sequentia node (set `SEQ_REPO` to your checkout of the
 [Sequentia repo](https://github.com/GracedEternalKingCabbageMan/Sequentia));
 the registry checks are skipped unless `REGISTRY_REPO` points at a checkout of
 `sequentia-registry`.
@@ -344,14 +423,21 @@ keys; they hold nothing on any real network.
 - **Centralized custody.** The operator's key controls the vault; there is no
   multisig, no threshold scheme, no fraud proofs. Do not use this design to
   hold funds of value.
-- **Testnet only.** Sepolia and the Sequentia public testnet; all tokens are
-  worthless.
-- **Single hot key and single process.** The operator key sits on the bridge
-  host; state is one JSON file (`daemon/lib/state.js`), fine for a PoC,
-  not for volume.
+- **Testnet only.** Sepolia, Bitcoin testnet4, the Solana devnet and the
+  Sequentia public testnet; all tokens are worthless.
+- **Single hot key and single process.** The operator keys (Ethereum,
+  Solana) sit on the bridge host; state is one JSON file
+  (`daemon/lib/state.js`), fine for a PoC, not for volume.
+- **The Solana leg bridges native SOL only.** SPL tokens would need Metaplex
+  metadata resolution and per-mint token accounts; out of scope for the PoC.
 - **Unauthenticated intents.** Anyone can create redemption intents; each one
   allocates a wallet address. Harmless at PoC scale, a griefing surface at
   real scale.
+- **The state file is the Solana leg's replay guard.** The Ethereum leg
+  reconciles against the vault's on-chain `processedRedemptions` after any
+  state loss; the Solana leg has no contract, so `state.json` is what stops
+  double-mints and double-releases there. Treat it like a wallet: keep it on
+  durable storage, and never restore an old copy while the daemon can act.
 - **Redemptions are slow by design** on the live deployment: 100
   Bitcoin-anchor confirmations, because Bitcoin testnet4 allows deep reorgs.
 

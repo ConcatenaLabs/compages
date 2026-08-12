@@ -23,6 +23,12 @@
   "sbtcBridgeToken": "<the sbtc-bridge HTTP token; the daemon proxies /btc/wrap + /btc/unwrap to it so the browser never holds a secret. Omit to disable the Bitcoin bridge.>",
   "btcConfirmations": 2,
 
+  "solChainName": "Solana devnet",
+  "solChainLabel": "solana-devnet",
+  "solRpcUrl": "https://api.devnet.solana.com",
+  "solGenesisHash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+  "solKeyFile": "solana.key",
+
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
   "pollIntervalMs": 15000,
