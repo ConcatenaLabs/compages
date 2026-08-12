@@ -947,6 +947,66 @@ async function refreshSolRedemptions(seqAddress) {
   }
 }
 
+/** Render proof of reserves: what is locked on each source chain, beside what
+ *  actually circulates on Sequentia.
+ *
+ *  Assets bridged before the escrow ledger existed have no recorded figure, and
+ *  showing zero for them would turn "never measured" into "nothing there", so
+ *  they are shown as untracked rather than given a verdict. */
+async function refreshReserves() {
+  const box = $("por-body");
+  if (!box) return;
+  let por;
+  try {
+    por = await api("por");
+  } catch (e) {
+    box.textContent = `reserves unavailable: ${e.message}`;
+    return;
+  }
+  const rows = (por.assets ?? []).filter((a) => a.escrowTracked || a.chainCirculatingAtoms !== null);
+  if (!rows.length) {
+    box.textContent = "no bridged assets yet";
+    return;
+  }
+  // Atoms are the consensus amount; precision is only how they are displayed.
+  const scale = (atoms, precision) => {
+    if (atoms === null || atoms === undefined) return null;
+    const neg = String(atoms).startsWith("-");
+    const digits = String(atoms).replace("-", "").padStart(precision + 1, "0");
+    const whole = digits.slice(0, digits.length - precision) || "0";
+    const frac = precision ? "." + digits.slice(digits.length - precision) : "";
+    return (neg ? "-" : "") + whole + frac;
+  };
+  box.innerHTML = "";
+  for (const a of rows) {
+    const line = document.createElement("div");
+    line.style.marginTop = "6px";
+    const precision = a.precision ?? 8;
+    const supply = scale(a.chainCirculatingAtoms, precision);
+    const escrow = scale(a.escrowedAtoms, precision);
+    const label = a.ticker ?? a.symbol ?? a.assetId.slice(0, 12);
+    let verdict;
+    if (a.backed === true) verdict = "fully backed";
+    else if (a.backed === false) verdict = "SHORT: escrow is below circulating supply";
+    else if (a.chainSupplyError) verdict = `not verifiable: ${a.chainSupplyError}`;
+    else verdict = "escrow not tracked for this asset";
+    line.innerHTML =
+      `<span class="mono">${label}</span>: ` +
+      `${supply === null ? "supply unknown" : `${supply} in circulation`}, ` +
+      `${escrow === null ? "escrow not tracked" : `${escrow} locked`} &mdash; ${verdict}`;
+    if (Array.isArray(a.sources) && a.sources.length > 1) {
+      const per = a.sources
+        .map((s) => `${s.chainId}: ${s.escrowedUnits === null ? "untracked" : s.escrowedUnits}`)
+        .join(", ");
+      const sub = document.createElement("div");
+      sub.className = "note";
+      sub.textContent = `locked per chain, in that chain's base units — ${per}`;
+      line.appendChild(sub);
+    }
+    box.appendChild(line);
+  }
+}
+
 async function refreshAssets() {
   try {
     assets = await api("assets");
@@ -993,6 +1053,7 @@ async function init() {
       ` not a Sequentia block count.`;
 
   await refreshAssets();
+  refreshReserves().catch(() => {});
 
   $("btn-connect").onclick = () =>
     account && walletChainId !== status.ethChainId ? switchNetwork() : connect();

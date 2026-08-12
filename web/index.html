@@ -580,6 +580,23 @@
   <div style="margin-top:6px">
     Vault: <span class="mono" id="vault-line">&hellip;</span>
   </div>
+
+  <!-- Proof of reserves. A bridged asset's whole claim is that every unit in
+       circulation is backed one for one by a unit locked on its source chain,
+       so both sides are published rather than asserted. Circulating supply is
+       read from the Sequentia chain itself, not from the bridge's own books,
+       so a bug in the bridge shows up here as a discrepancy instead of
+       quietly agreeing with itself. -->
+  <div style="margin-top:14px">
+    <div style="font-weight:600">Reserves</div>
+    <div style="margin-top:4px">
+      Every unit in circulation is backed by a unit locked on its source chain.
+      The circulating figures below are read from the Sequentia chain, not from
+      the bridge's own records. Raw data:
+      <a href="api/por" target="_blank" rel="noopener">api/por</a>.
+    </div>
+    <div id="por-body" style="margin-top:8px">&hellip;</div>
+  </div>
 </footer>
 
 <script type="module" src="app.js"></script>
