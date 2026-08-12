@@ -7,7 +7,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
-import { tokenKeyOf, SEQ_MAX_SATS } from "./bridge.js";
+import { tokenKeyOf, sourcesOf, SEQ_MAX_SATS } from "./bridge.js";
+import { unitsToAtoms } from "./eth.js";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -41,9 +42,23 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   }
 
   function publicMapping(m) {
+    const sources = Object.values(sourcesOf(m));
     return {
       tokenKey: m.tokenKey,
       chainId: m.chainId, // which leg bridged it (ethChainId number, or a chain label)
+      // A unified asset is bridged from several chains at once, so a caller
+      // filtering per leg must ask which chains it serves rather than which
+      // single one it came from.
+      unified: m.unified ?? false,
+      chainIds: sources.map((s) => s.chainId),
+      sources: sources.map((s) => ({
+        tokenKey: s.tokenKey,
+        chainId: s.chainId,
+        token: s.token,
+        decimals: s.decimals,
+        escrowedUnits: s.escrowedUnits ?? "0",
+      })),
+      precision: m.precision ?? 8,
       token: m.token,
       symbol: m.symbol,
       name: m.name,
@@ -147,6 +162,63 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
 
       if (req.method === "GET" && parts[1] === "assets") {
         return send(200, Object.values(state.data.mappings).map(publicMapping));
+      }
+
+      // Proof of reserves. A bridged asset's whole claim is that every unit in
+      // circulation is backed one-for-one by a unit escrowed on its source
+      // chain, so the bridge publishes both sides and their difference rather
+      // than asking anyone to take it on trust. Circulating supply is read
+      // from the Sequentia chain itself, not from the daemon's own ledger, so
+      // a bug in this daemon shows up here as a discrepancy instead of hiding.
+      if (req.method === "GET" && parts[1] === "por") {
+        const only = url.searchParams.get("asset");
+        const out = [];
+        for (const m of Object.values(state.data.mappings)) {
+          if (only && m.assetId !== only && m.symbol !== only) continue;
+          const sources = Object.values(sourcesOf(m)).map((s) => ({
+            tokenKey: s.tokenKey,
+            chainId: s.chainId,
+            token: s.token,
+            decimals: s.decimals,
+            escrowedUnits: s.escrowedUnits ?? "0",
+          }));
+          // Escrow is denominated in each source's base units; atoms are the
+          // common denominator, so convert before summing across chains.
+          let escrowedAtoms = 0n;
+          for (const s of sources) {
+            escrowedAtoms += unitsToAtoms(s.escrowedUnits ?? "0", s.decimals, m.precision);
+          }
+          let chainSupply = null;
+          let chainError = null;
+          try {
+            chainSupply = (await bridge.chainSupplyAtoms(m.assetId)).toString();
+          } catch (e) {
+            chainError = e.message;
+          }
+          const ledger = BigInt(m.mintedSats ?? "0");
+          out.push({
+            assetId: m.assetId,
+            symbol: m.symbol,
+            ticker: m.contract?.ticker ?? null,
+            precision: m.precision ?? 8,
+            unified: m.unified ?? false,
+            sources,
+            escrowedAtoms: escrowedAtoms.toString(),
+            ledgerCirculatingAtoms: ledger.toString(),
+            chainCirculatingAtoms: chainSupply,
+            chainSupplyError: chainError,
+            // Backing must never be short. In flight, a deposit is escrowed
+            // before it is minted and a redemption is burned before it is
+            // released, so escrow may legitimately EXCEED circulation for a
+            // while; the reverse would mean unbacked units exist.
+            backed: chainSupply === null ? null : escrowedAtoms >= BigInt(chainSupply),
+            ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
+          });
+        }
+        return send(200, {
+          generatedAt: new Date().toISOString(),
+          assets: out,
+        });
       }
 
       if (req.method === "GET" && parts[1] === "token" && parts[2]) {

@@ -107,6 +107,12 @@ async function main() {
   state.save();
   bridge.reconcileInterrupted();
 
+  // Unified assets are issued before the first deposit can be accepted, so a
+  // deposit is never the thing that creates one. If this fails the daemon must
+  // not run: minting into an asset that does not exist, or one issued with the
+  // wrong permanent parameters, cannot be undone afterwards.
+  await bridge.ensureUnifiedAssets();
+
   startApi(cfg, eth, seq, state, bridge, log);
 
   // --- main loop, one pass at a time ---

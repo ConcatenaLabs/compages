@@ -29,6 +29,27 @@
   "solGenesisHash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
   "solKeyFile": "solana.key",
 
+  "unifiedIssuerPubkey": "<33-byte compressed pubkey the bridge wallet controls, PINNED. It is hashed into every unified asset's id and later authorizes handing the asset's registry identity to its issuer, so generate it once, back it up, and never change it.>",
+  "unified": {
+    "USDC": {
+      "name": "Bridged USDC (Compages)",
+      "ticker": "USDC.e",
+      "precision": 6,
+      "sources": {
+        "11155111:0x1c7d4b196cb0c7b01d743fbc6116a902379c7238": {
+          "chainId": 11155111,
+          "token": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+          "decimals": 6
+        },
+        "solana-devnet:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU": {
+          "chainId": "solana-devnet",
+          "token": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+          "decimals": 6
+        }
+      }
+    }
+  },
+
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
   "pollIntervalMs": 15000,

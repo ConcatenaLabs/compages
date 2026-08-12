@@ -11,8 +11,14 @@ const DEFAULTS = () => ({
   lastEthBlock: 0,
   // Sequentia scan cursor for listsinceblock.
   seqLastBlockHash: null,
-  // tokenKey ("chainId:0x..." | "chainId:eth") -> asset mapping
+  // mapping key -> asset mapping. Usually the key IS a token key
+  // ("chainId:0x..." | "chainId:eth"); a unified asset is keyed
+  // "unified:SYMBOL" instead, because it is fed by several chains at once.
   mappings: {},
+  // tokenKey -> mapping key, for the sources of a unified asset. This is what
+  // makes a second source chain reissue the one asset instead of minting a
+  // rival one, so it is the guard against splitting a token's liquidity.
+  tokenRoutes: {},
   // deposit nonce -> record
   deposits: {},
   // sequentia redeem address -> { ethAddress, createdAt }

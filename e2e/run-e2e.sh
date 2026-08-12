@@ -84,6 +84,18 @@ echo "   vault: $VAULT   musd: $MUSD"
 cast send "$MUSD" "mint(address,uint256)" $USER_ADDR 1000000000 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
 
+# A stand-in for Circle's USDC on the Ethereum side of the unified asset. The
+# same dollar also arrives from Solana (an SPL mint created below), and both
+# must land on ONE Sequentia asset rather than two rival ones.
+USDC_ETH=$(forge create test/mocks/MockTokens.sol:MockERC20 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args "USD Coin" "USDC" 6 \
+  | awk '/Deployed to:/ {print $3}')
+[ -n "$USDC_ETH" ] || { echo "USDC deploy failed"; exit 1; }
+cast send "$USDC_ETH" "mint(address,uint256)" $USER_ADDR 1000000000 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
+echo "   usdc(eth): $USDC_ETH"
+
 echo "== starting Sequentia elementsregtest node"
 "$ELD" -datadir="$RUN/seq" -chain=elementsregtest \
   -rpcport=$SEQ_RPC -port=$SEQ_P2P -rpcuser=e2e -rpcpassword=e2e \
@@ -148,6 +160,19 @@ for _ in $(seq 1 40); do
 done
 echo "   $(head -1 "$RUN/solana.log")"
 
+# The Solana side of the unified asset. Its address must be known before the
+# daemon starts, because a unified asset's sources are configuration: the
+# bridge only ever unifies tokens an operator has explicitly declared to be
+# the same money, never tokens that merely share a symbol.
+solrpc() {
+  curl -s -X POST -H 'content-type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":$2}" \
+    "http://127.0.0.1:$SOL_PORT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])'
+}
+USDC_SOL=$(solrpc mockCreateMint '[6]')
+solrpc mockSetMetadata "[\"$USDC_SOL\", \"USD Coin\", \"USDC\"]" >/dev/null
+echo "   usdc(sol): $USDC_SOL"
+
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
 {
@@ -172,6 +197,25 @@ cat > "$RUN/config.json" <<EOF
   "solRpcUrl": "http://127.0.0.1:$SOL_PORT",
   "solGenesisHash": "3NKPKdsWGec7jmBYUwyXr326VY74s4z8hwu6QAiRco1P",
   "solKeyFile": "solana.key",
+  "unified": {
+    "USDC": {
+      "name": "Bridged USDC (Compages)",
+      "ticker": "USDC.e",
+      "precision": 6,
+      "sources": {
+        "31337:$(echo "$USDC_ETH" | tr 'A-Z' 'a-z')": {
+          "chainId": 31337,
+          "token": "$USDC_ETH",
+          "decimals": 6
+        },
+        "solana-mock:$USDC_SOL": {
+          "chainId": "solana-mock",
+          "token": "$USDC_SOL",
+          "decimals": 6
+        }
+      }
+    }
+  },
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -189,6 +233,7 @@ kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log";
 echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
+USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
 REGISTRY_URL=$REGISTRY_URL SOL_RPC=http://127.0.0.1:$SOL_PORT \
 node "$HERE/driver.mjs"

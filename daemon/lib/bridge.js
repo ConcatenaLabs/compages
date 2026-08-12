@@ -24,7 +24,7 @@
 import crypto from "node:crypto";
 import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
-import { unitsToSats, satsToUnits } from "./eth.js";
+import { unitsToSats, satsToUnits, unitsToAtoms, atomsToUnits } from "./eth.js";
 import {
   transferTx,
   buildTx,
@@ -81,6 +81,58 @@ export function tokenKeyOf(chainId, token) {
     : `${chainId}:${token.toLowerCase()}`;
 }
 
+/** The mapping key of a unified asset: one Sequentia asset fed by several
+ *  source chains, keyed by its symbol rather than by any one chain's token. */
+export function unifiedKeyOf(symbol) {
+  return `unified:${String(symbol).toUpperCase()}`;
+}
+
+/** A token key as the deposit paths spell it.
+ *
+ *  Ethereum addresses are case-insensitive hex and are stored lowercased
+ *  (tokenKeyOf does the same). Solana mints are base58, where case carries
+ *  meaning: lowercasing one yields a key no deposit can ever match, so a
+ *  configured source would sit there looking correct and never route. */
+export function normalizeTokenKey(tokenKey) {
+  const key = String(tokenKey);
+  const sep = key.indexOf(":");
+  if (sep < 0) return key;
+  const chain = key.slice(0, sep);
+  const token = key.slice(sep + 1);
+  return token.startsWith("0x") || token === "eth"
+    ? `${chain}:${token.toLowerCase()}`
+    : `${chain}:${token}`;
+}
+
+/** Every source a mapping serves, as { tokenKey: source }.
+ *
+ *  An ordinary bridged asset has exactly one source, its own token on its own
+ *  chain, which older state files do not spell out; synthesize it so callers
+ *  can treat every mapping the same way. A unified asset carries its sources
+ *  explicitly, one per chain, and is the only kind with more than one. */
+export function sourcesOf(mapping) {
+  if (mapping.sources) return mapping.sources;
+  return {
+    [mapping.tokenKey]: {
+      tokenKey: mapping.tokenKey,
+      chainId: mapping.chainId,
+      token: mapping.token,
+      decimals: mapping.decimals,
+      tokenProgram: mapping.tokenProgram,
+    },
+  };
+}
+
+/** The source this mapping serves on `chainId`, or null if it serves none.
+ *  This is what makes a redemption's release target come from the ROUTED
+ *  source rather than from whichever record an asset-id lookup returned. */
+export function sourceForChain(mapping, chainId) {
+  for (const src of Object.values(sourcesOf(mapping))) {
+    if (src.chainId === chainId) return src;
+  }
+  return null;
+}
+
 export function refundId(chainId, nonce) {
   return ethers.keccak256(ethers.toUtf8Bytes(`compages:refund:${chainId}:${nonce}`));
 }
@@ -105,6 +157,230 @@ export class Bridge {
     this.state = state;
     this.log = log;
     this.sol = sol;
+  }
+
+  // ================= Unified assets =================
+  //
+  // Normally one bridged token gets one Sequentia asset, so a token key IS a
+  // mapping key. USDC breaks that: the same dollar arrives from Ethereum and
+  // from Solana, and issuing an asset per chain would hand the network two
+  // non-fungible USDCs, the exact liquidity split Circle's Bridged USDC
+  // Standard exists to prevent. So a unified asset is ONE mapping fed by
+  // several token keys, and `tokenRoutes` points each of those keys at it.
+  //
+  // Everything downstream keeps working on a single mapping record, which is
+  // what keeps supply accounting honest: one asset, one circulating figure,
+  // one registry contract. Per-chain facts (which token, how many decimals,
+  // how much is escrowed there) live per source instead.
+
+  /** The mapping serving `tokenKey`, following a unified route if there is
+   *  one. Returns undefined when nothing bridges that token yet. */
+  mappingFor(tokenKey) {
+    const s = this.state.data;
+    return s.mappings[this.mappingKeyFor(tokenKey)];
+  }
+
+  /** The mapping key `tokenKey` belongs to: itself, or the unified asset that
+   *  claims it. */
+  mappingKeyFor(tokenKey) {
+    return this.state.data.tokenRoutes?.[tokenKey] ?? tokenKey;
+  }
+
+  /** Does this mapping serve this exact source? Used as the wrong-network
+   *  guard, so an asset can only ever be released on a chain it is actually
+   *  backed on. For an ordinary mapping the answer is "only my own token key",
+   *  identical to the single-chain rule it replaces. */
+  mappingServesSource(mapping, tokenKey) {
+    return Boolean(sourcesOf(mapping)[tokenKey]);
+  }
+
+  /** Unified asset definitions from config, keyed by mapping key. */
+  unifiedDefs() {
+    const out = {};
+    for (const [symbol, def] of Object.entries(this.cfg.unified ?? {})) {
+      out[unifiedKeyOf(symbol)] = { symbol, ...def };
+    }
+    return out;
+  }
+
+  /** Issue every configured unified asset that does not exist yet, and route
+   *  its sources to it.
+   *
+   *  This is a deliberate ceremony rather than a side effect of the first
+   *  deposit: the asset is created with ZERO supply and exactly ONE reissuance
+   *  token, so backing is exact from the very first atom and the mint
+   *  authority is a single, transferable object. It runs before any deposit is
+   *  accepted, and is idempotent, so a restart re-routes without re-issuing.
+   *
+   *  Every parameter here is permanent. The contract (name, ticker, domain,
+   *  issuer key) is hashed into the asset id, and the precision is read from
+   *  this issuance forever, so none of it can be corrected later. */
+  async ensureUnifiedAssets() {
+    const s = this.state.data;
+    const defs = this.unifiedDefs();
+    if (!Object.keys(defs).length) return;
+    s.tokenRoutes ??= {};
+
+    for (const [mappingKey, def] of Object.entries(defs)) {
+      const sources = def.sources ?? {};
+      if (!Object.keys(sources).length) {
+        throw new Error(`unified asset ${def.symbol} has no sources configured`);
+      }
+      let mapping = s.mappings[mappingKey];
+
+      if (!mapping) {
+        const precision = def.precision ?? 8;
+        const contract = await this.buildAssetContract(
+          { symbol: def.symbol, name: def.name },
+          null,
+          null,
+          { ticker: def.ticker, name: def.name, precision }
+        );
+        const ch = contractHash(contract);
+        // Zero asset amount, one reissuance token: nothing circulates until a
+        // deposit is verified, and the token supply is fixed at 1 forever so
+        // "who can mint" is answerable by looking at who holds it.
+        const issued = await this.seq.call("issueasset", {
+          assetamount: 0,
+          tokenamount: 1,
+          blind: false,
+          contract_hash: ch,
+          denomination: precision,
+          ...(this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {}),
+        });
+        if (!(await this.waitWalletTxVisible(issued.txid))) {
+          await this.seq.call("abandontransaction", { txid: issued.txid }).catch(() => {});
+          throw new Error(`unified ${def.symbol}: issuance tx never reached the mempool`);
+        }
+        mapping = {
+          tokenKey: mappingKey,
+          unified: true,
+          symbol: def.symbol,
+          name: def.name,
+          precision,
+          assetId: issued.asset,
+          reissuanceToken: issued.token,
+          entropy: issued.entropy,
+          issueTxid: issued.txid,
+          mintedSats: "0",
+          sources: {},
+          contract,
+          contractHash: ch,
+          registered: false,
+          createdAt: new Date().toISOString(),
+        };
+        s.mappings[mappingKey] = mapping;
+        this.state.save();
+        this.log(
+          `unified ${def.symbol}: issued Sequentia asset ${issued.asset} as ${contract.ticker} ` +
+            `(precision ${precision}, zero supply, 1 reissuance token ${issued.token})`
+        );
+        await this.registerAsset(mapping).catch((e) =>
+          this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
+        );
+      }
+
+      // Route every configured source at this asset. Adding a source later is
+      // just a config change plus a restart; it never mints a second asset,
+      // because the route makes the deposit path find this mapping.
+      mapping.sources ??= {};
+      for (const [tokenKey, src] of Object.entries(sources)) {
+        // Ethereum token keys are case-insensitive hex and are stored
+        // lowercased; Solana mints are base58, where case is significant and
+        // lowercasing would silently produce a key no deposit can ever match.
+        const key = normalizeTokenKey(tokenKey);
+        mapping.sources[key] ??= {
+          tokenKey: key,
+          chainId: src.chainId,
+          token: src.token,
+          decimals: src.decimals,
+          tokenProgram: src.tokenProgram,
+          escrowedUnits: "0",
+        };
+        // Config is the authority on identity; escrow is the daemon's ledger.
+        Object.assign(mapping.sources[key], {
+          chainId: src.chainId,
+          token: src.token,
+          decimals: src.decimals,
+          ...(src.tokenProgram ? { tokenProgram: src.tokenProgram } : {}),
+        });
+        if (s.tokenRoutes[key] !== mappingKey) {
+          s.tokenRoutes[key] = mappingKey;
+          this.log(`unified ${def.symbol}: routed ${key} -> ${mappingKey}`);
+        }
+      }
+      this.state.save();
+    }
+  }
+
+  /** Record that `units` more of a source's token now sit in that chain's
+   *  escrow. The sum of these across sources is what circulating supply must
+   *  equal; see /api/por. */
+  creditEscrow(mapping, tokenKey, units) {
+    // Only a mapping with persisted sources keeps an escrow ledger. An
+    // ordinary bridged asset predates the ledger and its source is synthesized
+    // on read, so there is nowhere to record this; its backing is still the
+    // vault balance, which the release checks against directly.
+    const src = mapping.sources?.[tokenKey];
+    if (!src) return;
+    src.escrowedUnits = (BigInt(src.escrowedUnits ?? "0") + BigInt(units)).toString();
+  }
+
+  /** Circulating supply of an asset in atoms, read from the Sequentia chain
+   *  rather than from this daemon's own bookkeeping.
+   *
+   *  That independence is the point: proof of reserves compares escrow against
+   *  what the CHAIN says is circulating, so a bug in the daemon's ledger shows
+   *  up as a discrepancy instead of quietly agreeing with itself. The node has
+   *  no per-asset supply index, so supply is reconstructed the same way the
+   *  standard's auditor does it, from issuances minus burns; the wallet has
+   *  seen every one of this bridge's own issuances, which is what listissuances
+   *  reports. A blinded issuance would be unknowable, so refuse to report a
+   *  number rather than report a wrong one. */
+  async chainSupplyAtoms(assetId) {
+    const issuances = await this.seq.call("listissuances", { asset: assetId });
+    let atoms = 0n;
+    for (const iss of issuances) {
+      // Read the amount from the transaction itself rather than from
+      // listissuances, whose `assetamount` is -1 both for a blinded issuance
+      // AND for an explicit zero one (a token-only issuance, exactly what the
+      // unified ceremony performs), which would make the two indistinguishable.
+      // In the raw transaction they are not: an explicit amount appears as
+      // `assetamount`, a blinded one as `assetamountcommitment`, and an
+      // issuance that mints no units of the asset carries neither.
+      const wtx = await this.seq.call("gettransaction", { txid: iss.txid });
+      const decoded = await this.seq.call("decoderawtransaction", { hexstring: wtx.hex });
+      const issuance = decoded.vin?.[iss.vin]?.issuance;
+      if (!issuance) continue;
+      if (issuance.assetamountcommitment) {
+        throw new Error(`asset ${assetId} has a blinded issuance; supply is not knowable`);
+      }
+      if (issuance.assetamount === undefined) continue; // mints no units
+      atoms += amountToSats(issuance.assetamount);
+    }
+    const burned = await this.burnedAtoms(assetId);
+    return atoms - burned;
+  }
+
+  /** Atoms of an asset this bridge has provably destroyed, summed from the
+   *  wallet's own burn transactions. */
+  async burnedAtoms(assetId) {
+    let burned = 0n;
+    for (const rec of Object.values(this.state.data.redemptions)) {
+      if (rec.assetId === assetId && rec.destroyTxid) burned += BigInt(rec.sats);
+    }
+    for (const rec of Object.values(this.state.data.solRedemptions)) {
+      if (rec.assetId === assetId && rec.destroyTxid) burned += BigInt(rec.sats);
+    }
+    return burned;
+  }
+
+  /** Record that `units` left a source's escrow on release. */
+  debitEscrow(mapping, tokenKey, units) {
+    const src = mapping.sources?.[tokenKey];
+    if (!src) return;
+    const now = BigInt(src.escrowedUnits ?? "0") - BigInt(units);
+    src.escrowedUnits = (now < 0n ? 0n : now).toString();
   }
 
   // ================= Ethereum -> Sequentia =================
@@ -188,13 +464,16 @@ export class Bridge {
       return;
     }
 
-    // 2. Resolve token metadata and the deposit amount in sats.
-    let mapping = s.mappings[dep.tokenKey];
-    const meta = mapping ?? (await this.eth.tokenMetadata(dep.token));
-    const sats = unitsToSats(dep.amountUnits, meta.decimals);
+    // 2. Resolve token metadata and the deposit amount in atoms. A unified
+    //    asset is found through its route, so a second source chain reissues
+    //    the one asset instead of minting a rival one.
+    let mapping = this.mappingFor(dep.tokenKey);
+    const src = mapping ? sourcesOf(mapping)[dep.tokenKey] : null;
+    const meta = src ?? mapping ?? (await this.eth.tokenMetadata(dep.token));
+    const sats = unitsToAtoms(dep.amountUnits, meta.decimals, mapping?.precision);
     if (sats === 0n) {
       dep.status = "refund_pending";
-      dep.refundReason = "amount below 1e-8 of a token (not representable on Sequentia)";
+      dep.refundReason = "amount too small to represent on Sequentia";
       this.state.save();
       return;
     }
@@ -218,6 +497,9 @@ export class Bridge {
     });
     if (!mapping) return; // deferred or halted; status/markers already recorded
     dep.assetId = mapping.assetId;
+    // The deposit is now backed: the tokens are in this chain's escrow.
+    this.creditEscrow(mapping, dep.tokenKey, dep.amountUnits);
+    this.state.save();
 
     await this.sendMinted(dep, mapping);
   }
@@ -231,7 +513,11 @@ export class Bridge {
   async ensureMintedMapping(dep, tokenKey, sats, origin) {
     const s = this.state.data;
     const tag = dep.tag ?? `deposit #${dep.nonce}`;
-    let mapping = s.mappings[tokenKey];
+    // Follow a unified route before deciding to issue: this lookup is the one
+    // and only thing standing between a second source chain and a duplicate,
+    // liquidity-splitting asset.
+    const mappingKey = this.mappingKeyFor(tokenKey);
+    let mapping = s.mappings[mappingKey];
     if (!mapping) {
       // Build the registry contract up front and issue the asset committed to
       // its hash, so the metadata is bound on-chain and independently verifiable.
@@ -279,7 +565,7 @@ export class Bridge {
         registered: false,
         createdAt: new Date().toISOString(),
       };
-      s.mappings[tokenKey] = mapping;
+      s.mappings[mappingKey] = mapping;
       delete dep.steps.pendingIssue;
       dep.steps.issueTxid = issued.txid;
       this.state.save();
@@ -331,6 +617,14 @@ export class Bridge {
    *  issuer_pubkey field (cached; any valid non-zero pubkey the issuer holds). */
   async issuerPubkey() {
     if (this._issuerPubkey) return this._issuerPubkey;
+    // A unified asset's issuer key is PINNED in config: it is committed into
+    // the asset id and later authorizes the registry hand-off to the stablecoin
+    // issuer, so it must survive restarts rather than being a fresh wallet key
+    // each time the daemon boots.
+    if (this.cfg.unifiedIssuerPubkey) {
+      this._issuerPubkey = this.cfg.unifiedIssuerPubkey;
+      return this._issuerPubkey;
+    }
     const addr = await this.seq.call("getnewaddress", { label: "compages-issuer" });
     const info = await this.seq.call("getaddressinfo", { address: addr });
     if (!info.pubkey) throw new Error("wallet returned no pubkey for the issuer address");
@@ -340,12 +634,18 @@ export class Bridge {
 
   /** The registry contract (metadata) for a bridged token. The name is the
    *  token's own name with a concise origin marker; the origin-suffixed ticker
-   *  and the bridge's entity domain convey which chain it bridged from. */
-  async buildAssetContract(meta, chainName = this.cfg.ethChainName, tickerSuffix = ".e") {
+   *  and the bridge's entity domain convey which chain it bridged from.
+   *
+   *  `override` supplies a unified asset's fixed identity instead, since that
+   *  asset belongs to no single chain: its name and ticker are the ones the
+   *  stablecoin issuer's standard prescribes, and its precision matches the
+   *  token's own decimals rather than the 8 that ordinary bridged assets use.
+   *  Everything here is hashed into the asset id, so it is permanent. */
+  async buildAssetContract(meta, chainName = this.cfg.ethChainName, tickerSuffix = ".e", override = null) {
     return {
-      name: `${meta.name} (${chainName})`.slice(0, 255),
-      ticker: bridgedTicker(meta.symbol, tickerSuffix),
-      precision: 8, // bridged assets are issued with 8 decimals on Sequentia
+      name: (override?.name ?? `${meta.name} (${chainName})`).slice(0, 255),
+      ticker: override?.ticker ?? bridgedTicker(meta.symbol, tickerSuffix),
+      precision: override?.precision ?? 8,
       entity: { domain: this.cfg.assetDomain || "compages.invalid" },
       issuer_pubkey: await this.issuerPubkey(),
       version: 0,
@@ -544,7 +844,7 @@ export class Bridge {
     for (const dep of Object.values(this.state.data.deposits)) {
       if (dep.status === "send_retry") {
         // Minting already happened; only the send to the user is outstanding.
-        const mapping = this.state.data.mappings[dep.tokenKey];
+        const mapping = this.mappingFor(dep.tokenKey);
         try {
           await this.sendMinted(dep, mapping);
         } catch (e) {
@@ -763,7 +1063,11 @@ export class Bridge {
       this.log(`redemption ${rec.key}: asset ${rec.assetId} is not a bridged asset, ignoring`);
       return;
     }
-    if (mapping.chainId !== this.cfg.ethChainId) {
+    // Release only on a chain this asset is actually backed on. For an
+    // ordinary asset that is its single origin chain, exactly as before; a
+    // unified asset is backed on several, and answers for each of them.
+    const src = sourceForChain(mapping, this.cfg.ethChainId);
+    if (!src) {
       // Bridged from another chain (e.g. SOL.s sent to an Ethereum redemption
       // address): the vault holds nothing to release for it. Park it for the
       // operator; it must never reach the Ethereum release path.
@@ -772,10 +1076,10 @@ export class Bridge {
       this.log(`redemption ${rec.key}: asset ${rec.assetId} is not Ethereum-bridged, parked for the operator`);
       return;
     }
-    rec.tokenKey = mapping.tokenKey;
+    rec.tokenKey = src.tokenKey;
     rec.symbol = mapping.symbol;
 
-    const units = satsToUnits(rec.sats, mapping.decimals);
+    const units = atomsToUnits(rec.sats, src.decimals, mapping.precision);
     if (units === 0n) {
       rec.status = "dust_ignored";
       this.state.save();
@@ -783,6 +1087,22 @@ export class Bridge {
       return;
     }
     rec.amountUnits = units.toString();
+
+    // Per-escrow solvency: global backing can be sound while THIS chain's
+    // escrow is short, because a unified asset lets users deposit on one chain
+    // and redeem on another. Wait for the operator to rebalance rather than
+    // sending a release that would revert. Only sources that actually keep an
+    // escrow ledger are gated; an ordinary bridged asset never had one, and
+    // its release is checked against the vault balance as before.
+    const escrowed = src.escrowedUnits === undefined ? null : BigInt(src.escrowedUnits);
+    if (escrowed !== null && escrowed < units) {
+      rec.status = "awaiting_liquidity";
+      this.state.save();
+      this.log(
+        `redemption ${rec.key}: ${src.tokenKey} escrow holds ${escrowed}, needs ${units}; awaiting rebalance`
+      );
+      return;
+    }
 
     // Gate the irreversible release on the burn's Bitcoin-anchor finality, not
     // a Sequentia block count (anchoring is supreme; see burnFinality).
@@ -822,12 +1142,18 @@ export class Bridge {
         }
         rec.status = "releasing";
         this.state.save();
-        const tokenAddr = rec.tokenKey.endsWith(":eth") ? ethers.ZeroAddress : mapping.token;
+        // The token to release is the ROUTED source's token on this chain,
+        // never whatever token some other source of the same asset uses.
+        const ethSrc = sourcesOf(mapping)[rec.tokenKey];
+        const tokenAddr = rec.tokenKey.endsWith(":eth")
+          ? ethers.ZeroAddress
+          : ethSrc?.token ?? mapping.token;
         try {
           const tx = await this.eth.vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
           await tx.wait(1);
           rec.releaseTxHash = tx.hash;
           rec.status = "released";
+          this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits);
           this.state.save();
           this.log(
             `redemption ${rec.key}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${tx.hash}`
@@ -1104,19 +1430,22 @@ export class Bridge {
     const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
     const isNative = !dep.mint || dep.mint === "sol"; // pre-SPL records lack mint
     const tokenKey = isNative ? this.solTokenKey() : `${chainLabel}:${dep.mint}`;
-    const existing = s.mappings[tokenKey];
+    const existing = this.mappingFor(tokenKey);
+    const existingSrc = existing ? sourcesOf(existing)[tokenKey] : null;
     let meta;
     if (isNative) {
       meta = { symbol: "SOL", name: "SOL", decimals: 9 };
-    } else if (existing) {
-      meta = { symbol: existing.symbol, name: existing.name, decimals: existing.decimals };
+    } else if (existingSrc?.decimals !== undefined) {
+      // A configured source states its own decimals, which is what a unified
+      // asset needs: each chain's token carries its own.
+      meta = { symbol: existing.symbol, name: existing.name, decimals: existingSrc.decimals };
     } else {
       // Metadata lookup failures throw and defer the mint; the deposit is
       // never lost to a flaky metadata fetch.
       meta = await this.sol.tokenMetadata(dep.mint);
     }
     const units = BigInt(dep.amountUnits ?? dep.lamports); // lamports: pre-SPL records
-    const sats = unitsToSats(units, meta.decimals);
+    const sats = unitsToAtoms(units, meta.decimals, existing?.precision);
     if (sats === 0n) {
       // Not representable on Sequentia (a mint with more than 8 decimals can
       // floor a tiny amount to zero). Funds are swept; flag for the operator.
@@ -1140,11 +1469,22 @@ export class Bridge {
       tickerSuffix: ".s",
     });
     if (!mapping) return; // deferred or halted; status/markers already recorded
-    if (!isNative && !mapping.tokenProgram && (dep.tokenProgram || meta.tokenProgram)) {
-      mapping.tokenProgram = dep.tokenProgram ?? meta.tokenProgram; // sweeps/releases need it
-      this.state.save();
+    if (!isNative && (dep.tokenProgram || meta.tokenProgram)) {
+      // The token program is a per-source fact (sweeps and releases need it),
+      // so it belongs on the source, not on an asset that may span chains.
+      const src = sourcesOf(mapping)[tokenKey];
+      if (src && !src.tokenProgram) {
+        src.tokenProgram = dep.tokenProgram ?? meta.tokenProgram;
+        this.state.save();
+      }
+      if (!mapping.sources && !mapping.tokenProgram) {
+        mapping.tokenProgram = dep.tokenProgram ?? meta.tokenProgram;
+        this.state.save();
+      }
     }
     dep.assetId = mapping.assetId;
+    this.creditEscrow(mapping, tokenKey, units);
+    this.state.save();
     await this.sendMinted(dep, mapping);
   }
 
@@ -1247,7 +1587,7 @@ export class Bridge {
 
   async sweepTokenAccount(address, intent, ta, chainLabel) {
     if (ta.amount === 0n) return;
-    if (!this.state.data.mappings[`${chainLabel}:${ta.mint}`]) return; // unbridged mint
+    if (!this.mappingFor(`${chainLabel}:${ta.mint}`)) return; // unbridged mint
     intent.sweeps ??= {};
     const prev = intent.sweeps[ta.address];
     if (prev && (await this.solTransferFate(prev)) === "pending") return;
@@ -1311,9 +1651,10 @@ export class Bridge {
     const s = this.state.data;
     const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
     const mapping = Object.values(s.mappings).find(
-      (m) => m.assetId === rec.assetId && m.chainId === chainLabel
+      (m) => m.assetId === rec.assetId && sourceForChain(m, chainLabel)
     );
-    if (!mapping) {
+    const src = mapping ? sourceForChain(mapping, chainLabel) : null;
+    if (!mapping || !src) {
       // Only Solana-bridged assets can be released on Solana. Anything else
       // (say, an Ethereum-bridged asset sent to a Solana unwrap address) parks
       // for the operator — and must never reach the Ethereum release path.
@@ -1324,7 +1665,8 @@ export class Bridge {
     }
     rec.symbol = mapping.symbol;
     rec.ticker = mapping.contract?.ticker ?? null;
-    if (mapping.token === "sol") {
+    rec.tokenKey = src.tokenKey;
+    if (src.token === "sol") {
       // Below Solana's rent-exempt minimum, a lamport release to a fresh
       // account cannot execute; park tiny redemptions instead of burning
       // attempts on them. (Token releases have no such floor: the treasury
@@ -1337,7 +1679,7 @@ export class Bridge {
         return;
       }
     }
-    const units = satsToUnits(rec.sats, mapping.decimals);
+    const units = atomsToUnits(rec.sats, src.decimals, mapping.precision);
     if (units === 0n) {
       rec.status = "dust_ignored";
       this.state.save();
@@ -1345,6 +1687,18 @@ export class Bridge {
       return;
     }
     rec.amountUnits = units.toString();
+
+    // Per-escrow solvency, as on the Ethereum leg, and gated the same way:
+    // only a source that keeps an escrow ledger is checked here.
+    const escrowed = src.escrowedUnits === undefined ? null : BigInt(src.escrowedUnits);
+    if (escrowed !== null && escrowed < units) {
+      rec.status = "awaiting_liquidity";
+      this.state.save();
+      this.log(
+        `sol redemption ${rec.key}: ${src.tokenKey} escrow holds ${escrowed}, needs ${units}; awaiting rebalance`
+      );
+      return;
+    }
 
     // The same gate as the Ethereum leg: the release is irreversible, so the
     // burn must be final under Bitcoin anchoring, never a Sequentia block count.
@@ -1362,6 +1716,18 @@ export class Bridge {
   }
 
   async releaseSolRedemption(rec, mapping) {
+    // The mint, decimals and token program to pay with are this asset's
+    // SOLANA source's, not those of whichever source an asset-id lookup
+    // happened to return first (a unified asset has one per chain).
+    const src =
+      sourcesOf(mapping)[rec.tokenKey] ??
+      sourceForChain(mapping, this.cfg.solChainLabel ?? "solana-devnet");
+    if (!src) {
+      rec.status = "ignored_wrong_network";
+      this.state.save();
+      this.log(`sol redemption ${rec.key}: asset ${rec.assetId} has no Solana source; parked`);
+      return;
+    }
     if (rec.status === "new" || rec.status === "releasing") {
       // Resolve any transfer already sent (or possibly sent) before building a
       // new one: the recorded signature is the on-chain replay guard.
@@ -1371,6 +1737,7 @@ export class Bridge {
         if (fate === "landed") {
           rec.status = "released";
           rec.releaseSig = rec.release.signature;
+          this.debitEscrow(mapping, src.tokenKey, rec.amountUnits ?? rec.lamports);
           this.state.save();
           this.log(
             `sol redemption ${rec.key}: released ${rec.amountUnits ?? rec.lamports} units of ${rec.symbol ?? "SOL"} to ${rec.solAddress} in ${rec.release.signature}`
@@ -1408,7 +1775,7 @@ export class Bridge {
           this.log(`sol redemption ${rec.key}: burn no longer final (${fin.reason}); release parked`);
           return;
         }
-        const isNative = mapping.token === "sol";
+        const isNative = src.token === "sol";
         const units = BigInt(rec.amountUnits ?? rec.lamports);
         const treasury = this.sol.treasury;
         // An underfunded treasury should simply wait for a top-up, not burn
@@ -1426,7 +1793,7 @@ export class Bridge {
             return;
           }
           const held = (await this.sol.tokenAccountsByOwner(treasury.address))
-            .filter((t) => t.mint === mapping.token)
+            .filter((t) => t.mint === src.token)
             .reduce((a, t) => a + t.amount, 0n);
           if (held < units) {
             this.log(`sol redemption ${rec.key}: treasury holds ${held} of ${mapping.symbol}, needs ${units}; waiting`);
@@ -1452,9 +1819,9 @@ export class Bridge {
             recentBlockhash: bh.blockhash,
           });
         } else {
-          const tokenProgram = mapping.tokenProgram ?? TOKEN_PROGRAM;
-          const treasuryAta = ataAddress(treasury.address, mapping.token, tokenProgram);
-          const userAta = ataAddress(rec.solAddress, mapping.token, tokenProgram);
+          const tokenProgram = src.tokenProgram ?? TOKEN_PROGRAM;
+          const treasuryAta = ataAddress(treasury.address, src.token, tokenProgram);
+          const userAta = ataAddress(rec.solAddress, src.token, tokenProgram);
           built = buildTx({
             feePayer: treasury,
             recentBlockhash: bh.blockhash,
@@ -1463,16 +1830,16 @@ export class Bridge {
                 payer: treasury.address,
                 ata: userAta,
                 owner: rec.solAddress,
-                mint: mapping.token,
+                mint: src.token,
                 tokenProgram,
               }),
               splTransferChecked({
                 source: treasuryAta,
-                mint: mapping.token,
+                mint: src.token,
                 dest: userAta,
                 owner: treasury.address,
                 amount: units,
-                decimals: mapping.decimals,
+                decimals: src.decimals,
                 tokenProgram,
               }),
             ],

@@ -143,8 +143,12 @@ const bal1 = await waitFor("user wallet sees 100 MUSD-asset", async () =>
 check("user Sequentia wallet holds 100 of the bridged asset", !!bal1);
 
 let assets = await api("assets");
-check("exactly one bridged asset exists", assets.length === 1, `${assets.length}`);
-check("bridged asset metadata is the ERC-20's", assets[0].symbol === "MUSD" && assets[0].decimals === 6);
+// Count only per-token assets: a unified asset is pre-issued by the ceremony
+// before any deposit, so it is never evidence of a duplicate mint.
+const bridgedAssets = (list) => list.filter((a) => !a.unified);
+check("exactly one bridged asset exists", bridgedAssets(assets).length === 1, `${bridgedAssets(assets).length}`);
+const musdAsset0 = assets.find((a) => a.assetId === minted1.assetId);
+check("bridged asset metadata is the ERC-20's", musdAsset0.symbol === "MUSD" && musdAsset0.decimals === 6);
 
 // ---------------- test 2: second deposit REISSUES the same asset ----------------
 console.log("\n-- deposit 50 MUSD more (must mint the same asset, no duplicate)");
@@ -155,7 +159,7 @@ const minted2 = await waitFor("deposit 2 minted", async () => {
 });
 check("deposit 2 minted the SAME asset id", minted2.assetId === minted1.assetId);
 assets = await api("assets");
-check("still exactly one bridged asset (no duplicate)", assets.length === 1, `${assets.length}`);
+check("still exactly one bridged asset (no duplicate)", bridgedAssets(assets).length === 1, `${bridgedAssets(assets).length}`);
 await waitFor("user balance reaches 150", async () =>
   (await seqAssetBalance("user", minted1.assetId)) === 15000000000 ? 1 : null
 );
@@ -171,7 +175,7 @@ const minted3 = await waitFor("ETH deposit minted", async () => {
 check("ETH minted as its own Sequentia asset", minted3.assetId && minted3.assetId !== minted1.assetId);
 check("0.25 ETH -> 0.25000000 asset units", minted3.sats === "25000000", minted3.sats);
 assets = await api("assets");
-check("two bridged assets now", assets.length === 2, `${assets.length}`);
+check("two bridged assets now", bridgedAssets(assets).length === 2, `${bridgedAssets(assets).length}`);
 
 // ---------------- test 4: redemption releases the original ERC-20 ----------------
 console.log("\n-- redeem 30 MUSD-asset back to Ethereum");
@@ -302,7 +306,7 @@ if (process.env.SOL_RPC) {
   );
   check("user Sequentia wallet holds the minted SOL.s", true);
   assets = await api("assets");
-  check("three bridged assets now (MUSD.e, ETH.e, SOL.s)", assets.length === 3, `${assets.length}`);
+  check("three bridged assets now (MUSD.e, ETH.e, SOL.s)", bridgedAssets(assets).length === 3, `${bridgedAssets(assets).length}`);
   const solMapping = assets.find((a) => a.assetId === solAssetId);
   check(
     "SOL mapping metadata (symbol, decimals, origin-suffixed ticker)",
@@ -511,6 +515,162 @@ if (process.env.SOL_RPC) {
     return r.redemptions.find((x) => x.assetId === solAssetId && x.status === "ignored_wrong_network") ? 1 : null;
   });
   check("SOL.s to an Ethereum redemption address is parked, not released", true);
+
+  // -------- test 7b: the unified asset (one USDC, two source chains) --------
+  // The point of the Bridged USDC Standard: USDC arriving from Ethereum and
+  // USDC arriving from Solana must be the SAME Sequentia asset. Two assets
+  // would be a liquidity split manufactured by our own bridge.
+  if (process.env.USDC_ETH && process.env.USDC_SOL) {
+    console.log("\n-- unified USDC: one asset fed by Ethereum and Solana");
+
+    let assets = await api("assets");
+    const usdc0 = assets.find((a) => a.unified);
+    check("unified asset was issued by the ceremony, before any deposit", !!usdc0, usdc0?.assetId?.slice(0, 12));
+    check("unified asset carries USDC's canonical 6 decimals", usdc0?.precision === 6, `${usdc0?.precision}`);
+    check("unified asset is named per Circle's convention", usdc0?.ticker === "USDC.e", usdc0?.ticker);
+    check("unified asset started with zero supply", usdc0?.mintedSats === "0", usdc0?.mintedSats);
+    check("unified asset declares both source chains", (usdc0?.chainIds ?? []).length === 2, JSON.stringify(usdc0?.chainIds));
+
+    // --- 250 USDC in from Ethereum ---
+    const usdcEth = new ethers.Contract(
+      process.env.USDC_ETH,
+      ["function approve(address,uint256) returns (bool)"],
+      user
+    );
+    await (await usdcEth.approve(process.env.VAULT, 250_000_000n)).wait();
+    const usdcDepTx = await (await vault.depositToken(process.env.USDC_ETH, 250_000_000n, userSeqAddr)).wait();
+    const usdcEthDep = await waitFor("USDC deposit from Ethereum minted", async () => {
+      const list = await api(`deposit/tx/${usdcDepTx.hash}`);
+      return list[0]?.status === "minted" ? list[0] : null;
+    });
+    // A 6-decimal token into a 6-precision asset: one base unit IS one atom,
+    // so the amount crosses unchanged. Nothing is scaled, nothing is floored.
+    check("250 USDC -> 250000000 atoms, an exact identity map", usdcEthDep.sats === "250000000", usdcEthDep.sats);
+
+    // --- 100 USDC in from Solana, which must hit the SAME asset ---
+    const usdcMint = process.env.USDC_SOL;
+    await sol.rpc("mockMintTo", [usdcMint, solUser.address, 500_000_000]);
+    const wrap2 = await api("sol/wrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seqAddress: userSeqAddr }),
+    });
+    const bh2 = await sol.latestBlockhash();
+    const usdcSolTx = buildTx({
+      feePayer: solUser,
+      recentBlockhash: bh2.blockhash,
+      instructions: [
+        ataCreateIdempotent({
+          payer: solUser.address,
+          ata: ataAddress(wrap2.depositAddress, usdcMint),
+          owner: wrap2.depositAddress,
+          mint: usdcMint,
+        }),
+        splTransferChecked({
+          source: ataAddress(solUser.address, usdcMint),
+          mint: usdcMint,
+          dest: ataAddress(wrap2.depositAddress, usdcMint),
+          owner: solUser.address,
+          amount: 100_000_000n,
+          decimals: 6,
+        }),
+      ],
+    });
+    await sol.send(usdcSolTx.tx);
+    const usdcSolDep = await waitFor("USDC deposit from Solana minted", async () => {
+      const r = await api(`sol/wrap/${wrap2.depositAddress}`);
+      const d = r.deposits.find((x) => x.mint === usdcMint);
+      return d?.status === "minted" ? d : null;
+    });
+
+    check(
+      "USDC from Solana minted the SAME asset as USDC from Ethereum",
+      usdcSolDep.assetId === usdc0.assetId,
+      `${usdcSolDep.assetId?.slice(0, 12)} vs ${usdc0.assetId.slice(0, 12)}`
+    );
+    assets = await api("assets");
+    check(
+      "exactly one USDC asset exists (no rival asset per chain)",
+      assets.filter((a) => a.ticker === "USDC.e").length === 1
+    );
+    const usdc1 = assets.find((a) => a.assetId === usdc0.assetId);
+    check("supply is the sum of both chains' deposits", usdc1.mintedSats === "350000000", usdc1.mintedSats);
+    check(
+      "the user holds ONE fungible balance, not two wrapped ones",
+      (await seqAssetBalance("user", usdc0.assetId)) === 350_000_000,
+      `${await seqAssetBalance("user", usdc0.assetId)}`
+    );
+
+    const escrowEth = usdc1.sources.find((s) => s.chainId === 31337)?.escrowedUnits;
+    const escrowSol = usdc1.sources.find((s) => s.chainId === "solana-mock")?.escrowedUnits;
+    check("Ethereum escrow records its own 250 USDC", escrowEth === "250000000", escrowEth);
+    check("Solana escrow records its own 100 USDC", escrowSol === "100000000", escrowSol);
+
+    const por = await api(`por?asset=${usdc0.assetId}`);
+    const p = por.assets[0];
+    check("proof of reserves: escrow across chains equals circulating supply", p.escrowedAtoms === "350000000", p.escrowedAtoms);
+    check("proof of reserves: supply read from the chain agrees with the ledger", p.ledgerMatchesChain === true, `${p.chainCirculatingAtoms}`);
+    check("proof of reserves: the asset is fully backed", p.backed === true);
+
+    // --- redeem to the OTHER chain than the one deposited on ---
+    // A unified asset is source-blind, so value that arrived from Ethereum may
+    // leave via Solana. That is what one asset buys, and it is exactly the
+    // case the per-chain wrong-network guard must NOT block.
+    const usdcUnwrap = await api("sol/unwrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solAddress: solReceiver.address }),
+    });
+    await seqRpc(
+      "sendtoaddress",
+      { address: usdcUnwrap.seqAddress, amount: 0.4, assetlabel: usdc0.assetId, fee_asset_label: process.env.FEEX },
+      "user"
+    );
+    const crossRedeem = await waitFor(
+      "cross-chain USDC redemption released and burned",
+      async () => {
+        const r = await api(`sol/redeem/${usdcUnwrap.seqAddress}`);
+        const rec = r.redemptions.find((x) => x.assetId === usdc0.assetId);
+        return rec?.status === "done" ? rec : null;
+      },
+      180_000
+    );
+    check(
+      "USDC deposited on Ethereum can be redeemed on Solana",
+      crossRedeem.status === "done",
+      `${crossRedeem.amountUnits} units in ${String(crossRedeem.releaseSig).slice(0, 12)}`
+    );
+    check("the cross-chain redemption paid the exact atom amount", crossRedeem.amountUnits === "40000000", crossRedeem.amountUnits);
+
+    assets = await api("assets");
+    const usdc2 = assets.find((a) => a.assetId === usdc0.assetId);
+    check("burning on redemption reduced the unified supply", usdc2.mintedSats === "310000000", usdc2.mintedSats);
+    const escrowSol2 = usdc2.sources.find((s) => s.chainId === "solana-mock")?.escrowedUnits;
+    check("the Solana escrow paid for it, not the Ethereum one", escrowSol2 === "60000000", escrowSol2);
+
+    const por2 = await api(`por?asset=${usdc0.assetId}`);
+    check(
+      "proof of reserves still balances after a cross-chain redemption",
+      por2.assets[0].escrowedAtoms === "310000000" && por2.assets[0].backed === true,
+      por2.assets[0].escrowedAtoms
+    );
+
+    // --- one chain cannot pay out more than it escrows ---
+    await seqRpc(
+      "sendtoaddress",
+      { address: usdcUnwrap.seqAddress, amount: 1.0, assetlabel: usdc0.assetId, fee_asset_label: process.env.FEEX },
+      "user"
+    );
+    await waitFor(
+      "an over-large redemption waits for liquidity",
+      async () => {
+        const r = await api(`sol/redeem/${usdcUnwrap.seqAddress}`);
+        return r.redemptions.find((x) => x.status === "awaiting_liquidity") ? 1 : null;
+      },
+      120_000
+    );
+    check("a redemption beyond one chain's escrow parks as awaiting_liquidity, not a failed release", true);
+  }
 }
 
 // ---------------- test 8: asset registry integration ----------------
