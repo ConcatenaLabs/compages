@@ -477,26 +477,26 @@
     <div class="direction" role="tablist">
       <button class="plate active" id="tab-sol-wrap" role="tab" aria-selected="true">
         Solana &#8594; Sequentia
-        <small>lock SOL, mint SOL.s</small>
+        <small>lock SOL or tokens, mint .s assets</small>
       </button>
       <div class="joint" aria-hidden="true"><div class="pin-dot"></div></div>
       <button class="plate" id="tab-sol-unwrap" role="tab" aria-selected="false">
         Sequentia &#8594; Solana
-        <small>burn SOL.s, release SOL</small>
+        <small>burn .s assets, release the originals</small>
       </button>
     </div>
 
     <!-- wrap panel: SOL -> SOL.s -->
     <div class="body" id="panel-sol-wrap">
       <div class="field">
-        <label>Your Sequentia address (receives SOL.s)</label>
+        <label>Your Sequentia address (receives the bridged assets)</label>
         <input class="mono" id="sol-wrap-seqaddr" placeholder="tb1&hellip; (your Sequentia wallet address)" spellcheck="false">
       </div>
       <button class="action" id="btn-sol-wrap">Get a Solana deposit address</button>
       <div class="statusline" id="sol-wrap-status"></div>
       <div class="hide" id="sol-wrap-result">
         <div class="field">
-          <label>Send SOL (devnet) to this address</label>
+          <label>Send SOL or any SPL token (devnet) to this address</label>
           <div class="bigaddr" id="sol-wrap-addr"></div>
           <div class="row" style="justify-content:center;margin-top:8px">
             <button class="copybtn" id="btn-sol-wrap-copy">copy address</button>
@@ -520,14 +520,14 @@
         transaction can still be reversed until its Bitcoin anchor is final.
       </div>
       <div class="field">
-        <label>Your Solana address (receives SOL)</label>
+        <label>Your Solana address (receives the released SOL or tokens)</label>
         <input class="mono" id="sol-unwrap-addr-input" placeholder="your Solana devnet wallet address" spellcheck="false">
       </div>
-      <button class="action" id="btn-sol-unwrap">Get a SOL.s return address</button>
+      <button class="action" id="btn-sol-unwrap">Get a return address</button>
       <div class="statusline" id="sol-unwrap-status"></div>
       <div class="hide" id="sol-unwrap-result">
         <div class="field">
-          <label>Send SOL.s to this Sequentia address</label>
+          <label>Send Solana-bridged assets to this Sequentia address</label>
           <div class="bigaddr" id="sol-unwrap-addr"></div>
           <div class="row" style="justify-content:center;margin-top:8px">
             <button class="copybtn" id="btn-sol-unwrap-copy">copy address</button>
@@ -546,10 +546,11 @@
 <footer>
   <div>
     Compages is a centralized proof-of-concept bridge into the Sequentia network:
-    from Ethereum (lock in a vault, mint), from Bitcoin (SBTC: lock BTC in an
-    operator multisig, mint 1:1), and from Solana (lock SOL with the operator,
-    mint SOL.s 1:1). Mints, releases, and custody are performed by the bridge
-    operator. You are trusting that operator.
+    from Ethereum (lock ether or any ERC-20 in a vault, mint), from Bitcoin
+    (SBTC: lock BTC in an operator multisig, mint 1:1), and from Solana (lock
+    SOL or any SPL token with the operator, mint matching .s assets). Mints,
+    releases, and custody are performed by the bridge operator. You are
+    trusting that operator.
   </div>
   <div style="margin-top:6px">
     Vault: <span class="mono" id="vault-line">&hellip;</span>

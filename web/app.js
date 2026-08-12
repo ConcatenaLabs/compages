@@ -689,11 +689,20 @@ function showSolTab(wrap) {
   $("tab-sol-unwrap").setAttribute("aria-selected", !wrap);
 }
 
-// Trim-zeros display of lamports as SOL (9 decimal places).
-function formatLamports(lamports) {
-  const l = BigInt(lamports ?? 0);
-  const frac = (l % 1000000000n).toString().padStart(9, "0").replace(/0+$/, "");
-  return `${l / 1000000000n}${frac ? "." + frac : ""}`;
+// Trim-zeros display of base units at a given number of decimal places
+// (lamports at 9, or any SPL mint at its own).
+function formatUnits(units, decimals) {
+  const u = BigInt(units ?? 0);
+  const base = 10n ** BigInt(decimals ?? 9);
+  const frac = (u % base).toString().padStart(Number(decimals ?? 9), "0").replace(/0+$/, "");
+  return `${u / base}${frac ? "." + frac : ""}`;
+}
+
+// Ticker of a bridged asset from the loaded asset list (e.g. "SOL.s", "MSU.s").
+function tickerForAssetId(assetId) {
+  if (!assetId) return "";
+  const a = assets.find((x) => x.assetId === assetId);
+  return a?.ticker ?? a?.symbol ?? "";
 }
 
 // Link a Solana transaction signature to the official explorer (devnet only;
@@ -749,6 +758,10 @@ async function refreshSolDeposits(depositAddress) {
     box.innerHTML = `<span class="note">nothing received yet; waiting for a transfer to ${escapeHtml(short(depositAddress))}</span>`;
     return;
   }
+  // New mints may have appeared; refresh the asset list so tickers resolve.
+  if (r.deposits.some((d) => d.assetId && !assets.some((a) => a.assetId === d.assetId))) {
+    refreshAssets();
+  }
   box.innerHTML = "";
   for (const d of r.deposits) {
     const el = document.createElement("div");
@@ -756,7 +769,7 @@ async function refreshSolDeposits(depositAddress) {
     let state, cls;
     switch (d.status) {
       case "minted":
-        state = `minted ${formatSats(d.sats)} SOL.s on Sequentia`;
+        state = `minted ${formatSats(d.sats)} ${escapeHtml(tickerForAssetId(d.assetId) || "on Sequentia")}`;
         cls = "ok";
         break;
       case "minting":
@@ -777,9 +790,11 @@ async function refreshSolDeposits(depositAddress) {
     const seqLine = d.seqTxid
       ? `<br><span class="mono">Sequentia tx ${escapeHtml(short(d.seqTxid))}</span>`
       : "";
+    const sym =
+      !d.mint || d.mint === "sol" ? "SOL" : symbolForAssetId(d.assetId) || short(d.mint);
     el.innerHTML = `
       <div>
-        <div>${formatLamports(d.lamports)} SOL</div>
+        <div>${formatUnits(d.amountUnits ?? d.lamports, d.decimals ?? 9)} ${escapeHtml(sym)}</div>
         <div class="mono">${escapeHtml(short(d.sig))}</div>
       </div>
       <div class="state ${cls}">${state}${solTxLink(d.sig)}${seqLine}</div>`;
@@ -856,7 +871,7 @@ async function refreshSolRedemptions(seqAddress) {
         cls = "bad";
         break;
       case "ignored_wrong_network":
-        state = "not bridged SOL; contact the operator";
+        state = "not a Solana-bridged asset; contact the operator";
         cls = "bad";
         break;
       case "release_failed_manual":
@@ -869,7 +884,7 @@ async function refreshSolRedemptions(seqAddress) {
     }
     el.innerHTML = `
       <div>
-        <div>${formatSats(ev.sats)} SOL.s</div>
+        <div>${formatSats(ev.sats)} ${escapeHtml(ev.ticker ?? ev.symbol ?? "")}</div>
         <div class="mono">${escapeHtml(short(ev.txid))}:${ev.vout}</div>
       </div>
       <div class="state ${cls}">${state}${solTxLink(ev.releaseSig)}</div>`;

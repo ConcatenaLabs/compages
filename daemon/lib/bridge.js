@@ -25,7 +25,18 @@ import crypto from "node:crypto";
 import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
 import { unitsToSats, satsToUnits } from "./eth.js";
-import { transferTx, isSolAddress, FEE_LAMPORTS, RENT_EXEMPT_MIN_LAMPORTS } from "./sol.js";
+import {
+  transferTx,
+  buildTx,
+  ataCreateIdempotent,
+  splTransferChecked,
+  ataAddress,
+  isSolAddress,
+  TOKEN_PROGRAM,
+  FEE_LAMPORTS,
+  RENT_EXEMPT_MIN_LAMPORTS,
+  TOKEN_ACCOUNT_RENT_LAMPORTS,
+} from "./sol.js";
 
 // Per-asset money cap on Sequentia chains (21M * 1e8 sats).
 export const SEQ_MAX_SATS = 2_100_000_000_000_000n;
@@ -984,70 +995,112 @@ export class Bridge {
     );
   }
 
-  /** Scan watched wrap intents for finalized inbound transfers and mint them.
-   *  Deposits are keyed by (signature, address): the signature alone is not
-   *  unique, because one transaction can pay several intent addresses and each
-   *  gets its own record. Rescans are idempotent via intent.seen; our own
-   *  sweeps show a non-positive delta and are remembered but skipped. The scan
-   *  paginates from an `until` cursor that only advances after a pass with no
-   *  gaps, so a burst of traffic can never push a deposit out of the window. */
+  /** Scan watched wrap intents for finalized inbound transfers and mint them:
+   *  native SOL from the intent address's own signature stream, and any SPL
+   *  token from the streams of the token accounts the address owns (a token
+   *  transfer to an existing token account does not reference the owner, so
+   *  scanning only the owner would miss it). */
   async processSolDeposits() {
     if (!this.sol) return;
     await this.sol.ensureCluster();
     const s = this.state.data;
     for (const [address, intent] of Object.entries(s.solWrapIntents)) {
       if (!this.solIntentWatched(address, intent)) continue;
-      let scan;
+      await this.scanSolDeposits(address, intent, {
+        scanAddress: address,
+        mint: "sol",
+        decimals: 9,
+      });
+      let tokenAccounts;
       try {
-        scan = await this.sol.signaturesFor(address, intent.until ?? undefined);
+        tokenAccounts = await this.sol.tokenAccountsByOwner(address);
       } catch (e) {
-        this.log(`sol intent ${address}: signature scan failed: ${e.message}`);
+        this.log(`sol intent ${address}: token account scan failed: ${e.message}`);
         continue;
       }
-      if (!scan.complete) {
-        this.log(`sol intent ${address}: signature scan truncated at ${scan.sigs.length}; continuing next tick`);
+      for (const ta of tokenAccounts) {
+        await this.scanSolDeposits(address, intent, {
+          scanAddress: ta.address,
+          mint: ta.mint,
+          decimals: ta.decimals,
+          tokenProgram: ta.tokenProgram,
+        });
       }
-      intent.seen ??= [];
-      let gaps = false;
-      for (const si of [...scan.sigs].reverse()) { // oldest first
-        if (intent.seen.includes(si.signature)) continue;
-        let lamports = 0n;
-        if (!si.err) {
-          try {
-            lamports = await this.sol.receivedLamports(si.signature, address);
-          } catch (e) {
-            // Not marked seen: retried on the next scan pass.
-            this.log(`sol intent ${address}: tx ${si.signature} fetch failed: ${e.message}`);
-            gaps = true;
-            continue;
-          }
-        }
-        intent.seen.push(si.signature);
-        if (lamports === 0n) {
-          this.state.save(); // a sweep of ours, or a failed tx: remember and skip
+    }
+  }
+
+  /** Scan one signature stream for new inbound transfers and mint them.
+   *  Cursor and seen bookkeeping are per stream; deposits are keyed by
+   *  (signature, stream) since one transaction can touch several streams.
+   *  Rescans are idempotent; our own sweeps show a non-positive delta and are
+   *  remembered but skipped. The cursor only advances after a complete pass
+   *  with no gaps, so a burst of traffic can never push a deposit out of the
+   *  scan window. */
+  async scanSolDeposits(address, intent, { scanAddress, mint, decimals, tokenProgram }) {
+    const s = this.state.data;
+    intent.scans ??= {};
+    // Pre-SPL records kept the native cursor directly on the intent; migrate.
+    if (intent.seen && !intent.scans[address]) {
+      intent.scans[address] = { seen: intent.seen, until: intent.until ?? null };
+      delete intent.seen;
+      delete intent.until;
+      this.state.save();
+    }
+    const cursor = (intent.scans[scanAddress] ??= { seen: [], until: null });
+    let scan;
+    try {
+      scan = await this.sol.signaturesFor(scanAddress, cursor.until ?? undefined);
+    } catch (e) {
+      this.log(`sol intent ${address}: signature scan of ${scanAddress} failed: ${e.message}`);
+      return;
+    }
+    if (!scan.complete) {
+      this.log(`sol intent ${address}: scan of ${scanAddress} truncated at ${scan.sigs.length}; continuing next tick`);
+    }
+    let gaps = false;
+    for (const si of [...scan.sigs].reverse()) { // oldest first
+      if (cursor.seen.includes(si.signature)) continue;
+      let units = 0n;
+      if (!si.err) {
+        try {
+          units =
+            mint === "sol"
+              ? await this.sol.receivedLamports(si.signature, scanAddress)
+              : await this.sol.receivedTokenAmount(si.signature, scanAddress);
+        } catch (e) {
+          // Not marked seen: retried on the next scan pass.
+          this.log(`sol intent ${address}: tx ${si.signature} fetch failed: ${e.message}`);
+          gaps = true;
           continue;
         }
-        const dep = {
-          sig: si.signature,
-          tag: `sol deposit ${si.signature.slice(0, 8)}`,
-          address,
-          seqAddress: intent.seqAddress,
-          lamports: lamports.toString(),
-          status: "minting",
-          steps: {},
-          createdAt: new Date().toISOString(),
-        };
-        s.solDeposits[`${si.signature}:${address}`] = dep;
-        this.state.save();
-        this.log(`${dep.tag}: ${lamports} lamports at ${address} -> ${intent.seqAddress}`);
-        await this.mintSolDeposit(dep).catch((e) => this.solMintFailed(dep, e));
       }
-      // Advance the cursor only when everything back to the old cursor was
-      // examined: a truncated or gappy pass keeps it, so nothing is skipped.
-      if (scan.complete && !gaps && scan.sigs.length) {
-        intent.until = scan.sigs[0].signature;
-        this.state.save();
+      cursor.seen.push(si.signature);
+      if (units === 0n) {
+        this.state.save(); // a sweep of ours, or a failed tx: remember and skip
+        continue;
       }
+      const dep = {
+        sig: si.signature,
+        tag: `sol deposit ${si.signature.slice(0, 8)}`,
+        address,
+        scanAddress,
+        mint,
+        decimals,
+        ...(tokenProgram ? { tokenProgram } : {}),
+        seqAddress: intent.seqAddress,
+        amountUnits: units.toString(),
+        status: "minting",
+        steps: {},
+        createdAt: new Date().toISOString(),
+      };
+      s.solDeposits[`${si.signature}:${scanAddress}`] = dep;
+      this.state.save();
+      this.log(`${dep.tag}: ${units} units of ${mint} at ${address} -> ${intent.seqAddress}`);
+      await this.mintSolDeposit(dep).catch((e) => this.solMintFailed(dep, e));
+    }
+    if (scan.complete && !gaps && scan.sigs.length) {
+      cursor.until = scan.sigs[0].signature;
+      this.state.save();
     }
   }
 
@@ -1072,15 +1125,29 @@ export class Bridge {
 
   async mintSolDeposit(dep) {
     const s = this.state.data;
-    const sats = unitsToSats(dep.lamports, 9); // SOL has 9 decimals
+    const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
+    const isNative = !dep.mint || dep.mint === "sol"; // pre-SPL records lack mint
+    const tokenKey = isNative ? this.solTokenKey() : `${chainLabel}:${dep.mint}`;
+    const existing = s.mappings[tokenKey];
+    let meta;
+    if (isNative) {
+      meta = { symbol: "SOL", name: "SOL", decimals: 9 };
+    } else if (existing) {
+      meta = { symbol: existing.symbol, name: existing.name, decimals: existing.decimals };
+    } else {
+      // Metadata lookup failures throw and defer the mint; the deposit is
+      // never lost to a flaky metadata fetch.
+      meta = await this.sol.tokenMetadata(dep.mint);
+    }
+    const units = BigInt(dep.amountUnits ?? dep.lamports); // lamports: pre-SPL records
+    const sats = unitsToSats(units, meta.decimals);
     if (sats === 0n) {
-      // A sub-10-lamport deposit is not representable on Sequentia. Real
-      // wallets cannot produce one (rent-exempt minimums), so just flag it.
+      // Not representable on Sequentia (a mint with more than 8 decimals can
+      // floor a tiny amount to zero). Funds are swept; flag for the operator.
       dep.status = "dust_manual";
       this.state.save();
       return;
     }
-    const existing = s.mappings[this.solTokenKey()];
     const already = existing ? BigInt(existing.mintedSats) : 0n;
     if (already + sats > SEQ_MAX_SATS) {
       dep.status = "failed_manual";
@@ -1089,14 +1156,18 @@ export class Bridge {
       return;
     }
     dep.sats = sats.toString();
-    const mapping = await this.ensureMintedMapping(dep, this.solTokenKey(), sats, {
-      chainId: this.cfg.solChainLabel ?? "solana-devnet",
-      token: "sol",
-      meta: { symbol: "SOL", name: "SOL", decimals: 9 },
+    const mapping = await this.ensureMintedMapping(dep, tokenKey, sats, {
+      chainId: chainLabel,
+      token: isNative ? "sol" : dep.mint,
+      meta: { symbol: meta.symbol, name: meta.name, decimals: meta.decimals },
       chainName: this.cfg.solChainName ?? "Solana devnet",
       tickerSuffix: ".s",
     });
     if (!mapping) return; // deferred or halted; status/markers already recorded
+    if (!isNative && !mapping.tokenProgram && (dep.tokenProgram || meta.tokenProgram)) {
+      mapping.tokenProgram = dep.tokenProgram ?? meta.tokenProgram; // sweeps/releases need it
+      this.state.save();
+    }
     dep.assetId = mapping.assetId;
     await this.sendMinted(dep, mapping);
   }
@@ -1108,7 +1179,7 @@ export class Bridge {
     const s = this.state.data;
     for (const dep of Object.values(s.solDeposits)) {
       if (dep.status === "send_retry") {
-        const mapping = s.mappings[this.solTokenKey()];
+        const mapping = Object.values(s.mappings).find((m) => m.assetId === dep.assetId);
         try {
           await this.sendMinted(dep, mapping);
         } catch (e) {
@@ -1140,42 +1211,108 @@ export class Bridge {
     return height > t.lastValidBlockHeight ? "expired" : "pending";
   }
 
-  /** Sweep deposited lamports into the treasury. The treasury pays the fee (a
-   *  two-signer transfer), so the swept amount arrives whole. Signature-guarded
-   *  like releases; a lost race costs one fee, never funds — and detection is
+  /** Sweep deposits into the treasury: lamports, and the balance of every
+   *  token account whose mint we have bridged (unbridged mints stay put; spam
+   *  tokens are never worth treasury fees and rent). The treasury pays every
+   *  fee, so swept amounts arrive whole. Each sweep is signature-guarded like
+   *  releases; a lost race costs a fee, never funds — and detection is
    *  signature-based, so sweeping can never hide a deposit from minting. */
   async sweepSolIntents() {
     if (!this.sol) return;
     await this.sol.ensureCluster();
     const s = this.state.data;
+    const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
     for (const [address, intent] of Object.entries(s.solWrapIntents)) {
       if (!this.solIntentWatched(address, intent)) continue;
       try {
-        const bal = await this.sol.balance(address);
-        // A sweep carries two signatures (treasury + intent) at 5000 lamports
-        // each; leave balances that are not clearly worth the 10,000 fee.
-        if (bal < 20_000n) continue;
-        // A pending sweep blocks a new one; any settled fate may proceed (the
-        // balance was re-read above, so a landed sweep leaves nothing to take
-        // and a false 'expired' costs at most one duplicate fee, never funds).
-        if (intent.sweep && (await this.solTransferFate(intent.sweep)) === "pending") continue;
-        const bh = await this.sol.latestBlockhash();
-        const kp = this.sol.depositKeypair(intent.index);
-        const { tx, signature } = transferTx({
-          feePayer: this.sol.treasury,
-          source: kp,
-          dest: this.sol.treasury.address,
-          lamports: bal,
-          recentBlockhash: bh.blockhash,
-        });
-        intent.sweep = { signature, lastValidBlockHeight: bh.lastValidBlockHeight };
-        this.state.save();
-        await this.sol.send(tx);
-        this.log(`sol intent ${address}: sweeping ${bal} lamports to the treasury (${signature})`);
+        await this.sweepNativeIntent(address, intent);
       } catch (e) {
         this.log(`sol intent ${address}: sweep failed: ${e.message}`);
       }
+      let tokenAccounts = [];
+      try {
+        tokenAccounts = await this.sol.tokenAccountsByOwner(address);
+      } catch (e) {
+        this.log(`sol intent ${address}: token sweep scan failed: ${e.message}`);
+      }
+      for (const ta of tokenAccounts) {
+        try {
+          await this.sweepTokenAccount(address, intent, ta, chainLabel);
+        } catch (e) {
+          this.log(`sol intent ${address}: sweep of ${ta.address} failed: ${e.message}`);
+        }
+      }
     }
+  }
+
+  async sweepNativeIntent(address, intent) {
+    const bal = await this.sol.balance(address);
+    // A sweep carries two signatures (treasury + intent) at 5000 lamports
+    // each; leave balances that are not clearly worth the 10,000 fee.
+    if (bal < 20_000n) return;
+    // A pending sweep blocks a new one; any settled fate may proceed (the
+    // balance was re-read above, so a landed sweep leaves nothing to take
+    // and a false 'expired' costs at most one duplicate fee, never funds).
+    if (intent.sweep && (await this.solTransferFate(intent.sweep)) === "pending") return;
+    const bh = await this.sol.latestBlockhash();
+    const kp = this.sol.depositKeypair(intent.index);
+    const { tx, signature } = transferTx({
+      feePayer: this.sol.treasury,
+      source: kp,
+      dest: this.sol.treasury.address,
+      lamports: bal,
+      recentBlockhash: bh.blockhash,
+    });
+    intent.sweep = { signature, lastValidBlockHeight: bh.lastValidBlockHeight };
+    this.state.save();
+    await this.sol.send(tx);
+    this.log(`sol intent ${address}: sweeping ${bal} lamports to the treasury (${signature})`);
+  }
+
+  async sweepTokenAccount(address, intent, ta, chainLabel) {
+    if (ta.amount === 0n) return;
+    if (!this.state.data.mappings[`${chainLabel}:${ta.mint}`]) return; // unbridged mint
+    intent.sweeps ??= {};
+    const prev = intent.sweeps[ta.address];
+    if (prev && (await this.solTransferFate(prev)) === "pending") return;
+    // The treasury pays two signatures and, on the first sweep of a mint, rent
+    // for its own associated token account; wait rather than bounce on chain.
+    const treasuryBal = await this.sol.balance(this.sol.treasury.address);
+    if (treasuryBal < 2n * FEE_LAMPORTS + TOKEN_ACCOUNT_RENT_LAMPORTS + RENT_EXEMPT_MIN_LAMPORTS) {
+      this.log(`sol intent ${address}: treasury underfunded for a token sweep; waiting`);
+      return;
+    }
+    const treasury = this.sol.treasury;
+    const treasuryAta = ataAddress(treasury.address, ta.mint, ta.tokenProgram);
+    const kp = this.sol.depositKeypair(intent.index);
+    const bh = await this.sol.latestBlockhash();
+    const { tx, signature } = buildTx({
+      feePayer: treasury,
+      signers: [kp],
+      recentBlockhash: bh.blockhash,
+      instructions: [
+        ataCreateIdempotent({
+          payer: treasury.address,
+          ata: treasuryAta,
+          owner: treasury.address,
+          mint: ta.mint,
+          tokenProgram: ta.tokenProgram,
+        }),
+        splTransferChecked({
+          source: ta.address,
+          mint: ta.mint,
+          dest: treasuryAta,
+          owner: kp.address,
+          amount: ta.amount,
+          decimals: ta.decimals,
+          tokenProgram: ta.tokenProgram,
+        }),
+      ],
+    });
+    intent.sweeps[ta.address] = { signature, lastValidBlockHeight: bh.lastValidBlockHeight };
+    this.state.save();
+    await this.sol.send(tx);
+    this.log(`sol intent ${address}: sweeping ${ta.amount} of ${ta.mint} to the treasury (${signature})`);
   }
 
   /** Create an unwrap intent: a fresh Sequentia address bound to a Solana
@@ -1196,27 +1333,42 @@ export class Bridge {
 
   async handleSolRedemption(rec) {
     const s = this.state.data;
-    const mapping = s.mappings[this.solTokenKey()];
-    if (!mapping || mapping.assetId !== rec.assetId) {
-      // Only bridged SOL can be released on Solana. Anything else (say, an
-      // Ethereum-bridged asset sent to a Solana unwrap address) parks for the
-      // operator — and must never reach the Ethereum release path either.
+    const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
+    const mapping = Object.values(s.mappings).find(
+      (m) => m.assetId === rec.assetId && m.chainId === chainLabel
+    );
+    if (!mapping) {
+      // Only Solana-bridged assets can be released on Solana. Anything else
+      // (say, an Ethereum-bridged asset sent to a Solana unwrap address) parks
+      // for the operator — and must never reach the Ethereum release path.
       rec.status = "ignored_wrong_network";
       this.state.save();
-      this.log(`sol redemption ${rec.key}: asset ${rec.assetId} is not bridged SOL, parked for the operator`);
+      this.log(`sol redemption ${rec.key}: asset ${rec.assetId} is not Solana-bridged, parked for the operator`);
       return;
     }
-    rec.symbol = "SOL";
-    // Below Solana's rent-exempt minimum, a release to a fresh account cannot
-    // execute; park tiny redemptions instead of burning attempts on them.
-    const minSats = BigInt(this.cfg.solMinReleaseSats ?? 100_000); // 0.001 SOL
-    if (BigInt(rec.sats) < minSats) {
+    rec.symbol = mapping.symbol;
+    rec.ticker = mapping.contract?.ticker ?? null;
+    if (mapping.token === "sol") {
+      // Below Solana's rent-exempt minimum, a lamport release to a fresh
+      // account cannot execute; park tiny redemptions instead of burning
+      // attempts on them. (Token releases have no such floor: the treasury
+      // funds the recipient's associated token account.)
+      const minSats = BigInt(this.cfg.solMinReleaseSats ?? 100_000); // 0.001 SOL
+      if (BigInt(rec.sats) < minSats) {
+        rec.status = "dust_ignored";
+        this.state.save();
+        this.log(`sol redemption ${rec.key}: below the minimum Solana release, needs manual handling`);
+        return;
+      }
+    }
+    const units = satsToUnits(rec.sats, mapping.decimals);
+    if (units === 0n) {
       rec.status = "dust_ignored";
       this.state.save();
-      this.log(`sol redemption ${rec.key}: below the minimum Solana release, needs manual handling`);
+      this.log(`sol redemption ${rec.key}: amount too small to represent on Solana, needs manual handling`);
       return;
     }
-    rec.lamports = satsToUnits(rec.sats, 9).toString();
+    rec.amountUnits = units.toString();
 
     // The same gate as the Ethereum leg: the release is irreversible, so the
     // burn must be final under Bitcoin anchoring, never a Sequentia block count.
@@ -1245,7 +1397,7 @@ export class Bridge {
           rec.releaseSig = rec.release.signature;
           this.state.save();
           this.log(
-            `sol redemption ${rec.key}: released ${rec.lamports} lamports to ${rec.solAddress} in ${rec.release.signature}`
+            `sol redemption ${rec.key}: released ${rec.amountUnits ?? rec.lamports} units of ${rec.symbol ?? "SOL"} to ${rec.solAddress} in ${rec.release.signature}`
           );
         } else if (fate === "failed") {
           // Executed on chain but failed (e.g. treasury underfunded): no
@@ -1280,14 +1432,30 @@ export class Bridge {
           this.log(`sol redemption ${rec.key}: burn no longer final (${fin.reason}); release parked`);
           return;
         }
-        const lamports = BigInt(rec.lamports);
-        // The transfer may not leave the treasury above zero but below the
-        // rent-exempt minimum (the chain rejects it), and an underfunded
-        // treasury should simply wait for a top-up, not burn attempts.
-        const treasuryBal = await this.sol.balance(this.sol.treasury.address);
-        if (treasuryBal < lamports + FEE_LAMPORTS + RENT_EXEMPT_MIN_LAMPORTS) {
-          this.log(`sol redemption ${rec.key}: treasury underfunded (${treasuryBal} lamports for a ${lamports} release); waiting`);
-          return;
+        const isNative = mapping.token === "sol";
+        const units = BigInt(rec.amountUnits ?? rec.lamports);
+        const treasury = this.sol.treasury;
+        // An underfunded treasury should simply wait for a top-up, not burn
+        // attempts; and a lamport transfer may not leave the treasury above
+        // zero but below the rent-exempt minimum (the chain rejects it).
+        const treasuryBal = await this.sol.balance(treasury.address);
+        if (isNative) {
+          if (treasuryBal < units + FEE_LAMPORTS + RENT_EXEMPT_MIN_LAMPORTS) {
+            this.log(`sol redemption ${rec.key}: treasury underfunded (${treasuryBal} lamports for a ${units} release); waiting`);
+            return;
+          }
+        } else {
+          if (treasuryBal < FEE_LAMPORTS + TOKEN_ACCOUNT_RENT_LAMPORTS + RENT_EXEMPT_MIN_LAMPORTS) {
+            this.log(`sol redemption ${rec.key}: treasury lamports too low for a token release; waiting`);
+            return;
+          }
+          const held = (await this.sol.tokenAccountsByOwner(treasury.address))
+            .filter((t) => t.mint === mapping.token)
+            .reduce((a, t) => a + t.amount, 0n);
+          if (held < units) {
+            this.log(`sol redemption ${rec.key}: treasury holds ${held} of ${mapping.symbol}, needs ${units}; waiting`);
+            return;
+          }
         }
         rec.attempts = (rec.attempts ?? 0) + 1;
         if (rec.attempts > 10) {
@@ -1298,25 +1466,54 @@ export class Bridge {
           return;
         }
         const bh = await this.sol.latestBlockhash();
-        const { tx, signature } = transferTx({
-          feePayer: this.sol.treasury,
-          source: this.sol.treasury,
-          dest: rec.solAddress,
-          lamports,
-          recentBlockhash: bh.blockhash,
-        });
-        rec.release = { signature, lastValidBlockHeight: bh.lastValidBlockHeight };
+        let built;
+        if (isNative) {
+          built = transferTx({
+            feePayer: treasury,
+            source: treasury,
+            dest: rec.solAddress,
+            lamports: units,
+            recentBlockhash: bh.blockhash,
+          });
+        } else {
+          const tokenProgram = mapping.tokenProgram ?? TOKEN_PROGRAM;
+          const treasuryAta = ataAddress(treasury.address, mapping.token, tokenProgram);
+          const userAta = ataAddress(rec.solAddress, mapping.token, tokenProgram);
+          built = buildTx({
+            feePayer: treasury,
+            recentBlockhash: bh.blockhash,
+            instructions: [
+              ataCreateIdempotent({
+                payer: treasury.address,
+                ata: userAta,
+                owner: rec.solAddress,
+                mint: mapping.token,
+                tokenProgram,
+              }),
+              splTransferChecked({
+                source: treasuryAta,
+                mint: mapping.token,
+                dest: userAta,
+                owner: treasury.address,
+                amount: units,
+                decimals: mapping.decimals,
+                tokenProgram,
+              }),
+            ],
+          });
+        }
+        rec.release = { signature: built.signature, lastValidBlockHeight: bh.lastValidBlockHeight };
         rec.releaseExpiredChecks = 0;
         rec.status = "releasing";
         this.state.save(); // persisted BEFORE broadcast: a crash cannot double-pay
-        await this.sol.send(tx);
-        this.log(`sol redemption ${rec.key}: release sent (${signature})`);
+        await this.sol.send(built.tx);
+        this.log(`sol redemption ${rec.key}: release sent (${built.signature})`);
         return; // finalization is checked on the next tick
       }
     }
 
     if (rec.status === "released") {
-      await this.destroyRedeemed(rec, mapping, "SOL.s");
+      await this.destroyRedeemed(rec, mapping, rec.ticker ?? mapping.symbol);
     }
   }
 
@@ -1367,7 +1564,7 @@ export class Bridge {
         if (rec.status === "awaiting_finality") {
           await this.handleSolRedemption(rec);
         } else if (["new", "releasing", "released", "destroy_pending"].includes(rec.status)) {
-          const mapping = s.mappings[this.solTokenKey()];
+          const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
           if (mapping) await this.releaseSolRedemption(rec, mapping);
         }
       } catch (e) {
