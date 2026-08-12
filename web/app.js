@@ -179,25 +179,57 @@ async function selectToken(t) {
       : "");
   updateDepositButton();
   renderDepositPreview();
-  renderChips();
 }
 
-function renderChips() {
-  const box = $("asset-chips");
-  box.innerHTML = "";
-  const mk = (label, t) => {
-    const b = document.createElement("button");
-    b.className = "chip" + (token && token.token === t ? " sel" : "");
-    b.textContent = label;
-    b.onclick = () => {
-      $("token-input").value = t === "eth" ? "" : t;
-      selectToken(t);
-    };
-    box.appendChild(b);
+// The bridge is multi-leg, so every Ethereum-pane list must show only
+// Ethereum-bridged assets (a Solana mint is not a vault token; offering it
+// here could only error) and vice versa.
+const ethAssets = () => assets.filter((a) => a.chainId === status?.ethChainId);
+const solAssets = () =>
+  assets.filter((a) => a.chainId === (status?.solChainLabel ?? "solana-devnet"));
+
+// ---------- deposit asset selector (searchable dropdown) ----------
+function tokenDroprow(title, sub, onpick) {
+  const d = document.createElement("div");
+  d.className = "droprow";
+  d.innerHTML = `<span class="sym">${escapeHtml(title)}</span> <span class="note">${escapeHtml(sub)}</span>`;
+  // mousedown, not click: the input's blur fires first and would hide the row.
+  d.onmousedown = (ev) => {
+    ev.preventDefault();
+    onpick();
   };
-  mk("ETH", "eth");
-  // ETH is already shown above; skip the eth-bridged asset so it isn't listed twice.
-  for (const a of assets) if (a.token !== "eth") mk(a.symbol, a.token);
+  return d;
+}
+
+function pickToken(t, label) {
+  $("token-search").value = label;
+  $("token-droplist").classList.add("hide");
+  selectToken(t);
+}
+
+function renderTokenDroplist() {
+  const box = $("token-droplist");
+  const raw = $("token-search").value.trim();
+  const q = raw.toLowerCase();
+  box.innerHTML = "";
+  if (/^0x[0-9a-fA-F]{40}$/.test(raw)) {
+    const addr = raw.toLowerCase();
+    box.appendChild(
+      tokenDroprow(`Look up ${short(addr)}`, "any ERC-20 by address", () => pickToken(addr, short(addr)))
+    );
+  }
+  const entries = [{ t: "eth", symbol: "ETH", name: "Ether, the chain's own coin" }];
+  for (const a of ethAssets()) {
+    if (a.token !== "eth") entries.push({ t: a.token, symbol: a.symbol, name: `${a.name} (already bridged)` });
+  }
+  for (const e of entries) {
+    const hay = `${e.symbol} ${e.name} ${e.t}`.toLowerCase();
+    if (q && !hay.includes(q)) continue;
+    box.appendChild(tokenDroprow(e.symbol, e.name, () => pickToken(e.t, e.symbol)));
+  }
+  if (!box.children.length) {
+    box.innerHTML = `<div class="droprow note"><span class="note">no match; paste an ERC-20 contract address (0x&hellip;)</span></div>`;
+  }
 }
 
 function updateDepositButton() {
@@ -534,24 +566,47 @@ async function refreshRedemptions(seqAddress) {
   }
 }
 
-function renderRedeemAssets() {
-  const box = $("red-assets");
-  if (!assets.length) {
-    box.innerHTML = `<span class="note">no assets have been bridged yet; bridge one from the Ethereum side first</span>`;
+// Filterable list of a leg's bridged assets with circulating supply, shared
+// by the Ethereum and Solana return panels.
+function renderAssetList(boxId, searchId, list, emptyText) {
+  const box = $(boxId);
+  const q = ($(searchId)?.value ?? "").trim().toLowerCase();
+  if (!list.length) {
+    box.innerHTML = `<span class="note">${escapeHtml(emptyText)}</span>`;
     return;
   }
   box.innerHTML = "";
-  for (const a of assets) {
+  for (const a of list) {
+    const hay = `${a.symbol} ${a.name} ${a.ticker ?? ""} ${a.assetId}`.toLowerCase();
+    if (q && !hay.includes(q)) continue;
     const el = document.createElement("div");
     el.className = "event";
     el.innerHTML = `
       <div>
-        <div>${escapeHtml(a.symbol)} <span class="note">${escapeHtml(a.name)}</span></div>
+        <div>${escapeHtml(a.ticker ?? a.symbol)} <span class="note">${escapeHtml(a.name)}</span></div>
         <div class="mono">asset ${escapeHtml(a.assetId)}</div>
       </div>
       <div class="state">${formatSats(a.mintedSats)} in circulation</div>`;
     box.appendChild(el);
   }
+  if (!box.children.length) {
+    box.innerHTML = `<span class="note">no match</span>`;
+  }
+}
+
+function renderRedeemAssets() {
+  renderAssetList(
+    "red-assets",
+    "red-assets-search",
+    ethAssets(),
+    "no assets have been bridged yet; bridge one from the Ethereum side first"
+  );
+  renderAssetList(
+    "sol-red-assets",
+    "sol-red-assets-search",
+    solAssets(),
+    "no assets have been bridged from Solana yet; deposit SOL or an SPL token first"
+  );
 }
 
 // T11: rehydrate a redemption after a page refresh, looking it up by the
@@ -898,7 +953,7 @@ async function refreshAssets() {
   } catch {
     assets = [];
   }
-  renderChips();
+  if (!$("token-droplist").classList.contains("hide")) renderTokenDroplist();
   renderRedeemAssets();
 }
 
@@ -968,10 +1023,27 @@ async function init() {
   $("btn-sol-unwrap").onclick = unwrapSol;
   $("btn-sol-wrap-copy").onclick = () => navigator.clipboard.writeText($("sol-wrap-addr").textContent);
   $("btn-sol-unwrap-copy").onclick = () => navigator.clipboard.writeText($("sol-unwrap-addr").textContent);
-  $("token-input").addEventListener("change", () => {
-    const v = $("token-input").value.trim();
-    if (/^0x[0-9a-fA-F]{40}$/.test(v)) selectToken(v.toLowerCase());
+  // Deposit asset selector: a searchable dropdown over ETH + the
+  // Ethereum-bridged assets, with paste-an-address as the escape hatch.
+  const tokenSearch = $("token-search");
+  const openDroplist = () => {
+    renderTokenDroplist();
+    $("token-droplist").classList.remove("hide");
+  };
+  tokenSearch.addEventListener("focus", openDroplist);
+  tokenSearch.addEventListener("input", () => {
+    openDroplist();
+    const v = tokenSearch.value.trim();
+    if (/^0x[0-9a-fA-F]{40}$/.test(v)) pickToken(v.toLowerCase(), short(v.toLowerCase()));
   });
+  tokenSearch.addEventListener("blur", () => {
+    setTimeout(() => $("token-droplist").classList.add("hide"), 150);
+  });
+  tokenSearch.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") $("token-droplist").classList.add("hide");
+  });
+  $("red-assets-search").addEventListener("input", renderRedeemAssets);
+  $("sol-red-assets-search").addEventListener("input", renderRedeemAssets);
   for (const id of ["amount-input", "seqaddr-input"]) {
     $(id).addEventListener("input", updateDepositButton);
   }
