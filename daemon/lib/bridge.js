@@ -624,11 +624,25 @@ export class Bridge {
 
   async processRedemptions() {
     const s = this.state.data;
-    const res = await this.seq.call("listsinceblock", {
-      blockhash: s.seqLastBlockHash ?? undefined,
-      target_confirmations: this.cfg.seqConfirmations,
-      include_watchonly: true,
-    });
+    let res;
+    try {
+      res = await this.seq.call("listsinceblock", {
+        blockhash: s.seqLastBlockHash ?? undefined,
+        target_confirmations: this.cfg.seqConfirmations,
+        include_watchonly: true,
+      });
+    } catch (e) {
+      if (e.code !== -5) throw e;
+      // The cursor block fell out of the node's main index (deep
+      // Bitcoin-anchor reorgs do this on testnet4). Rescan the whole wallet
+      // once: redemption records are keyed by txid:vout, so nothing is
+      // double-processed, and the cursor is re-seeded from this response.
+      this.log(`redemption scan cursor ${s.seqLastBlockHash} is gone (reorged); rescanning from the start`);
+      res = await this.seq.call("listsinceblock", {
+        target_confirmations: this.cfg.seqConfirmations,
+        include_watchonly: true,
+      });
+    }
 
     for (const tx of res.transactions) {
       if (tx.category !== "receive") continue;
