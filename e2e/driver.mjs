@@ -671,6 +671,43 @@ if (process.env.SOL_RPC) {
       120_000
     );
     check("a redemption beyond one chain's escrow parks as awaiting_liquidity, not a failed release", true);
+
+    // --- and it RESUMES once that chain's escrow is replenished, rather than
+    //     staying parked forever (awaiting_liquidity must not be terminal) ---
+    await sol.rpc("mockMintTo", [usdcMint, solUser.address, 50_000_000]);
+    const bh4 = await sol.latestBlockhash();
+    const topUp = buildTx({
+      feePayer: solUser,
+      recentBlockhash: bh4.blockhash,
+      instructions: [
+        ataCreateIdempotent({
+          payer: solUser.address,
+          ata: ataAddress(wrap2.depositAddress, usdcMint),
+          owner: wrap2.depositAddress,
+          mint: usdcMint,
+        }),
+        splTransferChecked({
+          source: ataAddress(solUser.address, usdcMint),
+          mint: usdcMint,
+          dest: ataAddress(wrap2.depositAddress, usdcMint),
+          owner: solUser.address,
+          amount: 50_000_000n, // 50 USDC: lifts Solana escrow past the parked redemption
+          decimals: 6,
+        }),
+      ],
+    });
+    await sol.send(topUp.tx);
+    const resumed = await waitFor(
+      "the parked redemption resumes and completes after escrow is replenished",
+      async () => {
+        const r = await api(`sol/redeem/${usdcUnwrap.seqAddress}`);
+        // the 100-USDC (RPC amount 1.0 = 1e8 atoms) redemption is the parked one
+        const rec = r.redemptions.find((x) => x.amountUnits === "100000000");
+        return rec?.status === "done" ? rec : null;
+      },
+      180_000
+    );
+    check("awaiting_liquidity is not terminal: the redemption releases after a rebalancing deposit", resumed.status === "done");
   }
 }
 
