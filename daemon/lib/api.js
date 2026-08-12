@@ -43,6 +43,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   function publicMapping(m) {
     return {
       tokenKey: m.tokenKey,
+      chainId: m.chainId, // which leg bridged it (ethChainId number, or a chain label)
       token: m.token,
       symbol: m.symbol,
       name: m.name,
@@ -134,6 +135,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           btcChainName: cfg.btcChainName ?? "Bitcoin testnet4",
           btcConfigured: !!cfg.sbtcBridgeUrl,
           solChainName: cfg.solChainName ?? "Solana devnet",
+          solChainLabel: cfg.solChainLabel ?? "solana-devnet",
           solConfigured: !!bridge.sol,
           ...(bridge.sol ? { solTreasury: bridge.sol.treasury.address } : {}),
           maxSatsPerAsset: SEQ_MAX_SATS.toString(),

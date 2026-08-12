@@ -143,16 +143,35 @@
   }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
-  .chip {
-    border: 1px solid var(--line);
+  /* searchable asset selector + filterable lists */
+  .combo { position: relative; }
+  .droplist {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 10;
+    margin-top: 6px;
     background: var(--panel2);
-    color: var(--text);
-    border-radius: 999px;
-    padding: 6px 14px;
-    font-family: var(--mono);
-    font-size: 12.5px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    max-height: 260px;
+    overflow-y: auto;
+    box-shadow: 0 10px 24px rgb(0 0 0 / 45%);
   }
-  .chip.sel { border-color: var(--gold); color: var(--gold); }
+  .droprow {
+    padding: 10px 14px;
+    cursor: pointer;
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 13.5px;
+  }
+  .droprow:hover { background: color-mix(in srgb, var(--gold) 8%, transparent); }
+  .droprow .sym { font-weight: 650; }
+  .droprow.note { cursor: default; }
+  .listsearch { margin-bottom: 8px; }
+  .scrolllist { max-height: 240px; overflow-y: auto; }
 
   .tokencard {
     border: 1px solid var(--line);
@@ -309,9 +328,9 @@
 
       <div class="field">
         <label>Asset to bridge</label>
-        <div class="row" id="asset-chips"></div>
-        <div style="margin-top:9px">
-          <input class="mono" id="token-input" placeholder="or paste any ERC-20 contract address (0x&hellip;)" spellcheck="false">
+        <div class="combo">
+          <input class="mono" id="token-search" placeholder="search bridged assets, or paste any ERC-20 address (0x&hellip;)" spellcheck="false" autocomplete="off">
+          <div class="droplist hide" id="token-droplist"></div>
         </div>
         <div class="tokencard hide" id="token-card" style="margin-top:10px"></div>
       </div>
@@ -377,7 +396,8 @@
 
       <div class="field">
         <label>Bridged assets you can return</label>
-        <div class="events" id="red-assets"><span class="note">none bridged yet</span></div>
+        <input class="mono listsearch" id="red-assets-search" placeholder="search" spellcheck="false" autocomplete="off">
+        <div class="events scrolllist" id="red-assets"><span class="note">none bridged yet</span></div>
       </div>
 
       <div class="field">
@@ -518,6 +538,11 @@
         not simply once the transfer confirms on Sequentia. On Sequentia, Bitcoin
         anchoring is the supreme consensus rule, so a confirmed Sequentia
         transaction can still be reversed until its Bitcoin anchor is final.
+      </div>
+      <div class="field">
+        <label>Solana-bridged assets you can return</label>
+        <input class="mono listsearch" id="sol-red-assets-search" placeholder="search" spellcheck="false" autocomplete="off">
+        <div class="events scrolllist" id="sol-red-assets"><span class="note">none bridged yet</span></div>
       </div>
       <div class="field">
         <label>Your Solana address (receives the released SOL or tokens)</label>
