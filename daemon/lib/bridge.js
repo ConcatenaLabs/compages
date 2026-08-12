@@ -1007,12 +1007,15 @@ export class Bridge {
     this.state.save();
   }
 
-  /** Re-evaluate redemptions still waiting for the burn to become final, so a
-   *  burn that has since accrued enough Bitcoin-anchor depth gets released even
-   *  if no new redemption arrived this tick. */
+  /** Re-evaluate redemptions parked before release, so one gets sent the tick
+   *  after its blocker clears without waiting for a new redemption to arrive:
+   *  a burn that has since accrued enough Bitcoin-anchor depth
+   *  (awaiting_finality), or a short chain whose escrow a later deposit has
+   *  since refilled (awaiting_liquidity). handleRedemption re-checks both gates
+   *  and is idempotent, so re-driving a still-blocked record just re-parks it. */
   async advanceRedemptions() {
     for (const rec of Object.values(this.state.data.redemptions)) {
-      if (rec.status !== "awaiting_finality") continue;
+      if (rec.status !== "awaiting_finality" && rec.status !== "awaiting_liquidity") continue;
       try {
         await this.handleRedemption(rec);
       } catch (e) {
@@ -1738,7 +1741,12 @@ export class Bridge {
       this.log(`sol redemption ${rec.key}: awaiting finality: ${fin.reason}`);
       return;
     }
-    if (rec.status === "awaiting_finality") rec.status = "new";
+    // Both gates passed: proceed to release, whichever pre-release park the
+    // record came from (awaiting_finality or awaiting_liquidity). This mirrors
+    // the Ethereum leg's unconditional promotion; a conditional check here
+    // would leave a rebalanced awaiting_liquidity record stuck, passing both
+    // gates every tick yet never releasing.
+    rec.status = "new";
     this.state.save();
     await this.releaseSolRedemption(rec, mapping);
   }
@@ -1932,7 +1940,7 @@ export class Bridge {
     const s = this.state.data;
     for (const rec of Object.values(s.solRedemptions)) {
       try {
-        if (rec.status === "awaiting_finality") {
+        if (rec.status === "awaiting_finality" || rec.status === "awaiting_liquidity") {
           await this.handleSolRedemption(rec);
         } else if (["new", "releasing", "released", "destroy_pending"].includes(rec.status)) {
           const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);

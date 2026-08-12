@@ -520,6 +520,10 @@ async function refreshRedemptions(seqAddress) {
         state = "waiting for Bitcoin-anchor finality" + (ev.finality ? ` (${ev.finality})` : "");
         cls = "wait";
         break;
+      case "awaiting_liquidity":
+        state = "waiting for the operator to rebalance this chain's reserves";
+        cls = "wait";
+        break;
       case "new":
       case "releasing":
         state = "releasing on " + status.ethChainName;
@@ -907,6 +911,10 @@ async function refreshSolRedemptions(seqAddress) {
     switch (ev.status) {
       case "awaiting_finality":
         state = "waiting for Bitcoin-anchor finality" + (ev.finality ? ` (${escapeHtml(ev.finality)})` : "");
+        cls = "wait";
+        break;
+      case "awaiting_liquidity":
+        state = "waiting for the operator to rebalance this chain's reserves";
         cls = "wait";
         break;
       case "new":
