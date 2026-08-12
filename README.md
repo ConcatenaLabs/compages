@@ -251,11 +251,6 @@ operator. Registration is best-effort and retried; it never blocks a mint.
   a raw transaction (a `burn` output for the bridged asset plus a fee output
   in `seqFeeAsset`), blinded, signed and broadcast by the daemon
   (`daemon/lib/bridge.js`, `destroyAsset`).
-- **Reissuance tokens stay confidential**: consensus accepts a reissuance
-  only when the reissuance-token input carries a commitment asset tag, so the
-  daemon keeps each asset's reissuance token on a blinded (confidential)
-  address and re-blinds it after every reissue (wallet change comes back
-  unblinded on transparent-by-default Sequentia). Handled automatically.
 - **Mempool verification**: the daemon verifies every mint, send and burn
   transaction actually reached the mempool before counting it, and rolls the
   wallet back (`abandontransaction`) if it did not.

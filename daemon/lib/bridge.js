@@ -291,12 +291,6 @@ export class Bridge {
         this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
       );
     } else {
-      // Consensus only accepts a reissuance whose token input carries a
-      // commitment asset tag, so the reissuance token must sit on a blinded
-      // (confidential) output. Sequentia wallets are transparent by default
-      // and leave token change unblinded, so re-blind before every reissue.
-      await this.ensureBlindedReissuanceToken(mapping);
-
       dep.steps.pendingMint = true;
       this.state.save();
       let re;
@@ -314,9 +308,8 @@ export class Bridge {
         throw e;
       }
       if (!(await this.waitWalletTxVisible(re.txid))) {
-        // The wallet handed us a txid for a transaction the chain rejected
-        // (observed with unblinded token inputs). Roll the wallet back and
-        // retry from a clean slate.
+        // The wallet can hand out a txid for a transaction the chain rejects
+        // without surfacing an error. Roll the wallet back and retry clean.
         await this.seq.call("abandontransaction", { txid: re.txid }).catch(() => {});
         this.deferMint(dep, "pendingMint", new Error("reissuance tx never reached the mempool"));
         return null;
@@ -450,34 +443,6 @@ export class Bridge {
       if (Date.now() - t0 > timeoutMs) return false;
       await new Promise((r) => setTimeout(r, 1000));
     }
-  }
-
-  /** Move the reissuance token to a confidential address if it currently
-   *  sits unblinded (consensus rejects reissuance from unblinded token
-   *  inputs; wallet change is unblinded on Sequentia, so this recurs). */
-  async ensureBlindedReissuanceToken(mapping) {
-    const utxos = await this.seq.call("listunspent", {
-      minconf: 0,
-      maxconf: 9999999,
-      query_options: { asset: mapping.reissuanceToken },
-    });
-    if (!utxos.length) {
-      throw new Error(`reissuance token ${mapping.reissuanceToken} not found in the bridge wallet`);
-    }
-    const ZERO_BLINDER = "0".repeat(64);
-    if (utxos.some((u) => u.assetblinder !== ZERO_BLINDER)) return; // already usable
-    const total = utxos.reduce((a, u) => a + Number(u.amount), 0);
-    const blindAddr = await this.seq.call("getnewaddress", {
-      label: "compages-token",
-      address_type: "blech32",
-    });
-    const txid = await this.seq.call("sendtoaddress", {
-      address: blindAddr,
-      amount: total,
-      assetlabel: mapping.reissuanceToken,
-      ...(this.cfg.seqFeeAsset ? { fee_asset_label: this.cfg.seqFeeAsset } : {}),
-    });
-    this.log(`re-blinded reissuance token for ${mapping.symbol} in ${txid}`);
   }
 
   /** Destroy (burn) `sats` of `assetId`, keeping circulating supply equal to
