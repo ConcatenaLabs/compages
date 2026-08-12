@@ -324,8 +324,21 @@ export class Bridge {
 
   /** Record that `units` more of a source's token now sit in that chain's
    *  escrow. The sum of these across sources is what circulating supply must
-   *  equal; see /api/por. */
-  creditEscrow(mapping, tokenKey, units) {
+   *  equal; see /api/por.
+   *
+   *  `dep` is credited at most once. Escrow measures what users actually sent,
+   *  not how many times we tried to mint against it, and a deposit CAN be
+   *  re-driven: a mint deferred by a false negative (the reissue confirmed but
+   *  we failed to see it) is retried from the top. Crediting twice would
+   *  inflate the escrow figure, and an inflated escrow makes /api/por report
+   *  backing that the source chain does not actually hold, which is the one
+   *  direction a proof of reserves must never err in. */
+  creditEscrow(mapping, tokenKey, units, dep = null) {
+    if (dep) {
+      dep.steps ??= {};
+      if (dep.steps.escrowCredited) return;
+      dep.steps.escrowCredited = true;
+    }
     // Only a mapping with persisted sources keeps an escrow ledger. An
     // ordinary bridged asset predates the ledger and its source is synthesized
     // on read, so there is nowhere to record this; its backing is still the
@@ -518,7 +531,7 @@ export class Bridge {
     if (!mapping) return; // deferred or halted; status/markers already recorded
     dep.assetId = mapping.assetId;
     // The deposit is now backed: the tokens are in this chain's escrow.
-    this.creditEscrow(mapping, dep.tokenKey, dep.amountUnits);
+    this.creditEscrow(mapping, dep.tokenKey, dep.amountUnits, dep);
     this.state.save();
 
     await this.sendMinted(dep, mapping);
@@ -1514,7 +1527,7 @@ export class Bridge {
       }
     }
     dep.assetId = mapping.assetId;
-    this.creditEscrow(mapping, tokenKey, units);
+    this.creditEscrow(mapping, tokenKey, units, dep);
     this.state.save();
     await this.sendMinted(dep, mapping);
   }
