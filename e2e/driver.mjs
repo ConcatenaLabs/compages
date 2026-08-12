@@ -595,11 +595,12 @@ if (process.env.SOL_RPC) {
     );
     const usdc1 = assets.find((a) => a.assetId === usdc0.assetId);
     check("supply is the sum of both chains' deposits", usdc1.mintedSats === "350000000", usdc1.mintedSats);
-    check(
-      "the user holds ONE fungible balance, not two wrapped ones",
-      (await seqAssetBalance("user", usdc0.assetId)) === 350_000_000,
-      `${await seqAssetBalance("user", usdc0.assetId)}`
+    // Minting and delivering are separate steps, so wait for the balance
+    // rather than sampling it the instant the mint is recorded.
+    const unifiedBal = await waitFor("user wallet sees both chains' USDC as one balance", async () =>
+      (await seqAssetBalance("user", usdc0.assetId)) === 350_000_000 ? 1 : null
     );
+    check("the user holds ONE fungible balance, not two wrapped ones", !!unifiedBal, "350000000");
 
     const escrowEth = usdc1.sources.find((s) => s.chainId === 31337)?.escrowedUnits;
     const escrowSol = usdc1.sources.find((s) => s.chainId === "solana-mock")?.escrowedUnits;

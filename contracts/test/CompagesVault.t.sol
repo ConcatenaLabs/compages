@@ -180,4 +180,123 @@ contract CompagesVaultTest is Test {
         assertEq(vault.owner(), bob);
         vm.stopPrank();
     }
+
+    // ---------------- supply lock and stablecoin hand-off ----------------
+
+    /// Put an escrow in the vault to work with.
+    function _escrow(uint256 amount) private {
+        vm.startPrank(alice);
+        token.approve(address(vault), amount);
+        vault.depositToken(address(token), amount, SEQ_ADDR);
+        vm.stopPrank();
+    }
+
+    function test_releasePause_isSeparateFromDepositPause() public {
+        _escrow(100e6);
+
+        // Pausing deposits alone must leave users able to exit: that is the
+        // routine pause, and stranding funds is no part of it.
+        vm.prank(owner);
+        vault.setDepositsPaused(true);
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 10e6, keccak256("r1"));
+        assertEq(token.balanceOf(bob), 10e6);
+
+        // Pausing releases as well locks the supply: nothing moves in either
+        // direction, which is what makes an exact reconciliation possible.
+        vm.prank(owner);
+        vault.setReleasesPaused(true);
+        vm.prank(operator);
+        vm.expectRevert(CompagesVault.ReleasesArePaused.selector);
+        vault.release(address(token), payable(bob), 10e6, keccak256("r2"));
+
+        vm.prank(owner);
+        vault.setReleasesPaused(false);
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 10e6, keccak256("r2"));
+        assertEq(token.balanceOf(bob), 20e6);
+    }
+
+    function test_burnLockedUSDC_onlyBurner_onlyWhenLocked_burnsEverything() public {
+        _escrow(100e6);
+
+        // Nothing can burn until the owner names both the stablecoin and the
+        // issuer's burner address.
+        vm.prank(bob);
+        vm.expectRevert(CompagesVault.NotBurner.selector);
+        vault.burnLockedUSDC();
+
+        vm.prank(owner);
+        vault.setStablecoinBurner(address(token), bob);
+
+        // The burner still cannot act while the supply is moving.
+        vm.prank(bob);
+        vm.expectRevert(CompagesVault.SupplyNotLocked.selector);
+        vault.burnLockedUSDC();
+
+        vm.startPrank(owner);
+        vault.setDepositsPaused(true);
+        vault.setReleasesPaused(true);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vm.expectRevert(CompagesVault.NotBurner.selector);
+        vault.burnLockedUSDC();
+
+        uint256 supplyBefore = token.totalSupply();
+        vm.prank(bob);
+        vault.burnLockedUSDC();
+
+        // The escrow is destroyed, not moved: after the hand-off the bridged
+        // asset is the issuer's liability, so tokens left here would
+        // double-count the backing.
+        assertEq(token.balanceOf(address(vault)), 0);
+        assertEq(token.totalSupply(), supplyBefore - 100e6);
+
+        vm.prank(bob);
+        vm.expectRevert(CompagesVault.ZeroAmount.selector);
+        vault.burnLockedUSDC();
+    }
+
+    function test_rebalanceOut_isOperatorOnly_andRespectsTheSupplyLock() public {
+        _escrow(100e6);
+
+        vm.prank(alice);
+        vm.expectRevert(CompagesVault.NotOperator.selector);
+        vault.rebalanceOut(address(token), payable(bob), 10e6, "solana");
+
+        vm.prank(operator);
+        vault.rebalanceOut(address(token), payable(bob), 40e6, "solana");
+        assertEq(token.balanceOf(bob), 40e6);
+        assertEq(token.balanceOf(address(vault)), 60e6);
+
+        // A locked supply must not be moved by a rebalance either.
+        vm.prank(owner);
+        vault.setReleasesPaused(true);
+        vm.prank(operator);
+        vm.expectRevert(CompagesVault.ReleasesArePaused.selector);
+        vault.rebalanceOut(address(token), payable(bob), 1e6, "solana");
+    }
+
+    function test_burnLockedUSDC_revertsWhenTheTokenCannotBurn() public {
+        // A token with no burn function must fail loudly rather than look like
+        // it destroyed an escrow the vault still holds.
+        NoReturnERC20 odd = new NoReturnERC20();
+        odd.mint(alice, 100e6);
+        vm.startPrank(alice);
+        odd.approve(address(vault), 100e6);
+        vault.depositToken(address(odd), 100e6, SEQ_ADDR);
+        vm.stopPrank();
+
+        vm.startPrank(owner);
+        vault.setStablecoinBurner(address(odd), bob);
+        vault.setDepositsPaused(true);
+        vault.setReleasesPaused(true);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectRevert(CompagesVault.BurnFailed.selector);
+        vault.burnLockedUSDC();
+        assertEq(odd.balanceOf(address(vault)), 100e6);
+    }
 }

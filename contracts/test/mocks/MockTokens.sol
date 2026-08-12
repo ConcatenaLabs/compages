@@ -25,6 +25,15 @@ contract MockERC20 {
         emit Transfer(address(0), to, amount);
     }
 
+    /// @notice Burn from the caller's own balance: the shape a fiat-backed
+    ///         stablecoin exposes to addresses its issuer has authorized.
+    function burn(uint256 amount) external {
+        require(balanceOf[msg.sender] >= amount, "balance");
+        balanceOf[msg.sender] -= amount;
+        totalSupply -= amount;
+        emit Transfer(msg.sender, address(0), amount);
+    }
+
     function approve(address spender, uint256 amount) external returns (bool) {
         allowance[msg.sender][spender] = amount;
         emit Approval(msg.sender, spender, amount);
