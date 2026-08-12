@@ -133,8 +133,13 @@ export function sourceForChain(mapping, chainId) {
   return null;
 }
 
-export function refundId(chainId, nonce) {
-  return ethers.keccak256(ethers.toUtf8Bytes(`compages:refund:${chainId}:${nonce}`));
+export function refundId(chainId, nonce, vault = null) {
+  // Each vault numbers its own deposits from zero, so a refund id must name
+  // the vault as well once more than one is watched. The primary vault keeps
+  // the original form so ids already recorded on chain still match.
+  return ethers.keccak256(
+    ethers.toUtf8Bytes(vault ? `compages:refund:${chainId}:${vault}:${nonce}` : `compages:refund:${chainId}:${nonce}`)
+  );
 }
 
 export function redemptionIdOf(seqChain, txid, vout) {
@@ -303,6 +308,10 @@ export class Bridge {
           token: src.token,
           decimals: src.decimals,
           ...(src.tokenProgram ? { tokenProgram: src.tokenProgram } : {}),
+          // Which vault escrows this source. A stablecoin destined for a
+          // hand-off needs one that can lock its supply and burn itself, which
+          // may not be the vault older assets sit in.
+          ...(src.vault ? { vault: src.vault } : {}),
         });
         if (s.tokenRoutes[key] !== mappingKey) {
           s.tokenRoutes[key] = mappingKey;
@@ -395,13 +404,15 @@ export class Bridge {
     let from = s.lastEthBlock + 1;
     while (from <= confirmedHead) {
       const to = Math.min(from + chunk - 1, confirmedHead);
-      const logs = await this.eth.vault.queryFilter(
-        this.eth.vault.filters.Deposited(),
-        from,
-        to
-      );
-      for (const ev of logs) {
-        await this.handleDeposit(ev);
+      // Every vault is on this chain and shares its block numbers, so one
+      // cursor covers them all; a vault deployed later simply has no logs
+      // before its deploy block.
+      for (const address of this.eth.vaultAddresses) {
+        const vault = this.eth.vaultFor(address);
+        const logs = await vault.queryFilter(vault.filters.Deposited(), from, to);
+        for (const ev of logs) {
+          await this.handleDeposit(ev, address);
+        }
       }
       s.lastEthBlock = to;
       this.state.save();
@@ -409,14 +420,23 @@ export class Bridge {
     }
   }
 
-  async handleDeposit(ev) {
+  async handleDeposit(ev, vaultAddress = null) {
     const s = this.state.data;
     const nonce = ev.args.nonce.toString();
-    if (s.deposits[nonce]) return; // already seen (rescan)
+    // Vaults number their deposits independently, so nonce alone stops being
+    // unique the moment a second vault is watched. The primary vault keeps
+    // the bare nonce as its key so existing records and their on-chain refund
+    // ids are untouched.
+    const isPrimary =
+      !vaultAddress || String(this.cfg.vaultAddress ?? "").toLowerCase() === String(vaultAddress).toLowerCase();
+    const key = isPrimary ? nonce : `${vaultAddress}:${nonce}`;
+    if (s.deposits[key]) return; // already seen (rescan)
 
     const token = ev.args.token === ethers.ZeroAddress ? "eth" : ev.args.token.toLowerCase();
     const dep = {
       nonce,
+      key,
+      vault: vaultAddress ?? null,
       tag: `deposit #${nonce}`,
       ethTxHash: ev.transactionHash,
       ethBlock: ev.blockNumber,
@@ -429,7 +449,7 @@ export class Bridge {
       steps: {},
       createdAt: new Date().toISOString(),
     };
-    s.deposits[nonce] = dep;
+    s.deposits[key] = dep;
     this.state.save();
     this.log(
       `deposit #${nonce}: ${dep.amountUnits} units of ${token} from ${dep.from} -> ${dep.seqAddress}`
@@ -873,15 +893,18 @@ export class Bridge {
   async processRefunds() {
     for (const dep of Object.values(this.state.data.deposits)) {
       if (dep.status !== "refund_pending") continue;
-      const id = refundId(this.cfg.ethChainId, dep.nonce);
+      const id = refundId(this.cfg.ethChainId, dep.nonce, dep.key === dep.nonce ? null : dep.vault);
+      // Refund out of the vault that took the deposit: no other vault holds
+      // escrow for it.
+      const vault = this.eth.vaultFor(dep.vault);
       try {
-        if (await this.eth.vault.processedRedemptions(id)) {
+        if (await vault.processedRedemptions(id)) {
           dep.status = "refunded";
           this.state.save();
           continue;
         }
         const tokenAddr = dep.token === "eth" ? ethers.ZeroAddress : dep.token;
-        const tx = await this.eth.vault.release(tokenAddr, dep.from, dep.amountUnits, id);
+        const tx = await vault.release(tokenAddr, dep.from, dep.amountUnits, id);
         await tx.wait(1);
         dep.status = "refunded";
         dep.refundTxHash = tx.hash;
@@ -1077,6 +1100,9 @@ export class Bridge {
       return;
     }
     rec.tokenKey = src.tokenKey;
+    // Pin the vault holding this source's escrow now, so a later config change
+    // cannot redirect an in-flight release to a vault that never held it.
+    rec.vault = src.vault ?? this.cfg.vaultAddress ?? null;
     rec.symbol = mapping.symbol;
 
     const units = atomsToUnits(rec.sats, src.decimals, mapping.precision);
@@ -1123,9 +1149,11 @@ export class Bridge {
   async releaseRedemption(rec, mapping) {
     const id = redemptionIdOf(this.cfg.seqChainLabel, rec.txid, rec.vout);
     rec.redemptionId = id;
+    // Pay out of the vault holding THIS asset's escrow on this chain.
+    const vault = this.eth.vaultFor(rec.vault ?? sourcesOf(mapping)[rec.tokenKey]?.vault);
 
     if (rec.status === "new") {
-      if (await this.eth.vault.processedRedemptions(id)) {
+      if (await vault.processedRedemptions(id)) {
         rec.status = "released"; // paid in a previous life; continue to destroy
       } else {
         // Anchoring is supreme: re-verify the burn is STILL final immediately
@@ -1149,7 +1177,7 @@ export class Bridge {
           ? ethers.ZeroAddress
           : ethSrc?.token ?? mapping.token;
         try {
-          const tx = await this.eth.vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
+          const tx = await vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
           await tx.wait(1);
           rec.releaseTxHash = tx.hash;
           rec.status = "released";
@@ -1194,7 +1222,7 @@ export class Bridge {
       if (!mapping) continue;
       if (rec.status === "releasing") {
         // The on-chain guard tells us whether the payout landed before the crash.
-        rec.status = (await this.eth.vault.processedRedemptions(rec.redemptionId))
+        rec.status = (await this.eth.vaultFor(rec.vault).processedRedemptions(rec.redemptionId))
           ? "released"
           : "new";
         this.state.save();

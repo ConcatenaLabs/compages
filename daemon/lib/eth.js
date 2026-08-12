@@ -31,7 +31,32 @@ export class Eth {
       staticNetwork: true,
     });
     this.wallet = new ethers.Wallet(operatorKey, this.provider);
-    this.vault = new ethers.Contract(cfg.vaultAddress, VAULT_ABI, this.wallet);
+
+    // More than one vault can be live at once on the same chain. A stablecoin
+    // whose issuer may adopt it needs an escrow that can lock its supply and
+    // burn itself at hand-off, and this contract is deliberately not
+    // upgradeable, so that capability arrives as a NEW vault. Escrow already
+    // sitting in the old one must not be disturbed to get it: moving user
+    // funds to gain a feature nobody has used yet would be the riskier half of
+    // the trade. So both are watched, and each source names the vault holding
+    // its escrow.
+    const configured = Array.isArray(cfg.vaults) && cfg.vaults.length
+      ? cfg.vaults
+      : [{ address: cfg.vaultAddress, deployBlock: cfg.vaultDeployBlock }];
+    this.vaults = new Map();
+    for (const v of configured) {
+      if (!v?.address) continue;
+      this.vaults.set(v.address.toLowerCase(), new ethers.Contract(v.address, VAULT_ABI, this.wallet));
+    }
+    this.vaultAddresses = [...this.vaults.keys()];
+    this.vault = this.vaults.get(String(cfg.vaultAddress ?? "").toLowerCase()) ?? this.vaults.values().next().value;
+  }
+
+  /** The vault contract at `address`, or the primary vault when a record
+   *  predates multi-vault support and names none. */
+  vaultFor(address) {
+    if (!address) return this.vault;
+    return this.vaults.get(String(address).toLowerCase()) ?? this.vault;
   }
 
   /** Fetch symbol/name/decimals for a token address; "eth" for ether. */
