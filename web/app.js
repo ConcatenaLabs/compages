@@ -495,6 +495,7 @@ async function refreshRedemptions(seqAddress) {
         break;
       case "released":
       case "destroy_pending":
+      case "destroy_manual":
       case "done":
         state = "released";
         cls = "ok";
@@ -505,6 +506,10 @@ async function refreshRedemptions(seqAddress) {
         break;
       case "ignored_unknown_asset":
         state = "not a bridged asset; contact the operator";
+        cls = "bad";
+        break;
+      case "ignored_wrong_network":
+        state = "not an Ethereum-bridged asset; contact the operator";
         cls = "bad";
         break;
       case "release_failed_manual":
@@ -581,11 +586,21 @@ async function resumeRedemption(addr) {
 }
 
 // ---------- tabs + init ----------
-// Network selector: show one bridge card at a time (Ethereum or Bitcoin) instead of stacking both.
+// Network selector: show one bridge card at a time. The header pill follows it,
+// so the "<origin> ══●══ Sequentia testnet" coupling always names the chain
+// actually selected, never just Sepolia.
 function showNetwork(net) {
-  const btc = net === "btc";
-  $("eth-card").classList.toggle("hide", btc);
-  $("btc-card").classList.toggle("hide", !btc);
+  for (const n of ["eth", "btc", "sol"]) {
+    $(`${n}-card`).classList.toggle("hide", n !== net);
+  }
+  const labels = {
+    eth: status?.ethChainName ?? "Ethereum",
+    btc: status?.btcChainName ?? "Bitcoin testnet4",
+    sol: status?.solChainName ?? "Solana devnet",
+  };
+  const pill = $("net-from");
+  pill.textContent = labels[net] ?? net;
+  pill.className = `net ${net}`;
 }
 
 function showTab(dep) {
@@ -661,6 +676,207 @@ async function unwrapBtc() {
   }
 }
 
+// ---------- Solana bridge (SOL <-> SOL.s) ----------
+// Address-based like the Bitcoin leg: request a bridge-allocated address, then
+// send SOL / SOL.s to it from any wallet. Unlike the Bitcoin leg the daemon
+// itself holds custody, so both flows report live per-transfer status here.
+function showSolTab(wrap) {
+  $("panel-sol-wrap").classList.toggle("hide", !wrap);
+  $("panel-sol-unwrap").classList.toggle("hide", wrap);
+  $("tab-sol-wrap").classList.toggle("active", wrap);
+  $("tab-sol-unwrap").classList.toggle("active", !wrap);
+  $("tab-sol-wrap").setAttribute("aria-selected", wrap);
+  $("tab-sol-unwrap").setAttribute("aria-selected", !wrap);
+}
+
+// Trim-zeros display of lamports as SOL (9 decimal places).
+function formatLamports(lamports) {
+  const l = BigInt(lamports ?? 0);
+  const frac = (l % 1000000000n).toString().padStart(9, "0").replace(/0+$/, "");
+  return `${l / 1000000000n}${frac ? "." + frac : ""}`;
+}
+
+// Link a Solana transaction signature to the official explorer (devnet only;
+// other clusters would need their own query parameter).
+function solTxLink(sig) {
+  if (!sig || !/devnet/i.test(status?.solChainName ?? "")) return "";
+  const url = `https://explorer.solana.com/tx/${encodeURIComponent(sig)}?cluster=devnet`;
+  return ` &middot; <a href="${url}" target="_blank" rel="noopener">view on Solana</a>`;
+}
+
+let solWrapPoll = null;
+let solRedeemPoll = null;
+
+async function wrapSol() {
+  const line = $("sol-wrap-status");
+  line.classList.remove("err");
+  const seqAddress = $("sol-wrap-seqaddr").value.trim();
+  if (!seqAddress) {
+    line.textContent = "enter your Sequentia address (it receives the SOL.s)";
+    line.classList.add("err");
+    return;
+  }
+  line.textContent = "requesting a deposit address…";
+  try {
+    const r = await api("sol/wrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seqAddress }),
+    });
+    $("sol-wrap-result").classList.remove("hide");
+    $("sol-wrap-addr").textContent = r.depositAddress;
+    $("sol-wrap-note").textContent = r.note;
+    line.textContent = "";
+    if (solWrapPoll) clearInterval(solWrapPoll);
+    const poll = () => refreshSolDeposits(r.depositAddress);
+    solWrapPoll = setInterval(poll, 6000);
+    poll();
+  } catch (e) {
+    line.textContent = e.message;
+    line.classList.add("err");
+  }
+}
+
+async function refreshSolDeposits(depositAddress) {
+  let r;
+  try {
+    r = await api(`sol/wrap/${depositAddress}`);
+  } catch {
+    return;
+  }
+  const box = $("sol-wrap-events");
+  if (!r.deposits.length) {
+    box.innerHTML = `<span class="note">nothing received yet; waiting for a transfer to ${escapeHtml(short(depositAddress))}</span>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const d of r.deposits) {
+    const el = document.createElement("div");
+    el.className = "event";
+    let state, cls;
+    switch (d.status) {
+      case "minted":
+        state = `minted ${formatSats(d.sats)} SOL.s on Sequentia`;
+        cls = "ok";
+        break;
+      case "minting":
+      case "mint_retry":
+      case "send_retry":
+        state = "minting on Sequentia";
+        cls = "wait";
+        break;
+      case "dust_manual":
+      case "failed_manual":
+        state = "paused for operator review; contact the operator";
+        cls = "bad";
+        break;
+      default:
+        state = d.status;
+        cls = "wait";
+    }
+    const seqLine = d.seqTxid
+      ? `<br><span class="mono">Sequentia tx ${escapeHtml(short(d.seqTxid))}</span>`
+      : "";
+    el.innerHTML = `
+      <div>
+        <div>${formatLamports(d.lamports)} SOL</div>
+        <div class="mono">${escapeHtml(short(d.sig))}</div>
+      </div>
+      <div class="state ${cls}">${state}${solTxLink(d.sig)}${seqLine}</div>`;
+    box.appendChild(el);
+  }
+}
+
+async function unwrapSol() {
+  const line = $("sol-unwrap-status");
+  line.classList.remove("err");
+  const solAddress = $("sol-unwrap-addr-input").value.trim();
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(solAddress)) {
+    line.textContent = "enter a valid Solana address (base58)";
+    line.classList.add("err");
+    return;
+  }
+  line.textContent = "requesting a return address…";
+  try {
+    const r = await api("sol/unwrap", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solAddress }),
+    });
+    $("sol-unwrap-result").classList.remove("hide");
+    $("sol-unwrap-addr").textContent = r.seqAddress;
+    $("sol-unwrap-note").textContent = r.note;
+    line.textContent = "";
+    if (solRedeemPoll) clearInterval(solRedeemPoll);
+    const poll = () => refreshSolRedemptions(r.seqAddress);
+    solRedeemPoll = setInterval(poll, 6000);
+    poll();
+  } catch (e) {
+    line.textContent = e.message;
+    line.classList.add("err");
+  }
+}
+
+async function refreshSolRedemptions(seqAddress) {
+  let r;
+  try {
+    r = await api(`sol/redeem/${seqAddress}`);
+  } catch {
+    return;
+  }
+  const box = $("sol-unwrap-events");
+  if (!r.redemptions.length) {
+    box.innerHTML = `<span class="note">nothing received yet; waiting for a transfer to ${escapeHtml(short(seqAddress))}</span>`;
+    return;
+  }
+  box.innerHTML = "";
+  for (const ev of r.redemptions) {
+    const el = document.createElement("div");
+    el.className = "event";
+    let state, cls;
+    switch (ev.status) {
+      case "awaiting_finality":
+        state = "waiting for Bitcoin-anchor finality" + (ev.finality ? ` (${escapeHtml(ev.finality)})` : "");
+        cls = "wait";
+        break;
+      case "new":
+      case "releasing":
+        state = "releasing on " + escapeHtml(status?.solChainName ?? "Solana");
+        cls = "wait";
+        break;
+      case "released":
+      case "destroy_pending":
+      case "destroy_manual":
+      case "done":
+        state = "released";
+        cls = "ok";
+        break;
+      case "dust_ignored":
+        state = "too small to release; contact the operator";
+        cls = "bad";
+        break;
+      case "ignored_wrong_network":
+        state = "not bridged SOL; contact the operator";
+        cls = "bad";
+        break;
+      case "release_failed_manual":
+        state = "release could not land; contact the operator";
+        cls = "bad";
+        break;
+      default:
+        state = ev.status;
+        cls = "wait";
+    }
+    el.innerHTML = `
+      <div>
+        <div>${formatSats(ev.sats)} SOL.s</div>
+        <div class="mono">${escapeHtml(short(ev.txid))}:${ev.vout}</div>
+      </div>
+      <div class="state ${cls}">${state}${solTxLink(ev.releaseSig)}</div>`;
+    box.appendChild(el);
+  }
+}
+
 async function refreshAssets() {
   try {
     assets = await api("assets");
@@ -677,12 +893,20 @@ async function init() {
   try {
     status = await api("status");
   } catch {
-    $("dep-status").textContent = "the bridge daemon is unreachable; try again later";
-    $("dep-status").classList.add("err");
+    // Show the failure in every leg's card, and keep the network selector
+    // working so a Bitcoin- or Solana-minded visitor sees the message too.
+    for (const id of ["dep-status", "wrap-status", "sol-wrap-status"]) {
+      $(id).textContent = "the bridge daemon is unreachable; try again later";
+      $(id).classList.add("err");
+    }
+    $("net-choice").onchange = (e) => showNetwork(e.target.value);
+    showNetwork($("net-choice").value || "eth");
     return;
   }
-  $("net-eth").textContent = status.ethChainName;
-  $("net-seq").textContent = status.seqChainLabel.replace(/-/g, " ");
+  // The right pill is the Sequentia side (capitalized for display); the left
+  // pill is set by showNetwork() so it always matches the selected origin chain.
+  const seqLabel = status.seqChainLabel.replace(/-/g, " ");
+  $("net-seq").textContent = seqLabel.charAt(0).toUpperCase() + seqLabel.slice(1);
   const scan = ETHERSCAN[status.ethChainId];
   $("vault-line").innerHTML = scan
     ? `<a href="${scan}/address/${status.vaultAddress}" target="_blank" rel="noopener">${status.vaultAddress}</a>`
@@ -709,9 +933,12 @@ async function init() {
   $("btn-resume-red").onclick = () => resumeRedemption($("resume-red-input").value.trim());
   $("tab-dep").onclick = () => showTab(true);
   $("tab-red").onclick = () => showTab(false);
-  // Network selector (Ethereum / Bitcoin) — one card at a time.
+  // Network selector: one card at a time. Legs the daemon reports unconfigured
+  // are not offered at all, rather than failing on use.
+  if (status.btcConfigured === false) $("net-choice").querySelector('option[value="btc"]')?.remove();
+  if (status.solConfigured === false) $("net-choice").querySelector('option[value="sol"]')?.remove();
   $("net-choice").onchange = (e) => showNetwork(e.target.value);
-  showNetwork("eth");
+  showNetwork($("net-choice").value || "eth");
   // Bitcoin bridge card
   $("tab-wrap").onclick = () => showBtcTab(true);
   $("tab-unwrap").onclick = () => showBtcTab(false);
@@ -719,6 +946,13 @@ async function init() {
   $("btn-unwrap").onclick = unwrapBtc;
   $("btn-wrap-copy").onclick = () => navigator.clipboard.writeText($("wrap-addr").textContent);
   $("btn-unwrap-copy").onclick = () => navigator.clipboard.writeText($("unwrap-addr").textContent);
+  // Solana bridge card
+  $("tab-sol-wrap").onclick = () => showSolTab(true);
+  $("tab-sol-unwrap").onclick = () => showSolTab(false);
+  $("btn-sol-wrap").onclick = wrapSol;
+  $("btn-sol-unwrap").onclick = unwrapSol;
+  $("btn-sol-wrap-copy").onclick = () => navigator.clipboard.writeText($("sol-wrap-addr").textContent);
+  $("btn-sol-unwrap-copy").onclick = () => navigator.clipboard.writeText($("sol-unwrap-addr").textContent);
   $("token-input").addEventListener("change", () => {
     const v = $("token-input").value.trim();
     if (/^0x[0-9a-fA-F]{40}$/.test(v)) selectToken(v.toLowerCase());
