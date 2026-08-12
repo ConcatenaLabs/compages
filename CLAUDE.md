@@ -51,6 +51,30 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
 - **One Sequentia asset per ERC-20, forever.** The mapping from token contract to Sequentia asset
   id is created exactly once, on the first deposit; every later deposit reissues the same asset.
   Duplicate assets would silently split liquidity.
+- **One Sequentia asset per unified stablecoin, across every chain it arrives from.** The same
+  dollar reaching us from Ethereum and from Solana must be ONE asset, or the bridge creates the
+  liquidity split it exists to prevent and forecloses a later in-place adoption by the issuer,
+  which can only ever adopt a single asset. A unified asset is ONE mapping keyed `unified:SYMBOL`,
+  with `state.tokenRoutes[tokenKey] -> mappingKey` pointing every source at it; per-chain facts
+  (token, decimals, escrow, vault, token program) live in `mapping.sources`. Never model it as one
+  mapping per chain sharing an asset id: supply increments and decrements would land on different
+  records. It is issued in a ceremony before any deposit, with zero supply and one reissuance
+  token. Spec: `doc/sequentia/bridged-usdc-standard.md` in the node repo.
+- **Never lowercase a non-EVM token key.** Ethereum addresses are case-insensitive hex; Solana
+  mints are base58, where case is significant. Lowercasing one yields a key no deposit can match,
+  so a configured source silently fails to route and the next deposit mints a duplicate asset.
+  `normalizeTokenKey` is the only correct way to canonicalize one.
+- **Read issuance amounts from the raw transaction, never from `listissuances`.** That RPC reports
+  `assetamount: -1` for a blinded issuance AND for an explicit zero one, so the two are
+  indistinguishable there. In the transaction they are not: an explicit amount, a commitment, and
+  no issuance at all are three distinct things.
+- **Deposit nonces are per vault.** With more than one vault watched, a nonce no longer identifies
+  a deposit and refund ids derived from it would collide. The primary vault keeps the bare nonce
+  and the original refund-id form so records and ids already on chain stay valid; other vaults key
+  `vault:nonce`.
+- **Proof of reserves reports only what it measured.** Untracked escrow is null, not zero, and a
+  backing verdict is given only when both sides were actually measured. A reassuring number nobody
+  measured is worse than an honest gap.
 - **Releases and refunds are replay-guarded on chain** by deterministic ids, so nothing can be paid
   twice.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
