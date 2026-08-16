@@ -30,11 +30,13 @@
   "solKeyFile": "solana.key",
 
   "unifiedIssuerPubkey": "<33-byte compressed pubkey the bridge wallet controls, PINNED. It is hashed into every unified asset's id and later authorizes handing the asset's registry identity to its issuer, so generate it once, back it up, and never change it.>",
+  "_supervision_note": "SEQUENTIA: `supervision.enabled` issues the asset SUPERVISED, meaning its issuer can freeze holdings at ordinary addresses by consensus rule. It is PERMANENT: the two keys are committed in the asset id, so an asset issued without this can never become supervised and one issued with it can never stop being. `pause` additionally allows stopping every holding at once, and is equally permanent. Leave operationalKey/recoveryKey unset and the daemon generates them from the node wallet once and logs them, which makes THAT WALLET'S BACKUP the freeze authority; a production issuer generates them under FROST and pins the public halves here instead, so no private key ever reaches a node.",
   "unified": {
     "USDC": {
       "name": "Bridged USDC (Compages)",
       "ticker": "USDC.e",
       "precision": 6,
+      "supervision": { "enabled": true, "pause": true },
       "sources": {
         "11155111:0x1c7d4b196cb0c7b01d743fbc6116a902379c7238": {
           "chainId": 11155111,
@@ -44,6 +46,24 @@
         "solana-devnet:4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU": {
           "chainId": "solana-devnet",
           "token": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+          "decimals": 6
+        }
+      }
+    },
+    "EURC": {
+      "name": "Bridged EURC (Compages)",
+      "ticker": "EURC.e",
+      "precision": 6,
+      "supervision": { "enabled": true, "pause": true },
+      "sources": {
+        "11155111:0x08210f9170f89ab7658f0b5e3ff39b0e03c594d4": {
+          "chainId": 11155111,
+          "token": "0x08210F9170F89Ab7658F0B5E3fF39b0E03C594D4",
+          "decimals": 6
+        },
+        "solana-devnet:HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr": {
+          "chainId": "solana-devnet",
+          "token": "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr",
           "decimals": 6
         }
       }

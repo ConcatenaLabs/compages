@@ -208,6 +208,75 @@ export class Bridge {
     return out;
   }
 
+  /** The two BIP340 keys that supervise a unified asset, generated once.
+   *
+   *  A supervised asset is one whose issuer can freeze holders by consensus
+   *  rule, which is what lets a bridged stablecoin meet the freeze obligation a
+   *  regulated issuer has. Two keys, and the split is the point (Sequentia
+   *  src/supervision.h):
+   *
+   *    operational  freezes and unfreezes, day to day
+   *    recovery     replaces either key, and can do nothing else
+   *
+   *  A stolen operational key can grief, visibly and on chain, but can never
+   *  take the authority away from its owner, because it cannot rotate. That is
+   *  the entire reason for the second key.
+   *
+   *  BOTH ARE PERMANENT. They are committed in the asset id, so they cannot be
+   *  changed for this asset ever, and an asset issued without them can never
+   *  become supervised. Hence: generated once, recorded in state before the
+   *  issuance that commits them, and logged loudly so they survive a lost state
+   *  file. The private halves live in the node wallet, which means THAT WALLET'S
+   *  BACKUP IS THE FREEZE AUTHORITY. Fine for a testnet operator; a production
+   *  issuer would generate these under FROST and pass the public halves in via
+   *  config instead, which is why the RPC never asks for a private key. */
+  async supervisionKeysFor(mappingKey, def) {
+    const s = this.state.data;
+    s.supervision ??= {};
+    if (s.supervision[mappingKey]) return s.supervision[mappingKey];
+
+    // Configured public keys win: an issuer with a real signing setup brings
+    // its own and the node never sees the private halves at all.
+    const cfg = def.supervision ?? {};
+    let operationalkey = cfg.operationalKey;
+    let recoverykey = cfg.recoveryKey;
+
+    const freshXOnly = async () => {
+      const addr = await this.seq.call("getnewaddress", {});
+      const info = await this.seq.call("getaddressinfo", { address: addr });
+      const compressed = String(info.pubkey || "");
+      if (compressed.length !== 66) {
+        throw new Error(`node returned a ${compressed.length / 2}-byte pubkey, cannot use for BIP340`);
+      }
+      // Compressed is 33 bytes: a parity byte then the x coordinate. BIP340
+      // signs under the x coordinate alone.
+      return compressed.slice(2);
+    };
+
+    if (!operationalkey) operationalkey = await freshXOnly();
+    if (!recoverykey) recoverykey = await freshXOnly();
+    if (operationalkey === recoverykey) {
+      throw new Error("supervision keys must differ; the wallet handed out the same key twice");
+    }
+
+    const keys = {
+      operationalkey,
+      recoverykey,
+      pause: Boolean(cfg.pause),
+      source: cfg.operationalKey ? "config" : "node-wallet",
+      createdAt: new Date().toISOString(),
+    };
+    s.supervision[mappingKey] = keys;
+    this.state.save();
+
+    this.log(
+      `unified ${def.symbol}: SUPERVISION KEYS, permanent and committed in the asset id. ` +
+        `operational=${operationalkey} recovery=${recoverykey} pause=${keys.pause} ` +
+        `source=${keys.source}. Back up the node wallet: it holds the freeze authority.`
+    );
+    return keys;
+  }
+
   /** Issue every configured unified asset that does not exist yet, and route
    *  its sources to it.
    *
@@ -245,6 +314,13 @@ export class Bridge {
         // Zero asset amount, one reissuance token: nothing circulates until a
         // deposit is verified, and the token supply is fixed at 1 forever so
         // "who can mint" is answerable by looking at who holds it.
+        // Supervision is decided HERE and nowhere else, permanently: the keys
+        // go into the asset id, so this asset and the unsupervised one are
+        // different assets and no later change can convert between them.
+        const supervision = def.supervision?.enabled
+          ? await this.supervisionKeysFor(mappingKey, def)
+          : null;
+
         const issued = await this.seq.call("issueasset", {
           assetamount: 0,
           tokenamount: 1,
@@ -252,6 +328,15 @@ export class Bridge {
           contract_hash: ch,
           denomination: precision,
           ...(this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {}),
+          ...(supervision
+            ? {
+                supervision: {
+                  operationalkey: supervision.operationalkey,
+                  recoverykey: supervision.recoverykey,
+                  pause: supervision.pause,
+                },
+              }
+            : {}),
         });
         if (!(await this.waitWalletTxVisible(issued.txid))) {
           await this.seq.call("abandontransaction", { txid: issued.txid }).catch(() => {});
@@ -273,12 +358,21 @@ export class Bridge {
           contractHash: ch,
           registered: false,
           createdAt: new Date().toISOString(),
+          supervision: supervision
+            ? {
+                supervised: true,
+                operationalkey: supervision.operationalkey,
+                recoverykey: supervision.recoverykey,
+                pauseAllowed: supervision.pause,
+              }
+            : { supervised: false },
         };
         s.mappings[mappingKey] = mapping;
         this.state.save();
         this.log(
           `unified ${def.symbol}: issued Sequentia asset ${issued.asset} as ${contract.ticker} ` +
-            `(precision ${precision}, zero supply, 1 reissuance token ${issued.token})`
+            `(precision ${precision}, zero supply, 1 reissuance token ${issued.token}` +
+            `${supervision ? ", SUPERVISED" + (supervision.pause ? " with pause" : "") : ""})`
         );
         await this.registerAsset(mapping).catch((e) =>
           this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
