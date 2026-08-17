@@ -474,13 +474,33 @@ export class Sol {
    *  for native SOL). The Solana counterpart of Eth.escrowBalance: escrow read
    *  from the cluster rather than from the daemon's own counter.
    *
-   *  Every token account of that mint counts, not only the associated one, so
-   *  escrow that arrived in a non-standard account is still seen as backing. */
-  async escrowBalance(owner, mint) {
+   *  Deliberately NOT getTokenAccountsByOwner. That call is throttled hard on
+   *  the public devnet endpoint -- it answers a single COLD request with 429 --
+   *  which left the reserves page reporting the Solana escrow as unreadable no
+   *  matter how little it was asked. getTokenAccountBalance on a derived
+   *  address is cheap and is not throttled.
+   *
+   *  Both token programs are tried when the mint's own program is not recorded,
+   *  because which one owns a mint is not guessable: this deployment's SPL
+   *  demo token is a Token-2022 mint while others are classic. A mint with no
+   *  account under a program holds nothing there, which is zero, not an error.
+   *
+   *  This reads the ASSOCIATED account, which is where deposits land -- the
+   *  bridge creates it idempotently before transferring. Tokens parked in a
+   *  non-associated account would not be counted. */
+  async escrowBalance(owner, mint, tokenProgram = null) {
     if (mint === "sol") return this.balance(owner);
+    const programs = tokenProgram ? [tokenProgram] : [TOKEN_PROGRAM, TOKEN_2022_PROGRAM];
     let total = 0n;
-    for (const acct of await this.tokenAccountsByOwner(owner)) {
-      if (acct.mint === mint) total += acct.amount;
+    for (const program of programs) {
+      const ata = ataAddress(owner, mint, program);
+      try {
+        const r = await this.rpc("getTokenAccountBalance", [ata, { commitment: "finalized" }]);
+        total += BigInt(r?.value?.amount ?? 0);
+      } catch (e) {
+        // -32602 is "could not find account": no account under this program.
+        if (e.code !== -32602) throw e;
+      }
     }
     return total;
   }
