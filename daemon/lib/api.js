@@ -207,10 +207,29 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       const r = await cached("sol:native", () => bridge.sol.balance(treasury));
       return { units: r.value, at: r.at, staleError: r.staleError };
     }
-    const r = await cached(`sol:${source.tokenKey}`, () =>
-      bridge.sol.escrowBalance(treasury, source.token, source.tokenProgram ?? null),
-    );
-    return { units: r.value, at: r.at, staleError: r.staleError };
+    // Escrow on this leg is NOT all in the treasury. A Solana deposit lands on
+    // its own intent address and is never swept, so reading the treasury alone
+    // reported a real 20 USDC deposit as zero escrow and called the asset
+    // unbacked -- while the daemon's own ledger, the thing chain reads are
+    // supposed to check, had it right. Every address the bridge derives is
+    // counted, because funds sitting on an unswept intent address are still
+    // locked and still backing.
+    //
+    // This costs one read per intent address, which grows with deposits
+    // forever; sweeping intents into the treasury would bound it.
+    const owners = [treasury, ...Object.keys(state.data.solWrapIntents ?? {})];
+    let total = 0n;
+    let at = Date.now();
+    let staleError = null;
+    for (const owner of owners) {
+      const r = await cached(`sol:${owner}:${source.token}`, () =>
+        bridge.sol.escrowBalance(owner, source.token, source.tokenProgram ?? null),
+      );
+      total += r.value;
+      at = Math.min(at, r.at);
+      staleError = staleError ?? r.staleError;
+    }
+    return { units: total, at, staleError };
   }
 
   const server = http.createServer(async (req, res) => {
