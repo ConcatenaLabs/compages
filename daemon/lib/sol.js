@@ -470,6 +470,21 @@ export class Sol {
 
   /** Every token account owned by `address`, across both token programs:
    *  [{ address, mint, amount, decimals, tokenProgram }]. */
+  /** How much of `mint` the treasury actually holds, in base units (lamports
+   *  for native SOL). The Solana counterpart of Eth.escrowBalance: escrow read
+   *  from the cluster rather than from the daemon's own counter.
+   *
+   *  Every token account of that mint counts, not only the associated one, so
+   *  escrow that arrived in a non-standard account is still seen as backing. */
+  async escrowBalance(owner, mint) {
+    if (mint === "sol") return this.balance(owner);
+    let total = 0n;
+    for (const acct of await this.tokenAccountsByOwner(owner)) {
+      if (acct.mint === mint) total += acct.amount;
+    }
+    return total;
+  }
+
   async tokenAccountsByOwner(address) {
     const out = [];
     for (const tokenProgram of [TOKEN_PROGRAM, TOKEN_2022_PROGRAM]) {

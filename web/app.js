@@ -992,19 +992,36 @@ async function refreshReserves() {
     const precision = a.precision ?? 8;
     const supply = scale(a.chainCirculatingAtoms, precision);
     const escrow = scale(a.escrowedAtoms, precision);
-    const label = a.ticker ?? a.symbol ?? a.assetId.slice(0, 12);
+    const label = a.ticker ?? a.symbol ?? (a.assetId ? a.assetId.slice(0, 12) : "unknown asset");
     let verdict;
     if (a.backed === true) verdict = "fully backed";
     else if (a.backed === false) verdict = "SHORT: escrow is below circulating supply";
     else if (a.chainSupplyError) verdict = `not verifiable: ${a.chainSupplyError}`;
     else verdict = "escrow not tracked for this asset";
     line.innerHTML =
-      `<span class="mono">${label}</span>: ` +
+      `<span class="mono">${escapeHtml(label)}</span>: ` +
       `${supply === null ? "supply unknown" : `${supply} in circulation`}, ` +
-      `${escrow === null ? "escrow not tracked" : `${escrow} locked`} &mdash; ${verdict}`;
-    if (Array.isArray(a.sources) && a.sources.length > 1) {
+      `${escrow === null ? "escrow not tracked" : `${escrow} locked`} &mdash; ${escapeHtml(verdict)}`;
+    // Say who holds the reserve when it is not this bridge. SBTC is backed by
+    // the sbtc-bridge's own Bitcoin reserve, so a reader comparing these rows
+    // should know they are trusting a different custodian for that one.
+    if (a.external) {
+      const who = document.createElement("div");
+      who.className = "note";
+      who.textContent = `reserve held by ${a.external}, not by a Compages vault`;
+      line.appendChild(who);
+    }
+    // Name the chain, never its id. 11155111 identifies Sepolia to a router,
+    // not to a reader. The daemon resolves the name from the same config the
+    // rest of the page uses, so this shows whatever chain is actually
+    // configured rather than a second, drifting list of names here.
+    if (Array.isArray(a.sources) && a.sources.length) {
       const per = a.sources
-        .map((s) => `${s.chainId}: ${s.escrowedUnits === null ? "untracked" : s.escrowedUnits}`)
+        .map((s) => {
+          const where = s.chainName ?? `chain ${s.chainId}`;
+          if (s.escrowError) return `${where}: unreadable (${s.escrowError})`;
+          return `${where}: ${s.escrowedUnits === null ? "untracked" : s.escrowedUnits}`;
+        })
         .join(", ");
       const sub = document.createElement("div");
       sub.className = "note";

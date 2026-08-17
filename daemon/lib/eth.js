@@ -18,6 +18,8 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
 ];
 
+const ERC20_BALANCE_ABI = ["function balanceOf(address) view returns (uint256)"];
+
 // Tokens like MKR return bytes32 instead of string.
 const ERC20_BYTES32_ABI = [
   "function symbol() view returns (bytes32)",
@@ -57,6 +59,34 @@ export class Eth {
   vaultFor(address) {
     if (!address) return this.vault;
     return this.vaults.get(String(address).toLowerCase()) ?? this.vault;
+  }
+
+  /** How much of `token` is actually escrowed, in that token's base units:
+   *  the total held across every vault this bridge watches.
+   *
+   *  Read from the chain rather than from the daemon's own escrow counter, for
+   *  the same reason circulating supply is read from the Sequentia chain: if
+   *  both sides of a proof of reserves come from the operator's bookkeeping, it
+   *  proves only that the bookkeeping agrees with itself. It also gives a
+   *  figure for assets bridged before that counter existed, which otherwise
+   *  can never be reported at all.
+   *
+   *  Every watched vault counts, not just the one a source names. Escrow left
+   *  in a superseded vault is still escrow, and omitting it would understate
+   *  backing and read as a shortfall. */
+  async escrowBalance(token) {
+    const native = token === "eth" || token === ethers.ZeroAddress;
+    const erc20 = native
+      ? null
+      : new ethers.Contract(ethers.getAddress(token), ERC20_BALANCE_ABI, this.provider);
+    let total = 0n;
+    for (const addr of this.vaultAddresses) {
+      const held = native
+        ? await this.provider.getBalance(ethers.getAddress(addr))
+        : await erc20.balanceOf(ethers.getAddress(addr));
+      total += BigInt(held);
+    }
+    return total;
   }
 
   /** Fetch symbol/name/decimals for a token address; "eth" for ether. */

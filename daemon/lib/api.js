@@ -103,15 +103,69 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
 
   // Proxy a request to the sbtc-bridge (the BTC<->SBTC custody service). The daemon holds the bridge
   // token so the browser never sees it; the bridge itself enforces 1:1 backing.
-  async function sbtcBridge(bridgePath, body) {
+  async function sbtcBridge(bridgePath, body, method = "POST") {
     const headers = { "content-type": "application/json" };
     if (cfg.sbtcBridgeToken) headers.authorization = "Bearer " + cfg.sbtcBridgeToken;
     const res = await fetch(cfg.sbtcBridgeUrl.replace(/\/+$/, "") + bridgePath, {
-      method: "POST",
+      method,
       headers,
-      body: JSON.stringify(body),
+      ...(method === "GET" ? {} : { body: JSON.stringify(body) }),
     });
     return res.json().catch(() => ({ ok: false, error: "bad bridge response" }));
+  }
+
+  // Whole BTC, as a Bitcoin RPC reports a balance, to satoshis. JSON.parse has
+  // already turned it into a double by the time it arrives, so rounding rather
+  // than truncating is what keeps it exact: every satoshi count a real balance
+  // can hold is far below 2^53 and survives the round trip intact, while the
+  // decimal-to-binary step leaves a value like 1.01 a hair under.
+  const btcToSats = (btc) => BigInt(Math.round(Number(btc) * 1e8));
+
+  // A chain id is how the daemon routes; it is not how a person reads a page.
+  // The rest of the UI already names chains from config, so anything else that
+  // shows a chain to a reader resolves it the same way rather than printing a
+  // bare 11155111.
+  function chainNameOf(chainId) {
+    if (chainId === (cfg.solChainLabel ?? "solana-devnet")) return cfg.solChainName ?? "Solana devnet";
+    if (String(chainId) === String(cfg.ethChainId)) return cfg.ethChainName ?? `chain ${chainId}`;
+    return `chain ${chainId}`;
+  }
+
+  // What a source chain actually holds in escrow, in that source's base units.
+  //
+  // Read from the chain, never from this daemon's escrow counter. Proof of
+  // reserves whose both halves come from the operator's own bookkeeping proves
+  // only that the bookkeeping agrees with itself; reading the lock side from
+  // the source chain and the circulating side from Sequentia means a bug in
+  // this daemon surfaces as a discrepancy instead of hiding behind one. It is
+  // also the only way to report assets bridged before that counter existed,
+  // which otherwise stay permanently untracked.
+  //
+  // Cached briefly because every open page polls this and each read is an RPC
+  // round trip to a public endpoint.
+  const escrowCache = new Map();
+  const ESCROW_TTL_MS = 15_000;
+  async function chainEscrowUnits(source) {
+    const now = Date.now();
+    const hit = escrowCache.get(source.tokenKey);
+    if (hit && now - hit.at < ESCROW_TTL_MS) {
+      if (hit.error) throw new Error(hit.error);
+      return hit.units;
+    }
+    try {
+      let units;
+      if (source.chainId === (cfg.solChainLabel ?? "solana-devnet")) {
+        if (!bridge.sol) throw new Error("the Solana leg is not configured");
+        units = await bridge.sol.escrowBalance(bridge.sol.treasury.address, source.token);
+      } else {
+        units = await eth.escrowBalance(source.token);
+      }
+      escrowCache.set(source.tokenKey, { at: now, units });
+      return units;
+    } catch (e) {
+      escrowCache.set(source.tokenKey, { at: now, error: e.message });
+      throw e;
+    }
   }
 
   const server = http.createServer(async (req, res) => {
@@ -175,30 +229,40 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         const out = [];
         for (const m of Object.values(state.data.mappings)) {
           if (only && m.assetId !== only && m.symbol !== only) continue;
-          // Read the raw sources, not a defaulted copy: whether a source keeps
-          // an escrow ledger at all is the very thing being reported, and
-          // substituting zero for "never tracked" would erase the distinction
-          // before it could be measured.
+          // Escrow comes from the source chain, so every asset can be reported,
+          // including those bridged before this daemon kept an escrow counter
+          // at all. The counter is still published beside it: where the two
+          // disagree, that gap is itself the finding, and hiding one of them
+          // would hide it.
           const rawSources = Object.values(sourcesOf(m));
-          const escrowTracked = rawSources.length > 0 && rawSources.every((s) => s.escrowedUnits !== undefined);
-          const sources = rawSources.map((s) => ({
-            tokenKey: s.tokenKey,
-            chainId: s.chainId,
-            token: s.token,
-            decimals: s.decimals,
-            escrowedUnits: s.escrowedUnits ?? null,
-          }));
-          // Assets bridged before the escrow ledger existed have no figure at
-          // all, and printing zero would turn "never tracked" into "nothing
-          // there", so their backing is reported as unknown rather than
-          // asserted.
-          let escrowedAtoms = null;
-          if (escrowTracked) {
-            escrowedAtoms = 0n;
-            for (const s of rawSources) {
-              escrowedAtoms += unitsToAtoms(s.escrowedUnits, s.decimals, m.precision);
+          const sources = [];
+          let escrowedAtoms = 0n;
+          let escrowTracked = rawSources.length > 0;
+          for (const s of rawSources) {
+            let units = null;
+            let escrowError = null;
+            try {
+              units = await chainEscrowUnits(s);
+            } catch (e) {
+              escrowError = e.message;
             }
+            // One unreadable source makes the whole total unknown rather than
+            // low. Reporting a partial sum as if it were the reserve would
+            // manufacture a shortfall out of an RPC failure.
+            if (units === null) escrowTracked = false;
+            else escrowedAtoms += unitsToAtoms(units, s.decimals, m.precision);
+            sources.push({
+              tokenKey: s.tokenKey,
+              chainId: s.chainId,
+              chainName: chainNameOf(s.chainId),
+              token: s.token,
+              decimals: s.decimals,
+              escrowedUnits: units === null ? null : units.toString(),
+              escrowError,
+              ledgerEscrowedUnits: s.escrowedUnits ?? null,
+            });
           }
+          if (!escrowTracked) escrowedAtoms = null;
 
           let chainSupply = null;
           let chainError = null;
@@ -235,6 +299,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             unified: m.unified ?? false,
             sources,
             escrowTracked,
+            escrowSource: escrowTracked ? "chain" : null,
             escrowedAtoms: escrowedAtoms === null ? null : escrowedAtoms.toString(),
             ledgerCirculatingAtoms: ledger.toString(),
             chainCirculatingAtoms: chainSupply,
@@ -242,6 +307,73 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             backed: comparable ? escrowedAtoms >= BigInt(chainSupply) : null,
             ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
           });
+        }
+
+        // SBTC belongs on this page even though Compages does not issue it.
+        //
+        // It is minted by the sbtc-bridge against BTC held in that bridge's
+        // reserve, not by this daemon against a vault, so it appears in none of
+        // the mappings above. It makes its holders exactly the same promise
+        // every other row makes -- each circulating unit is backed by a unit
+        // locked on the source chain -- and it is measurable, so leaving it off
+        // would make this page quietly narrower than it looks. A reserves page
+        // that omits a reserve it could have checked is worse than no page.
+        if (cfg.sbtcBridgeUrl && !only) {
+          const row = {
+            assetId: null,
+            symbol: "SBTC",
+            ticker: "SBTC",
+            precision: 8,
+            unified: false,
+            external: "sbtc-bridge",
+            sources: [],
+            escrowTracked: false,
+            escrowSource: null,
+            escrowedAtoms: null,
+            ledgerCirculatingAtoms: null,
+            chainCirculatingAtoms: null,
+            chainSupplyError: null,
+            backed: null,
+            ledgerMatchesChain: null,
+          };
+          try {
+            const st = await sbtcBridge("/status", null, "GET");
+            if (!st?.ok) throw new Error(st?.error || "the Bitcoin bridge did not answer");
+            row.assetId = st.sbtc_asset ?? null;
+            // reserve_btc is whole BTC from a Bitcoin wallet, not base units.
+            if (st.reserve_btc !== null && st.reserve_btc !== undefined) {
+              row.sources = [{
+                tokenKey: "bitcoin:btc",
+                chainId: "bitcoin",
+                chainName: cfg.btcChainName ?? "Bitcoin testnet4",
+                token: "btc",
+                decimals: 8,
+                escrowedUnits: btcToSats(st.reserve_btc).toString(),
+                escrowError: null,
+                ledgerEscrowedUnits: null,
+              }];
+              row.escrowedAtoms = btcToSats(st.reserve_btc).toString();
+              row.escrowTracked = true;
+              row.escrowSource = "chain";
+            }
+            if (row.assetId) {
+              const supply = await bridge.chainSupplyAtoms(row.assetId);
+              if (supply < 0n) {
+                row.chainSupplyError =
+                  "more burned than issued is visible for this asset; its issuance is not on this chain";
+              } else {
+                row.chainCirculatingAtoms = supply.toString();
+              }
+            } else {
+              row.chainSupplyError = "the Bitcoin bridge did not say which asset its reserve backs";
+            }
+          } catch (e) {
+            row.chainSupplyError = e.message;
+          }
+          if (row.escrowedAtoms !== null && row.chainCirculatingAtoms !== null) {
+            row.backed = BigInt(row.escrowedAtoms) >= BigInt(row.chainCirculatingAtoms);
+          }
+          out.push(row);
         }
         return send(200, {
           generatedAt: new Date().toISOString(),
