@@ -167,14 +167,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   // also the only way to report assets bridged before that counter existed,
   // which otherwise stay permanently untracked.
   //
-  // Reads are cached, and the cache is what keeps this within a public RPC's
-  // rate limit. Asking per source does not: one Solana source costs two calls
-  // (the two token programs), so a page with four of them fired nine requests
-  // per refresh at devnet and was answered with 429.
-  //
-  // So the treasury's token accounts are fetched ONCE per cycle and every
-  // Solana source is answered from that one snapshot, which is possible because
-  // the call already returns every account with its mint.
+  // Reads are cached so a page full of open tabs does not become a load
+  // generator. The cache alone was not what fixed the Solana 429 though: that
+  // endpoint throttles getTokenAccountsByOwner so hard it refuses a single cold
+  // call, so the fix was to stop making that call at all (see Sol.escrowBalance).
   const cache = new Map();
   const ESCROW_TTL_MS = 60_000;
   async function cached(key, fn) {
@@ -211,10 +207,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       const r = await cached("sol:native", () => bridge.sol.balance(treasury));
       return { units: r.value, at: r.at, staleError: r.staleError };
     }
-    const r = await cached("sol:accounts", () => bridge.sol.tokenAccountsByOwner(treasury));
-    let total = 0n;
-    for (const acct of r.value) if (acct.mint === source.token) total += acct.amount;
-    return { units: total, at: r.at, staleError: r.staleError };
+    const r = await cached(`sol:${source.tokenKey}`, () =>
+      bridge.sol.escrowBalance(treasury, source.token, source.tokenProgram ?? null),
+    );
+    return { units: r.value, at: r.at, staleError: r.staleError };
   }
 
   const server = http.createServer(async (req, res) => {
