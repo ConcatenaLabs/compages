@@ -14,6 +14,8 @@
   "seqConfirmations": 1,
   "btcAnchorConfirmations": 3,
 
+  "esploraUrl": "http://127.0.0.1:3003",
+
   "registryUrl": "http://127.0.0.1:3005",
   "registryAdminToken": "<Asset Registry ADMIN_TOKEN; omit to use the public verify-on-chain endpoint instead>",
   "assetDomain": "bridge.example.com",

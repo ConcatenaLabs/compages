@@ -343,6 +343,7 @@ Configuration reference (`daemon/config.example.json`):
 | `seqConfirmations` | Sequentia confirmations; also the finality fallback on chains without anchoring |
 | `btcAnchorConfirmations` | Bitcoin-anchor depth required before a release (see "Finality") |
 | `registryUrl`, `registryAdminToken`, `assetDomain` | Asset Registry endpoint, optional admin token, and the entity domain written into asset contracts |
+| `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
 | `sbtcBridgeUrl`, `sbtcBridgeToken`, `btcConfirmations` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg) |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |

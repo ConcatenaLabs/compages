@@ -1002,13 +1002,13 @@ async function refreshReserves() {
       `<span class="mono">${escapeHtml(label)}</span>: ` +
       `${supply === null ? "supply unknown" : `${supply} in circulation`}, ` +
       `${escrow === null ? "escrow not tracked" : `${escrow} locked`} &mdash; ${escapeHtml(verdict)}`;
-    // Say who holds the reserve when it is not this bridge. SBTC is backed by
-    // the sbtc-bridge's own Bitcoin reserve, so a reader comparing these rows
-    // should know they are trusting a different custodian for that one.
-    if (a.external) {
+    // Say where a reserve is held when it is not a vault this bridge watches.
+    // The difference is the mechanism, not the operator, so this describes the
+    // custody rather than naming a separate party.
+    if (a.custody) {
       const who = document.createElement("div");
       who.className = "note";
-      who.textContent = `reserve held by ${a.external}, not by a Compages vault`;
+      who.textContent = `reserve held as ${a.custody}`;
       line.appendChild(who);
     }
     // Name the chain, never its id. 11155111 identifies Sepolia to a router,

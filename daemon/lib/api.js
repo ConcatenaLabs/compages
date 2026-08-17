@@ -114,6 +114,32 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     return res.json().catch(() => ({ ok: false, error: "bad bridge response" }));
   }
 
+  // Circulating supply of an asset this daemon did NOT issue.
+  //
+  // bridge.chainSupplyAtoms reads listissuances, a WALLET call: it sees only
+  // issuances this daemon's own wallet made. For an externally issued asset it
+  // therefore returns zero, and zero is the one wrong answer that reads as
+  // right -- a supply of zero makes any reserve look like full backing. So an
+  // external asset is measured against the indexer, which sees the whole
+  // chain, and when the indexer cannot be reached the supply is reported as
+  // unknown rather than as zero.
+  async function externalChainSupplyAtoms(assetId) {
+    if (!cfg.esploraUrl) {
+      throw new Error("no indexer is configured, so this asset's supply cannot be read");
+    }
+    const res = await fetch(`${cfg.esploraUrl.replace(/\/+$/, "")}/asset/${assetId}`);
+    if (!res.ok) throw new Error(`the indexer returned ${res.status} for this asset`);
+    const a = await res.json();
+    const stats = a.chain_stats ?? {};
+    if (stats.has_blinded_issuances) {
+      throw new Error("this asset has a blinded issuance, so its supply is not knowable");
+    }
+    if (stats.issued_amount === undefined || stats.issued_amount === null) {
+      throw new Error("the indexer reported no issuance for this asset");
+    }
+    return BigInt(stats.issued_amount) - BigInt(stats.burned_amount ?? 0);
+  }
+
   // Whole BTC, as a Bitcoin RPC reports a balance, to satoshis. JSON.parse has
   // already turned it into a double by the time it arrives, so rounding rather
   // than truncating is what keeps it exact: every satoshi count a real balance
@@ -309,15 +335,17 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           });
         }
 
-        // SBTC belongs on this page even though Compages does not issue it.
+        // SBTC belongs on this page. It is the same operator's bridge holding
+        // the same kind of promise: every circulating unit backed by a unit
+        // locked on the source chain.
         //
-        // It is minted by the sbtc-bridge against BTC held in that bridge's
-        // reserve, not by this daemon against a vault, so it appears in none of
-        // the mappings above. It makes its holders exactly the same promise
-        // every other row makes -- each circulating unit is backed by a unit
-        // locked on the source chain -- and it is measurable, so leaving it off
-        // would make this page quietly narrower than it looks. A reserves page
-        // that omits a reserve it could have checked is worse than no page.
+        // It appears in none of the mappings above only because its reserve is
+        // held differently -- BTC in the peg multisig on Bitcoin, rather than a
+        // token in a vault contract this daemon watches -- so it is measured
+        // through the peg service instead of by reading a vault. That is a
+        // difference in mechanism, not in who is answerable for it, and a
+        // reserves page that omits a reserve it could have checked is worse
+        // than no page at all.
         if (cfg.sbtcBridgeUrl && !only) {
           const row = {
             assetId: null,
@@ -325,7 +353,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             ticker: "SBTC",
             precision: 8,
             unified: false,
-            external: "sbtc-bridge",
+            custody: "BTC in the peg multisig, via the SBTC peg service",
             sources: [],
             escrowTracked: false,
             escrowSource: null,
@@ -357,7 +385,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
               row.escrowSource = "chain";
             }
             if (row.assetId) {
-              const supply = await bridge.chainSupplyAtoms(row.assetId);
+              const supply = await externalChainSupplyAtoms(row.assetId);
               if (supply < 0n) {
                 row.chainSupplyError =
                   "more burned than issued is visible for this asset; its issuance is not on this chain";
