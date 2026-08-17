@@ -1076,6 +1076,17 @@ async function refreshReserves() {
       who.textContent = `reserve held as ${a.custody}`;
       line.appendChild(who);
     }
+    // Minted but still with the issuer is inventory, not a holder's claim, so
+    // say so rather than leaving the reader to wonder why circulation is below
+    // the amount minted.
+    if (a.issuerHeldAtoms && a.issuedAtoms) {
+      const held = scale(a.issuerHeldAtoms, precision);
+      const minted = scale(a.issuedAtoms, precision);
+      const n = document.createElement("div");
+      n.className = "note";
+      n.textContent = `${minted} minted, of which ${held} is still held by the bridge and issued to nobody`;
+      line.appendChild(n);
+    }
     // Name the chain, never its id. 11155111 identifies Sepolia to a router,
     // not to a reader. The daemon resolves the name from the same config the
     // rest of the page uses, so this shows whatever chain is actually

@@ -453,7 +453,28 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
                 row.chainSupplyError =
                   "more burned than issued is visible for this asset; its issuance is not on this chain";
               } else {
-                row.chainCirculatingAtoms = supply.toString();
+                row.issuedAtoms = supply.toString();
+                // SBTC minted but still sitting with the bridge is inventory,
+                // not a liability: nobody holds a claim on it, so the reserve
+                // does not have to cover it. Subtracting it is what separates
+                // "10 minted at setup, none issued to anyone" from a genuine
+                // shortfall, and without it the page reported a 1.01 BTC
+                // reserve against 10 SBTC as SHORT while no user held any.
+                //
+                // Only subtracted when it is actually known. Treating an
+                // unreadable float as zero would turn every failed read into a
+                // false shortfall, which is the alarm this is fixing.
+                if (st.bridge_sbtc_balance !== null && st.bridge_sbtc_balance !== undefined) {
+                  const held = btcToSats(st.bridge_sbtc_balance);
+                  row.issuerHeldAtoms = held.toString();
+                  const circ = supply - held;
+                  row.chainCirculatingAtoms = (circ < 0n ? 0n : circ).toString();
+                } else {
+                  row.issuerHeldAtoms = null;
+                  row.chainSupplyError =
+                    "the bridge could not report how much SBTC it still holds, so the amount " +
+                    "actually in circulation is unknown";
+                }
               }
             } else {
               row.chainSupplyError = "the Bitcoin bridge did not say which asset its reserve backs";
