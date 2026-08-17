@@ -167,31 +167,54 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   // also the only way to report assets bridged before that counter existed,
   // which otherwise stay permanently untracked.
   //
-  // Cached briefly because every open page polls this and each read is an RPC
-  // round trip to a public endpoint.
-  const escrowCache = new Map();
-  const ESCROW_TTL_MS = 15_000;
-  async function chainEscrowUnits(source) {
+  // Reads are cached, and the cache is what keeps this within a public RPC's
+  // rate limit. Asking per source does not: one Solana source costs two calls
+  // (the two token programs), so a page with four of them fired nine requests
+  // per refresh at devnet and was answered with 429.
+  //
+  // So the treasury's token accounts are fetched ONCE per cycle and every
+  // Solana source is answered from that one snapshot, which is possible because
+  // the call already returns every account with its mint.
+  const cache = new Map();
+  const ESCROW_TTL_MS = 60_000;
+  async function cached(key, fn) {
     const now = Date.now();
-    const hit = escrowCache.get(source.tokenKey);
-    if (hit && now - hit.at < ESCROW_TTL_MS) {
-      if (hit.error) throw new Error(hit.error);
-      return hit.units;
-    }
+    const hit = cache.get(key);
+    if (hit?.ok && now - hit.at < ESCROW_TTL_MS) return hit;
     try {
-      let units;
-      if (source.chainId === (cfg.solChainLabel ?? "solana-devnet")) {
-        if (!bridge.sol) throw new Error("the Solana leg is not configured");
-        units = await bridge.sol.escrowBalance(bridge.sol.treasury.address, source.token);
-      } else {
-        units = await eth.escrowBalance(source.token);
-      }
-      escrowCache.set(source.tokenKey, { at: now, units });
-      return units;
+      const value = await fn();
+      const entry = { ok: true, at: now, value };
+      cache.set(key, entry);
+      return entry;
     } catch (e) {
-      escrowCache.set(source.tokenKey, { at: now, error: e.message });
+      // Serve the last good answer rather than reporting the reserve as
+      // unreadable. A rate-limited poll is not evidence that anything changed,
+      // and a page that flickers between a figure and an error teaches the
+      // reader to disregard it. Staleness is reported instead, so the reader
+      // knows how old the number is.
+      if (hit?.ok) return { ...hit, staleError: e.message };
+      const entry = { ok: false, at: now, error: e.message };
+      cache.set(key, entry);
       throw e;
     }
+  }
+
+  async function chainEscrowUnits(source) {
+    const isSol = source.chainId === (cfg.solChainLabel ?? "solana-devnet");
+    if (!isSol) {
+      const r = await cached(`eth:${source.tokenKey}`, () => eth.escrowBalance(source.token));
+      return { units: r.value, at: r.at, staleError: r.staleError };
+    }
+    if (!bridge.sol) throw new Error("the Solana leg is not configured");
+    const treasury = bridge.sol.treasury.address;
+    if (source.token === "sol") {
+      const r = await cached("sol:native", () => bridge.sol.balance(treasury));
+      return { units: r.value, at: r.at, staleError: r.staleError };
+    }
+    const r = await cached("sol:accounts", () => bridge.sol.tokenAccountsByOwner(treasury));
+    let total = 0n;
+    for (const acct of r.value) if (acct.mint === source.token) total += acct.amount;
+    return { units: total, at: r.at, staleError: r.staleError };
   }
 
   const server = http.createServer(async (req, res) => {
@@ -218,17 +241,35 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       }
 
       if (req.method === "GET" && parts[1] === "status") {
+        // Where the Bitcoin reserve actually sits, so the page can show custody
+        // for every leg rather than for Ethereum alone. Cached and best-effort:
+        // the bridge being unreachable must not take the whole page down.
+        let btcReserveAddresses = null;
+        let btcCustody = null;
+        if (cfg.sbtcBridgeUrl) {
+          try {
+            const st = await cached("sbtc:status", () => sbtcBridge("/status", null, "GET"));
+            btcReserveAddresses = st.value?.reserve_addresses ?? null;
+            btcCustody = st.value?.reserve_custody ?? null;
+          } catch {}
+        }
         return send(200, {
           app: "Compages",
           ethChainId: cfg.ethChainId,
           ethChainName: cfg.ethChainName,
           vaultAddress: cfg.vaultAddress,
+          // Every vault, not just the primary one. More than one can hold
+          // escrow at a time, and naming only the first understates where user
+          // funds actually sit.
+          vaultAddresses: eth.vaultAddresses ?? [cfg.vaultAddress].filter(Boolean),
           seqChainLabel: cfg.seqChainLabel,
           ethConfirmations: cfg.ethConfirmations,
           seqConfirmations: cfg.seqConfirmations,
           btcAnchorConfirmations: cfg.btcAnchorConfirmations ?? 3,
           btcChainName: cfg.btcChainName ?? "Bitcoin testnet4",
           btcConfigured: !!cfg.sbtcBridgeUrl,
+          btcReserveAddresses,
+          btcCustody,
           solChainName: cfg.solChainName ?? "Solana devnet",
           solChainLabel: cfg.solChainLabel ?? "solana-devnet",
           solConfigured: !!bridge.sol,
@@ -267,8 +308,13 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           for (const s of rawSources) {
             let units = null;
             let escrowError = null;
+            let readAt = null;
+            let stale = null;
             try {
-              units = await chainEscrowUnits(s);
+              const r = await chainEscrowUnits(s);
+              units = r.units;
+              readAt = new Date(r.at).toISOString();
+              stale = r.staleError ?? null;
             } catch (e) {
               escrowError = e.message;
             }
@@ -285,6 +331,8 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
               decimals: s.decimals,
               escrowedUnits: units === null ? null : units.toString(),
               escrowError,
+              readAt,
+              stale,
               ledgerEscrowedUnits: s.escrowedUnits ?? null,
             });
           }

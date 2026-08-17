@@ -955,6 +955,71 @@ async function refreshSolRedemptions(seqAddress) {
   }
 }
 
+/** Where the funds are held, one line per chain the bridge actually takes
+ *  custody on.
+ *
+ *  This replaced a single "Vault:" line that named one Ethereum address. The
+ *  footer paragraph names three custody legs, so one address read as though it
+ *  covered all three, and the Bitcoin and Solana reserves were nowhere on the
+ *  page. Addresses are linked to a block explorer where one is known, because
+ *  an address a reader cannot check is decoration. */
+function renderCustody(status) {
+  const box = $("custody-block");
+  if (!box) return;
+  box.innerHTML = "";
+  const scan = ETHERSCAN[status.ethChainId];
+  const row = (label, entries, note) => {
+    if (!entries || !entries.length) return;
+    const d = document.createElement("div");
+    d.style.marginTop = "3px";
+    d.innerHTML =
+      `${escapeHtml(label)}: ` +
+      entries
+        .map((e) =>
+          e.href
+            ? `<a class="mono" href="${e.href}" target="_blank" rel="noopener">${escapeHtml(e.text)}</a>`
+            : `<span class="mono">${escapeHtml(e.text)}</span>`,
+        )
+        .join(", ");
+    if (note) d.innerHTML += ` <span class="note">(${escapeHtml(note)})</span>`;
+    box.appendChild(d);
+  };
+
+  const vaults = status.vaultAddresses?.length
+    ? status.vaultAddresses
+    : [status.vaultAddress].filter(Boolean);
+  row(
+    status.ethChainName ?? "Ethereum",
+    vaults.map((v) => ({ text: v, href: scan ? `${scan}/address/${v}` : null })),
+    vaults.length > 1 ? "more than one vault holds escrow" : null,
+  );
+
+  if (status.btcConfigured) {
+    const addrs = status.btcReserveAddresses ?? [];
+    row(
+      status.btcChainName ?? "Bitcoin",
+      addrs.length
+        ? addrs.map((a) => ({
+            text: `${a.address} (${a.amount_btc} BTC)`,
+            href: `https://mempool.space/testnet4/address/${a.address}`,
+          }))
+        : [{ text: "reserve address unavailable", href: null }],
+      // Say plainly what guards it. Describing a single key as a multisig
+      // overstates the custody a holder is trusting.
+      status.btcCustody ?? null,
+    );
+  }
+
+  if (status.solConfigured && status.solTreasury) {
+    row(status.solChainName ?? "Solana", [
+      {
+        text: status.solTreasury,
+        href: `https://explorer.solana.com/address/${status.solTreasury}?cluster=devnet`,
+      },
+    ]);
+  }
+}
+
 /** Render proof of reserves: what is locked on each source chain, beside what
  *  actually circulates on Sequentia.
  *
@@ -1020,7 +1085,12 @@ async function refreshReserves() {
         .map((s) => {
           const where = s.chainName ?? `chain ${s.chainId}`;
           if (s.escrowError) return `${where}: unreadable (${s.escrowError})`;
-          return `${where}: ${s.escrowedUnits === null ? "untracked" : s.escrowedUnits}`;
+          if (s.escrowedUnits === null) return `${where}: untracked`;
+          // A rate-limited refresh is not new information about the reserve,
+          // so the last good figure is kept and its age shown, rather than
+          // replacing a number with an error the reader can do nothing about.
+          const age = s.stale && s.readAt ? ` (as of ${s.readAt.replace("T", " ").slice(0, 16)} UTC)` : "";
+          return `${where}: ${s.escrowedUnits}${age}`;
         })
         .join(", ");
       const sub = document.createElement("div");
@@ -1062,10 +1132,7 @@ async function init() {
   // pill is set by showNetwork() so it always matches the selected origin chain.
   const seqLabel = status.seqChainLabel.replace(/-/g, " ");
   $("net-seq").textContent = seqLabel.charAt(0).toUpperCase() + seqLabel.slice(1);
-  const scan = ETHERSCAN[status.ethChainId];
-  $("vault-line").innerHTML = scan
-    ? `<a href="${scan}/address/${status.vaultAddress}" target="_blank" rel="noopener">${status.vaultAddress}</a>`
-    : status.vaultAddress;
+  renderCustody(status);
 
   // T8/T4: state the real Bitcoin-anchor release gate (and an ETA) up front,
   // before the user commits any funds to a redemption.

@@ -572,14 +572,16 @@
   <div>
     Compages is a centralized proof-of-concept bridge into the Sequentia network:
     from Ethereum (lock ether or any ERC-20 in a vault, mint), from Bitcoin
-    (SBTC: lock BTC in an operator multisig, mint 1:1), and from Solana (lock
-    SOL or any SPL token with the operator, mint matching .s assets). Mints,
-    releases, and custody are performed by the bridge operator. You are
-    trusting that operator.
+    (SBTC: lock BTC in an operator-held reserve, mint 1:1), and from Solana
+    (lock SOL or any SPL token with the operator, mint matching .s assets).
+    Mints, releases, and custody are performed by the bridge operator. You are
+    trusting that operator. The custody guarding each reserve is stated below;
+    do not assume a threshold of signers where none is named.
   </div>
-  <div style="margin-top:6px">
-    Vault: <span class="mono" id="vault-line">&hellip;</span>
-  </div>
+  <!-- Custody for every leg, not just Ethereum. The paragraph above names three
+       places user funds are held; showing one address invited the reader to
+       assume it covered all of them. -->
+  <div style="margin-top:6px" id="custody-block"></div>
 
   <!-- Proof of reserves. A bridged asset's whole claim is that every unit in
        circulation is backed one for one by a unit locked on its source chain,
