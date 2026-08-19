@@ -11,11 +11,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 RUN="$HERE/run"
-# The node repo lives at ~/Sequentia (renamed from ~/SequentiaByClaude); the
+# The node repo lives at ~/Sequentia; the
 # binaries sit in build-linux/src on an out-of-tree build, or src/ in-tree.
 SEQ_REPO_SET="${SEQ_REPO:-}"
 SEQ_REPO="${SEQ_REPO:-$HOME/Sequentia}"
-[ -d "$SEQ_REPO" ] || SEQ_REPO="$HOME/SequentiaByClaude"
 SEQ_BIN="$SEQ_REPO/build-linux/src"
 [ -x "$SEQ_BIN/elementsd" ] || SEQ_BIN="$SEQ_REPO/src"
 # A downloaded release build (with its shared libs beside it) beats a stale
