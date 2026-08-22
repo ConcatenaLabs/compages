@@ -1,7 +1,7 @@
 {
   "name": "compages-daemon",
   "version": "0.1.0",
-  "description": "Compages: centralized bridge daemon between Ethereum and the Sequentia network",
+  "description": "Compages: centralized bridge daemon between Ethereum, Bitcoin (proxied to the SBTC custody service) and Solana and the Sequentia network",
   "type": "module",
   "private": true,
   "scripts": {

@@ -2,10 +2,11 @@
 # Compages end-to-end test: anvil (local Ethereum) + Sequentia elementsregtest
 # + the real daemon + real contract deployments, driven by driver.mjs.
 #
-# Requires: foundry (anvil/forge/cast), node >= 20, a Sequentia build
-# (elementsd/elements-cli, v23.3.8 or later: earlier consensus rejects the
-# unblinded reissuance the bridge now performs), the daemon's node_modules
-# installed.
+# Requires: foundry (anvil/forge/cast), node >= 20, a Sequentia Core build
+# (sequentiad/sequentia-cli; builds that still carry the legacy names
+# elementsd/elements-cli are accepted as a fallback. Needs 23.3.8 or later:
+# earlier consensus rejects the unblinded reissuance the bridge performs),
+# the daemon's node_modules installed.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -15,19 +16,26 @@ RUN="$HERE/run"
 # binaries sit in build-linux/src on an out-of-tree build, or src/ in-tree.
 SEQ_REPO_SET="${SEQ_REPO:-}"
 SEQ_REPO="${SEQ_REPO:-$HOME/Sequentia}"
+# Prefer the current binary names; fall back to the legacy ones.
+node_bin_in() { # <dir> -> prints the node binary path in <dir>, or nothing
+  if [ -x "$1/sequentiad" ]; then echo "$1/sequentiad"
+  elif [ -x "$1/elementsd" ]; then echo "$1/elementsd"
+  fi
+}
 SEQ_BIN="$SEQ_REPO/build-linux/src"
-[ -x "$SEQ_BIN/elementsd" ] || SEQ_BIN="$SEQ_REPO/src"
+[ -n "$(node_bin_in "$SEQ_BIN")" ] || SEQ_BIN="$SEQ_REPO/src"
 # A downloaded release build (with its shared libs beside it) beats a stale
 # in-tree binary; set SEQ_REPO explicitly to override either.
-if [ -z "${SEQ_REPO_SET:-}" ] && [ -x "$HOME/seq-binaries-23.3.8/src/elementsd" ]; then
-  case "$("$SEQ_BIN/elementsd" --version 2>/dev/null | head -1)" in
+if [ -z "${SEQ_REPO_SET:-}" ] && [ -n "$(node_bin_in "$HOME/seq-binaries-23.3.8/src")" ]; then
+  case "$("$(node_bin_in "$SEQ_BIN")" --version 2>/dev/null | head -1)" in
     *v23.3.[89]*|*v23.4*|*v24*) : ;; # in-tree binary is new enough
     *) SEQ_BIN="$HOME/seq-binaries-23.3.8/src"
        export LD_LIBRARY_PATH="$HOME/seq-binaries-23.3.8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
   esac
 fi
-ELD="$SEQ_BIN/elementsd"
-ELC="$SEQ_BIN/elements-cli"
+ELD="$(node_bin_in "$SEQ_BIN")"
+if [ -x "$SEQ_BIN/sequentia-cli" ]; then ELC="$SEQ_BIN/sequentia-cli"; else ELC="$SEQ_BIN/elements-cli"; fi
+[ -n "$ELD" ] || { echo "no sequentiad (or elementsd) found under $SEQ_REPO; set SEQ_REPO" >&2; exit 1; }
 
 ANVIL_PORT=8545
 SEQ_RPC=18892

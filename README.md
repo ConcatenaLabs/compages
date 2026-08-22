@@ -38,8 +38,9 @@ Within that assumption, the design removes every failure mode it can:
 - Releases and refunds are keyed by deterministic ids and replay-guarded on
   chain (`processedRedemptions`), so nothing can be paid twice.
 - Every deposit of the same ERC-20 mints the **same** Sequentia asset; the
-  mapping from token contract to Sequentia asset id is created exactly once,
-  on the first deposit, so no duplicate assets can exist.
+  mapping from token contract to Sequentia asset id is created exactly once
+  (on the first deposit for an ordinary token, in the issuance ceremony for a
+  unified stablecoin, see below), so no duplicate assets can exist.
 - Redeemed Sequentia amounts are destroyed, keeping the circulating bridged
   supply equal to the locked Ethereum funds.
 - Deposits that cannot be delivered (invalid Sequentia address, amount not
@@ -55,13 +56,44 @@ Within that assumption, the design removes every failure mode it can:
   is persisted before sending. After a crash the recorded signature answers,
   on chain, whether the transfer landed or can never land.
 
+### Unified stablecoins
+
+For the stablecoins declared under `unified` in the config (live: **USDC.e**
+and **EURC.e**), there is exactly one Sequentia asset per coin, whichever
+chain a deposit came from: a USDC deposit from Sepolia and one from the
+Solana devnet both mint into the same `USDC.e`. The bridge only unifies tokens
+the operator has explicitly declared to be the same money, never tokens that
+merely share a symbol.
+
+- The asset is issued once, in a ceremony at daemon start, **before any
+  deposit**, with zero supply and exactly one reissuance token, so backing is
+  exact from the first atom and the mint authority is a single object. The
+  daemon refuses to run if the ceremony fails.
+- It is issued at the issuer's own precision (6 for USDC and EURC), not the 8
+  decimals ordinary bridged assets use; amounts convert at that precision.
+- It is issued as a node-level **supervised** asset with pause
+  (`supervision: {enabled, pause}`): the holder of the operational key can
+  freeze individual holdings, or pause the asset, by consensus rule. This is
+  the node's supervised-asset feature, not OpenAMP. It is permanent: both
+  supervision keys are committed in the asset id. By default the daemon
+  derives them from the bridge wallet, which makes that wallet's backup the
+  freeze authority; a production issuer pins its own public keys instead.
+- `unifiedIssuerPubkey` is hashed into the asset id and later authorizes
+  handing the asset's registry identity to the real issuer, which is why the
+  asset is built this way: so the issuer can adopt it in place.
+
+The specification is
+[`bridged-usdc-standard.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md)
+in the node repository.
+
 ## Status
 
 | Piece | State |
 |---|---|
 | Ethereum → Sequentia (lock, then mint) | Working on the live deployment; ETH and ERC-20 deposits, first-bridge issuance, duplicate-free reissuance, automatic refunds |
 | Sequentia → Ethereum (return, then release) | Implemented and exercised end-to-end in `e2e/run-e2e.sh`; live redemptions wait for 100 Bitcoin-anchor confirmations before releasing (see "Finality") |
-| Vault contract | `CompagesVault` deployed on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41); 13 Foundry unit tests |
+| Vault contract | `CompagesVault` deployed on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) (primary) and [`0x15b3c97ed82c62b7828a775456bd75e67a8ec42c`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c); the daemon watches both; 17 Foundry unit tests |
+| Unified stablecoins | `USDC.e` and `EURC.e` live, precision 6, fed from Sepolia and the Solana devnet, node-level supervised (see "Unified stablecoins") |
 | Bitcoin ↔ SBTC (wrap, unwrap) | Live; address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
 | Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) and exercised end-to-end against a mock Solana RPC in `e2e/run-e2e.sh` |
 | Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
@@ -126,8 +158,9 @@ SOL amounts should be at least 0.001 in both directions (below Solana's
 rent-exempt minimum a lamport transfer cannot create the destination account;
 smaller SOL.s returns are parked for the operator). Token amounts have no
 such floor: the treasury funds the recipient's associated token account on
-release. Sequentia amounts carry 8 decimal places, so decimals beyond 8 are
-dropped when minting (SOL has 9; most SPL mints have 6 or 9).
+release. An ordinary bridged asset carries 8 decimal places, so decimals
+beyond 8 are dropped when minting (SOL has 9; most SPL mints have 6 or 9); a
+unified stablecoin converts at its own precision instead.
 
 Only assets that were bridged in can be redeemed; Compages never mints
 Ethereum-side or Solana-side representations of Sequentia-native assets, and
@@ -145,13 +178,16 @@ operator, never released on the wrong chain.
 3. First deposit of a token: the daemon issues a new reissuable Sequentia
    asset carrying the token's symbol, name and decimals, and records the
    mapping. Every later deposit of that token, by anyone, reissues the same
-   asset.
+   asset. A token declared under `unified` is routed to the asset issued in
+   the start-up ceremony instead, which already exists before any deposit.
 4. The minted amount is sent to the user's Sequentia address.
 
-Amounts convert 1:1 with decimal normalization: Sequentia amounts have 8
-decimal places, so a token with more than 8 decimals bridges at a granularity
-of `10^(d-8)` base units (the web app limits inputs accordingly, and the
-daemon refunds a deposit too small to represent).
+Amounts convert 1:1 with decimal normalization at the asset's precision: an
+ordinary bridged asset has 8 decimal places, so a token with more than 8
+decimals bridges at a granularity of `10^(d-8)` base units (the web app
+limits inputs accordingly, and the daemon refunds a deposit too small to
+represent); a unified stablecoin converts at its issuer's precision (6 for
+USDC and EURC).
 
 ### Sequentia → Ethereum (return, then release)
 
@@ -223,7 +259,9 @@ Each bridged asset is registered in the
 with an origin-suffixed ticker (`.e` marks it Ethereum-bridged, `.s`
 Solana-bridged; the suffix avoids colliding with native assets) and the name
 `<token name> (<chain name>)`, e.g. `Ether (Sepolia)` as `ETH.e` and
-`SOL (Solana devnet)` as `SOL.s`. The asset is issued committed to
+`SOL (Solana devnet)` as `SOL.s`. Unified stablecoins are the exception: one
+ticker (`USDC.e`, `EURC.e`) whichever chain the deposit came from, because
+there is exactly one asset per coin. The asset is issued committed to
 `SHA256(canonical-JSON(contract))` as its contract hash, so the metadata is
 bound on-chain and independently verifiable, not just asserted by the
 operator. Registration is best-effort and retried; it never blocks a mint.
@@ -265,12 +303,14 @@ operator. Registration is best-effort and retried; it never blocks a mint.
 The daemon serves the static web app and a JSON API from the same port
 (`apiPort`, default 9950). The live instance is reverse-proxied under
 `https://sequentiatestnet.com/bridge/`. CORS is permissive; the API holds no
-secrets, and the only mutating call creates a redemption intent.
+secrets, and the only mutating calls create deposit or redemption intents;
+none moves funds.
 
 | Method and path | Purpose |
 |---|---|
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
 | `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`) |
+| `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero |
 | `GET /api/token/<address\|eth>` | Metadata for a token and whether it is already bridged (used by the front-end's token lookup) |
 | `POST /api/redeem` `{"ethAddress": "0x..."}` | Create a redemption intent; returns the Sequentia address to send bridged assets to |
 | `GET /api/redeem/<seqAddress>` | A redemption address's bound Ethereum address and the status of every redemption seen on it |
@@ -333,7 +373,8 @@ Configuration reference (`daemon/config.example.json`):
 |---|---|
 | `ethChainName`, `ethChainId` | Display name and chain id of the Ethereum network (checked against the RPC at startup) |
 | `ethRpcUrl` | Ethereum JSON-RPC endpoint (must support `eth_getLogs`) |
-| `vaultAddress`, `vaultDeployBlock` | The deployed `CompagesVault` and the block to start scanning from |
+| `vaultAddress`, `vaultDeployBlock` | The primary `CompagesVault` and the block to start scanning from |
+| `vaults` | Optional list of `{address, deployBlock}`; the daemon watches every vault in it (`vaultAddress` stays the primary). Omit to watch `vaultAddress` alone |
 | `ethConfirmations` | Confirmations before a deposit is processed |
 | `ethLogChunk` | Max block range per `eth_getLogs` call |
 | `operatorKeyFile` | File containing the operator's private key (never commit it) |
@@ -351,6 +392,11 @@ Configuration reference (`daemon/config.example.json`):
 | `solKeyFile` | 32-byte hex seed for the Solana treasury and deposit-address derivation; generated on first boot, never commit it |
 | `solWatchDays` | How long a wrap intent's deposit address is polled (default 7 days); re-requesting a wrap for the same Sequentia address revives it |
 | `solMinReleaseSats` | Smallest SOL.s return that is released (default 100000 sats = 0.001 SOL, clear of Solana's rent-exempt minimum) |
+| `unified` | Unified stablecoins, keyed by symbol: `name`, `ticker`, `precision`, `supervision` and the `sources` (one per chain) that all mint into the one asset (see "Unified stablecoins") |
+| `unifiedIssuerPubkey` | Pinned 33-byte compressed pubkey the bridge wallet controls; hashed into every unified asset id and later authorizes handing the asset to its issuer. Generate once, back up, never change |
+| `supervision` (per unified asset) | `enabled` issues the asset as a node-level supervised asset; `pause` additionally allows stopping every holding. Both permanent. `operationalKey`/`recoveryKey` pin the public keys; unset, the daemon derives them from the node wallet once |
+| `btcChainName` | Display name of the Bitcoin network behind the SBTC leg (default `Bitcoin testnet4`) |
+| `webDir` | Directory of the static web app to serve (default: the repository's `web/`) |
 | `apiHost`, `apiPort` | Where the API + web app listen |
 | `pollIntervalMs` | Main loop interval |
 | `stateFile` | Path of the JSON state file |
@@ -397,7 +443,7 @@ The daemon's only runtime dependency is `ethers`.
 
 ## Testing
 
-Contract unit tests (13 tests: deposits, fee-on-transfer tokens, pausing,
+Contract unit tests (17 tests: deposits, fee-on-transfer tokens, pausing,
 release replay protection, access control):
 
 ```
@@ -419,9 +465,12 @@ reissuance, native ether bridging, redemption with exact release and supply
 destruction, automatic refund of an undeliverable deposit, the Solana leg
 (wrap, reissue, sweep, unwrap, and the cross-leg wrong-network guards),
 fee-asset independence (the bridge wallet never touches the policy asset),
-and registry metadata binding. Requires foundry, node >= 20 and a build of
-the Sequentia node (set `SEQ_REPO` to your checkout of the
-[Sequentia repo](https://github.com/GracedEternalKingCabbageMan/Sequentia));
+the unified-asset ceremony (USDC from Ethereum and from Solana landing on one
+`USDC.e`), and registry metadata binding. Requires foundry, node >= 20 and a
+build of the Sequentia node (`sequentiad`/`sequentia-cli`; set `SEQ_REPO` to
+your checkout of the
+[Sequentia repo](https://github.com/GracedEternalKingCabbageMan/Sequentia),
+the script looks in `build-linux/src` then `src`);
 the registry checks are skipped unless `REGISTRY_REPO` points at a checkout of
 `sequentia-registry`.
 
@@ -463,7 +512,7 @@ protocol documentation lives in
 
 | Repo | One-liner |
 |---|---|
-| [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (`elementsd` fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (Sequentia Core, `sequentiad`; a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
 | [`sequentia-registry`](https://github.com/GracedEternalKingCabbageMan/sequentia-registry) | Sequentia Asset Registry service (asset metadata). |
 | [`sequentia-explorer`](https://github.com/GracedEternalKingCabbageMan/sequentia-explorer) | Sequentia block explorer frontend (esplora fork); the indexer lives in sequentia-electrs. |
 | [`SWK`](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK; Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
@@ -478,5 +527,5 @@ Never commit `config.json`, `operator.key`, or state files (they are
 
 ## License
 
-The Solidity sources carry MIT SPDX identifiers. The repository does not yet
-include a top-level license file.
+MIT, see [`LICENSE`](LICENSE). The Solidity sources carry matching SPDX
+identifiers.
