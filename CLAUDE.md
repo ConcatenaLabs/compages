@@ -10,7 +10,7 @@ Sending a bridged asset back releases the original funds.
 covers only the mechanics of working on the code.
 
 Node and consensus conventions live in the
-[`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) repo.
+[`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) repo.
 
 ## Pieces
 

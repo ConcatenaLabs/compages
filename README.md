@@ -83,7 +83,7 @@ merely share a symbol.
   asset is built this way: so the issuer can adopt it in place.
 
 The specification is
-[`bridged-usdc-standard.md`](https://github.com/GracedEternalKingCabbageMan/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md)
+[`bridged-usdc-standard.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md)
 in the node repository.
 
 ## Status
@@ -255,7 +255,7 @@ anchored finality.
 ### Bridged asset metadata
 
 Each bridged asset is registered in the
-[Sequentia Asset Registry](https://github.com/GracedEternalKingCabbageMan/sequentia-registry)
+[Sequentia Asset Registry](https://github.com/ConcatenaLabs/sequentia-registry)
 with an origin-suffixed ticker (`.e` marks it Ethereum-bridged, `.s`
 Solana-bridged; the suffix avoids colliding with native assets) and the name
 `<token name> (<chain name>)`, e.g. `Ether (Sepolia)` as `ETH.e` and
@@ -347,7 +347,7 @@ Ethereum RPC endpoint that supports `eth_getLogs` over block ranges.
 ### 1. Deploy the vault
 
 ```
-git clone --recurse-submodules https://github.com/GracedEternalKingCabbageMan/compages.git
+git clone --recurse-submodules https://github.com/ConcatenaLabs/compages.git
 cd compages/contracts
 forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL \
   --private-key $BRIDGE_OPERATOR_KEY --broadcast
@@ -469,7 +469,7 @@ the unified-asset ceremony (USDC from Ethereum and from Solana landing on one
 `USDC.e`), and registry metadata binding. Requires foundry, node >= 20 and a
 build of the Sequentia node (`sequentiad`/`sequentia-cli`; set `SEQ_REPO` to
 your checkout of the
-[Sequentia repo](https://github.com/GracedEternalKingCabbageMan/Sequentia),
+[Sequentia repo](https://github.com/ConcatenaLabs/Sequentia),
 the script looks in `build-linux/src` then `src`);
 the registry checks are skipped unless `REGISTRY_REPO` points at a checkout of
 `sequentia-registry`.
@@ -508,15 +508,15 @@ keys; they hold nothing on any real network.
 
 Compages is one component of the Sequentia testnet ecosystem. The umbrella
 protocol documentation lives in
-[`Sequentia/doc/sequentia/`](https://github.com/GracedEternalKingCabbageMan/Sequentia/tree/HEAD/doc/sequentia).
+[`Sequentia/doc/sequentia/`](https://github.com/ConcatenaLabs/Sequentia/tree/HEAD/doc/sequentia).
 
 | Repo | One-liner |
 |---|---|
-| [`Sequentia`](https://github.com/GracedEternalKingCabbageMan/Sequentia) | The Sequentia node (Sequentia Core, `sequentiad`; a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
-| [`sequentia-registry`](https://github.com/GracedEternalKingCabbageMan/sequentia-registry) | Sequentia Asset Registry service (asset metadata). |
-| [`sequentia-explorer`](https://github.com/GracedEternalKingCabbageMan/sequentia-explorer) | Sequentia block explorer frontend (esplora fork); the indexer lives in sequentia-electrs. |
-| [`SWK`](https://github.com/GracedEternalKingCabbageMan/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK; Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
-| [`seqdex`](https://github.com/GracedEternalKingCabbageMan/seqdex) | SeqDEX: non-custodial atomic-swap DEX; P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
+| [`Sequentia`](https://github.com/ConcatenaLabs/Sequentia) | The Sequentia node (Sequentia Core, `sequentiad`; a fork of Elements 23.3.3): consensus, anchoring, proof of stake, open fee market, plus the canonical protocol documentation in `doc/sequentia/`. |
+| [`sequentia-registry`](https://github.com/ConcatenaLabs/sequentia-registry) | Sequentia Asset Registry service (asset metadata). |
+| [`sequentia-explorer`](https://github.com/ConcatenaLabs/sequentia-explorer) | Sequentia block explorer frontend (esplora fork); the indexer lives in sequentia-electrs. |
+| [`SWK`](https://github.com/ConcatenaLabs/SWK) | Sequentia Wallet Kit: a fork of Blockstream LWK; Rust wallet library, CLI, and WASM bindings for building Sequentia (and Bitcoin testnet4) wallets. |
+| [`seqdex`](https://github.com/ConcatenaLabs/seqdex) | SeqDEX: non-custodial atomic-swap DEX; P2P order book (seqob), same-chain swaps, and cross-chain BTC↔asset swaps made safe by Bitcoin anchoring. |
 
 ## Contributing
 
