@@ -86,18 +86,20 @@ The specification is
 [`bridged-usdc-standard.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md)
 in the node repository.
 
-## Status
+## What the bridge does
 
-| Piece | State |
+| Piece | What it does |
 |---|---|
-| Ethereum → Sequentia (lock, then mint) | Working on the live deployment; ETH and ERC-20 deposits, first-bridge issuance, duplicate-free reissuance, automatic refunds |
-| Sequentia → Ethereum (return, then release) | Implemented and exercised end-to-end in `e2e/run-e2e.sh`; live redemptions wait for 100 Bitcoin-anchor confirmations before releasing (see "Finality") |
-| Vault contract | `CompagesVault` deployed on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) (primary) and [`0x15b3c97ed82c62b7828a775456bd75e67a8ec42c`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c); the daemon watches both; 17 Foundry unit tests |
-| Unified stablecoins | `USDC.e` and `EURC.e` live, precision 6, fed from Sepolia and the Solana devnet, node-level supervised (see "Unified stablecoins") |
-| Bitcoin ↔ SBTC (wrap, unwrap) | Live; address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
-| Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) and exercised end-to-end against a mock Solana RPC in `e2e/run-e2e.sh` |
+| Ethereum → Sequentia (lock, then mint) | ETH and ERC-20 deposits, first-bridge issuance, duplicate-free reissuance, automatic refunds |
+| Sequentia → Ethereum (return, then release) | Releases the locked funds against a returned bridged asset; live redemptions wait for 100 Bitcoin-anchor confirmations first (see "Finality") |
+| Vault contract | `CompagesVault` on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) (primary) and [`0x15b3c97ed82c62b7828a775456bd75e67a8ec42c`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c); the daemon watches both |
+| Unified stablecoins | `USDC.e` and `EURC.e`, precision 6, fed from Sepolia and the Solana devnet, node-level supervised (see "Unified stablecoins") |
+| Bitcoin ↔ SBTC (wrap, unwrap) | Address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
+| Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) |
 | Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
-| Web front-end | Live at https://sequentiatestnet.com/bridge/, served by the daemon itself |
+| Web front-end | Served by the daemon itself at https://sequentiatestnet.com/bridge/ |
+
+Every leg is exercised end to end by `e2e/run-e2e.sh`.
 
 Chain ids, RPC endpoints, the vault address and confirmation depths are all
 configuration, and asset mappings are keyed per chain id, so nothing in the
@@ -443,8 +445,8 @@ The daemon's only runtime dependency is `ethers`.
 
 ## Testing
 
-Contract unit tests (17 tests: deposits, fee-on-transfer tokens, pausing,
-release replay protection, access control):
+Contract unit tests (deposits, fee-on-transfer tokens, pausing, release replay
+protection, access control):
 
 ```
 cd contracts
