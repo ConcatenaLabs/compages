@@ -2697,8 +2697,11 @@ export class Bridge {
    *  person, not discovered by the user. */
   async watchDeliveries() {
     const s = this.state.data;
+    // Only deliveries this watcher saw happen (they carry `deliveredAt`). An
+    // older record can predate a chain reset, and its delivery would read as
+    // displaced when the chain it landed on simply no longer exists.
     const pending = [...Object.values(s.deposits), ...Object.values(s.solDeposits)].filter(
-      (d) => d.status === "minted" && d.steps?.sendTxid && !d.deliveryFinal
+      (d) => d.status === "minted" && d.steps?.sendTxid && d.deliveredAt && !d.deliveryFinal
     );
     for (const d of pending.slice(0, this.cfg.deliveryWatchBatch ?? 25)) {
       const txid = d.steps.sendTxid;
