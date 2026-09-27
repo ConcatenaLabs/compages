@@ -5,10 +5,13 @@ daemon/*.key
 daemon/state/
 e2e/run/
 
-node_modules/
+node_modules
 contracts/out/
 contracts/cache/
 contracts/broadcast/
 watcher/config.json
 watcher/state/
 watcher/*.key
+reserves/config.json
+reserves/state/
+reserves/*.key

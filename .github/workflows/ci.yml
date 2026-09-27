@@ -66,6 +66,19 @@ jobs:
       - working-directory: watcher
         run: npm test
 
+  reserves:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - working-directory: reserves
+        run: npm ci
+      - working-directory: reserves
+        run: npm test
+
   e2e:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
