@@ -1465,7 +1465,7 @@ const trimAmount = (a) => String(a ?? "?").replace(/(\.\d*?)0+$/, "$1").replace(
 /** One Bitcoin-leg transfer in plain words. `kind` is "wrap" (BTC in, SBTC
  *  out; confirmations are Bitcoin blocks, about 10 minutes each) or "unwrap"
  *  (SBTC in, BTC out; confirmations are Sequentia blocks, about 1 minute). */
-function describeBtcTransfer(t, minConf, kind) {
+function describeBtcTransfer(t, minConf, kind, anchor = null) {
   const wrap = kind === "wrap";
   const need = Number(minConf ?? 0);
   const conf = Math.max(0, Number(t.confirmations ?? 0));
@@ -1478,9 +1478,16 @@ function describeBtcTransfer(t, minConf, kind) {
         const unit = wrap ? "Bitcoin" : "Sequentia";
         const left = Math.max(0, need - conf);
         html = `Waiting for ${Math.min(conf, need)}/${need} ${unit} confirmations.`;
+        // Confirmed, but a deposit is credited only once Sequentia's
+        // Bitcoin anchor reaches its block: then a Bitcoin reorg that undid
+        // the deposit would undo the credit too.
+        const anchorBehind =
+          wrap && !left && anchor?.anchorHeight != null && anchor?.btcTip != null &&
+          anchor.anchorHeight < anchor.btcTip - conf + 1;
+        if (anchorBehind) html = "Confirmed. Waiting for Sequentia to anchor the Bitcoin block that holds it.";
         progress = progressHtml(
           Math.min(conf, need) / need,
-          left ? `${fmtMinutes(left * (wrap ? 10 : 1))} left` : "Confirmed. Processing shortly."
+          left ? `${fmtMinutes(left * (wrap ? 10 : 1))} left` : anchorBehind ? "usually within a few minutes" : "Confirmed. Processing shortly."
         );
       } else {
         html = "Seen. The bridge processes it shortly.";
@@ -1501,7 +1508,7 @@ function describeBtcTransfer(t, minConf, kind) {
   return { html, cls, progress };
 }
 
-function renderBtcTransfers(boxId, list, minConf, kind, address) {
+function renderBtcTransfers(boxId, list, minConf, kind, address, anchor = null) {
   const box = $(boxId);
   const items = [...(list ?? [])].reverse(); // newest first
   if (!items.length) {
@@ -1509,7 +1516,7 @@ function renderBtcTransfers(boxId, list, minConf, kind, address) {
     const when =
       kind === "wrap"
         ? need > 0
-          ? `SBTC is credited after ${need} Bitcoin confirmation${need === 1 ? "" : "s"}, ${fmtMinutes(need * 10)}.`
+          ? `SBTC is credited after ${need} Bitcoin confirmation${need === 1 ? "" : "s"} (${fmtMinutes(need * 10)}), once Sequentia has anchored that Bitcoin block.`
           : "SBTC is credited once the bridge sees the payment."
         : "BTC is released once the transfer is processed.";
     box.innerHTML = `<span class="note">Nothing received yet at ${escapeHtml(short(address))}. ${escapeHtml(when)}</span>`;
@@ -1517,7 +1524,7 @@ function renderBtcTransfers(boxId, list, minConf, kind, address) {
   }
   box.innerHTML = "";
   for (const t of items) {
-    const d = describeBtcTransfer(t, minConf, kind);
+    const d = describeBtcTransfer(t, minConf, kind, anchor);
     const amount = kind === "wrap" ? `${trimAmount(t.amount_btc)} BTC` : `${trimAmount(t.amount_sbtc)} SBTC`;
     const inLink = kind === "wrap" ? btcTxLink : seqTxLink;
     const el = document.createElement("div");
@@ -1543,7 +1550,10 @@ async function refreshBtcWrap(address) {
     return; // anything else: keep the last list and try again next time
   }
   if (btcWrap?.depositAddress !== address) return;
-  renderBtcTransfers("wrap-events", r.deposits, r.min_conf, "wrap", address);
+  renderBtcTransfers("wrap-events", r.deposits, r.min_conf, "wrap", address, {
+    anchorHeight: r.anchor_height ?? null,
+    btcTip: r.btc_tip ?? null,
+  });
 }
 
 async function refreshBtcUnwrap(address) {

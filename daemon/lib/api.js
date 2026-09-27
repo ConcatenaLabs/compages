@@ -791,7 +791,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(200, {
           depositAddress: r.deposit_address,
           seqAddress: body.seqAddress,
-          note: `Send BTC (testnet4) to this address from any Bitcoin wallet. After ${cfg.btcConfirmations ?? 2} confirmations you receive the same amount of SBTC at ${body.seqAddress}, 1:1.`,
+          note: `Send BTC (testnet4) to this address from any Bitcoin wallet. Once it has one confirmation and Sequentia has anchored the Bitcoin block holding it, you receive the same amount of SBTC at ${body.seqAddress}, 1:1. From then on a Bitcoin reorg that undid your deposit would undo the SBTC credit with it.`,
         });
       }
       // --- Solana bridge (SOL <-> SOL.s) --------------------------------------------------------
