@@ -315,7 +315,43 @@ async function checkDaemon() {
 
 // ---- the brake ----------------------------------------------------------------
 
+// With a guardian key (a vault role that can pause and cancel queued
+// payouts, and nothing else), a critical finding also pauses payouts on the
+// vault itself. That holds even if the daemon, its host or its admin API is
+// the thing that failed; only the vault's owner can resume.
+const guardian = cfg.guardianKeyFile
+  ? new ethers.Wallet(fs.readFileSync(path.resolve(path.dirname(cfgPath), cfg.guardianKeyFile), "utf8").trim(), provider)
+  : null;
+const GUARDIAN_ABI = [
+  "function guardian() view returns (address)",
+  "function releasesPaused() view returns (bool)",
+  "function pauseReleases()",
+];
+
+async function pauseVault(address, why) {
+  if (!guardian) return;
+  try {
+    const v = new ethers.Contract(address, GUARDIAN_ABI, guardian);
+    if (String(await v.guardian()).toLowerCase() !== guardian.address.toLowerCase()) return; // not our role here
+    if (await v.releasesPaused()) return;
+    const tx = await v.pauseReleases();
+    await tx.wait(1, 120_000);
+    log(`PAUSED payouts on vault ${address} (${tx.hash}): ${why}`);
+    await alerts.raise(`paused:${address}`, `payouts paused on vault ${address.slice(0, 10)}`, `${why}. Only the owner can resume.`, {
+      priority: 5,
+    });
+  } catch (e) {
+    log(`could not pause vault ${address}: ${e.message}`);
+  }
+}
+
 async function brake(p) {
+  // Which vaults the finding concerns: the one named, or every vault that
+  // escrows the affected asset.
+  const vaults = new Set();
+  if (p.vault) vaults.add(p.vault);
+  if (p.assetId) for (const v of cfg.vaults) vaults.add(v.address);
+  for (const v of vaults) await pauseVault(v, p.title);
   if (!cfg.daemonAdminToken) return;
   const assets = await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/assets`).catch(() => []);
   let ids = [];
@@ -363,7 +399,7 @@ async function pass() {
   for (const p of problems) {
     active.add(p.key);
     await alerts.raise(p.key, p.title, p.detail, { priority: p.severity === "critical" ? 5 : 4 });
-    if (p.severity === "critical") await brake(p);
+    if (p.severity === "critical" && !p.noBrake) await brake(p);
   }
   await alerts.settle(active);
   report = { ...report, lastRun: new Date().toISOString(), problems };

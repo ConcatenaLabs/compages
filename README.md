@@ -729,7 +729,12 @@ chains through its own endpoints and, once a minute:
 
 Critical findings go to `alertUrl`, and with `daemonAdminToken` set the
 affected assets are halted in the daemon, which stops their minting and
-payouts until an operator clears the halt. Payouts at or above
+payouts until an operator clears the halt. With `guardianKeyFile` set to the
+key holding a vault's guardian role, the watcher also pauses payouts on the
+vault itself, which holds even if the daemon or its host is what failed; the
+guardian can pause and cancel queued payouts and nothing else, and only the
+vault's owner can resume. A fault in the watcher's own data source (an RPC
+dropping logs) alerts but never pauses. Payouts at or above
 `largePayout[token]` are announced as they happen (`announceEveryPayout`
 announces all of them). A JSON report is served on
 `127.0.0.1:<statusPort>/status`.
