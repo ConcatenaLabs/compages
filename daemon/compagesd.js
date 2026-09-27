@@ -162,6 +162,8 @@ async function main() {
       ["ethRedemptions", () => bridge.advanceRedemptions()],
       ["ethRetries", () => bridge.retryRedemptions()],
       ["cctpTransfers", () => cctp.advance()],
+      ["cctpInbound", () => cctp.advanceInbound()],
+      ["cctpOutbound", () => cctp.advanceOutbound()],
       ["invariants", () => bridge.checkInvariants()],
     ],
     interval

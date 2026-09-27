@@ -417,7 +417,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
 
       const isIntent =
         req.method === "POST" &&
-        (parts[1] === "redeem" || (["sol", "btc"].includes(parts[1]) && ["wrap", "unwrap"].includes(parts[2])));
+        (parts[1] === "redeem" ||
+          parts[1] === "cctp" ||
+          (["sol", "btc"].includes(parts[1]) && ["wrap", "unwrap"].includes(parts[2])));
       if (isIntent && overLimit(req)) {
         return send(429, { error: "too many requests from this address; try again in an hour" });
       }
@@ -461,6 +463,19 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           solChainName: cfg.solChainName ?? "Solana devnet",
           solChainLabel: cfg.solChainLabel ?? "solana-devnet",
           solConfigured: !!bridge.sol,
+          // USDC from and to other chains through Circle's CCTP: the chains,
+          // and Circle's contracts the page calls on them.
+          cctp: bridge.cctp?.c.enabled
+            ? {
+                // Each chain's public RPC is included: a wallet needs it to add
+                // a chain it does not know yet.
+                chains: bridge.cctp.chains,
+                tokenMessenger: cfg.cctp.tokenMessengerEvm ?? "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA",
+                messageTransmitter: cfg.cctp.messageTransmitter,
+                depositVault: cfg.depositVault ?? cfg.vaultAddress,
+                depositHookPrefix: "compages:deposit:",
+              }
+            : null,
           ...(bridge.sol ? { solTreasury: bridge.sol.treasury.address } : {}),
           maxSatsPerAsset: SEQ_MAX_SATS.toString(),
           bridgedAssets: Object.keys(state.data.mappings).length,
@@ -719,19 +734,52 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         }
       }
 
+      if (req.method === "POST" && parts[1] === "cctp" && parts[2] === "deposit") {
+        const body = parseJson(await readBody(req));
+        if (!body) return send(400, { error: "invalid JSON body" });
+        if (!bridge.cctp?.c.enabled) return send(503, { error: "USDC from other chains is not enabled" });
+        try {
+          const rec = bridge.cctp.registerInbound(body.sourceDomain, body.txHash);
+          return send(200, { key: rec.key, stage: rec.stage });
+        } catch (e) {
+          if (e.badRequest) return send(400, { error: e.message });
+          throw e;
+        }
+      }
+      if (req.method === "GET" && parts[1] === "cctp" && parts[2] === "deposit" && parts[3] && parts[4]) {
+        const key = `${Number(parts[3])}:${String(parts[4]).toLowerCase()}`;
+        const rec = Object.hasOwn(bridge.cctp?.inbound ?? {}, key) ? bridge.cctp.inbound[key] : null;
+        if (!rec) return send(404, { error: "this burn has not been reported to the bridge" });
+        const { attestation, message, ethTx, ...pub } = rec;
+        // The deposit it became, once relayed: found by the CCTP nonce.
+        const dep = rec.nonce
+          ? Object.values(state.data.deposits).find((d) => d.cctp?.cctpNonce === rec.nonce) ?? null
+          : null;
+        return send(200, { ...pub, deposit: dep ? publicDeposit(dep) : null });
+      }
+
       if (req.method === "POST" && parts[1] === "redeem") {
-        const body = await readBody(req);
+        const raw = parseJson(await readBody(req));
         let ethAddress;
         try {
-          ethAddress = ethers.getAddress(JSON.parse(body || "{}").ethAddress ?? "");
+          ethAddress = ethers.getAddress(raw?.ethAddress ?? "");
         } catch {
           return send(400, { error: "invalid ethAddress" });
         }
-        const seqAddress = await bridge.createRedeemIntent(ethAddress);
+        let seqAddress;
+        try {
+          seqAddress = await bridge.createRedeemIntent(ethAddress, raw?.destinationDomain ?? 0);
+        } catch (e) {
+          if (e.badRequest) return send(400, { error: e.message });
+          throw e;
+        }
         return send(200, {
           seqAddress,
           ethAddress,
-          note: `Send any bridged asset to this Sequentia address from any wallet. Once the burn is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 3} Bitcoin-anchor confirmations), the locked funds are released to ${ethAddress} on ${cfg.ethChainName}. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
+          destinationDomain: Number(raw?.destinationDomain ?? 0),
+          note: `Send any bridged asset to this Sequentia address from any wallet. Once the transfer is final under Bitcoin anchoring (${cfg.btcAnchorConfirmations ?? 3} Bitcoin-anchor confirmations), the locked funds are released to ${ethAddress} on ${
+            Number(raw?.destinationDomain ?? 0) ? `${bridge.cctp.chain(raw.destinationDomain).name} (USDC.e, through Circle's CCTP: claim it there with the attestation this page fetches; any other asset is paid on ${cfg.ethChainName})` : cfg.ethChainName
+          }. This waits on Bitcoin, not a Sequentia block count, because a Sequentia transaction can be reorged if its Bitcoin anchor is.`,
         });
       }
 

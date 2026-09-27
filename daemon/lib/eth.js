@@ -59,6 +59,8 @@ export const VAULT_ABI = [
   "event ReleaseCancelled(bytes32 indexed redemptionId, address indexed by)",
   "event ReleaseDeferred(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
   "event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender)",
+  "event CctpUnrecognized(uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount, bytes hookData)",
+  "event CctpForwarded(uint32 indexed sourceDomain, bytes32 indexed mintRecipient, bytes32 cctpNonce)",
   "function VERSION() view returns (uint256)",
   "function release(address token, address to, uint256 amount, bytes32 redemptionId)",
   "function refund(address token, address to, uint256 amount, bytes32 refundId)",

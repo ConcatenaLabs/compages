@@ -43,6 +43,11 @@ SEQ_P2P=18893
 API_PORT=9950
 SOL_PORT=18999
 FAULT_PORT=18894
+IRIS_PORT=18995
+# The remote chain the CCTP checks pretend to bridge from and pay out to.
+REMOTE_DOMAIN=6
+REMOTE_MESSENGER=0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa
+REMOTE_USDC=0x036CbD53842c5426634e7929541eC2318f3dCF7e
 REGISTRY_PORT=13005
 REGISTRY_REPO="${REGISTRY_REPO:-$HOME/sequentia-registry}"
 REGISTRY_TOKEN=e2e-admin-token
@@ -69,6 +74,7 @@ cleanup() {
   [ -f "$RUN/daemon.pid" ] && kill "$(cat "$RUN/daemon.pid")" 2>/dev/null
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
   [ -n "${FAULT_PID:-}" ] && kill "$FAULT_PID" 2>/dev/null
+  [ -n "${IRIS_PID:-}" ] && kill "$IRIS_PID" 2>/dev/null
   [ -n "${REGISTRY_PID:-}" ] && kill "$REGISTRY_PID" 2>/dev/null
   [ -n "${SOL_PID:-}" ] && kill "$SOL_PID" 2>/dev/null
   seqcli stop >/dev/null 2>&1
@@ -119,6 +125,23 @@ USDC_ETH=$(forge create test/mocks/MockTokens.sol:MockERC20 \
 cast send "$USDC_ETH" "mint(address,uint256)" $USER_ADDR 1000000000 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
 echo "   usdc(eth): $USDC_ETH"
+
+# Circle's CCTP, as mocks: a transmitter that accepts the attestation "valid"
+# and a messenger that burns and mints the test USDC. The vault's owner points
+# the vault at them, as on a real deployment.
+TRANSMITTER=$(forge create test/mocks/MockCctp.sol:MockMessageTransmitterV2 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args 0 | awk '/Deployed to:/ {print $3}')
+MESSENGER=$(forge create test/mocks/MockCctp.sol:MockTokenMessengerV2 \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args $TRANSMITTER | awk '/Deployed to:/ {print $3}')
+[ -n "$TRANSMITTER" ] && [ -n "$MESSENGER" ] || { echo "CCTP mock deploy failed"; exit 1; }
+cast send "$MESSENGER" "addRemote(uint32,bytes32,bytes32,address)" $REMOTE_DOMAIN $REMOTE_MESSENGER \
+  "0x000000000000000000000000${REMOTE_USDC:2}" "$USDC_ETH" \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
+cast send "$VAULT" "setCctp(address,address,address)" "$MESSENGER" "$TRANSMITTER" "$USDC_ETH" \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OWNER_KEY >/dev/null
+echo "   cctp mocks: transmitter $TRANSMITTER messenger $MESSENGER"
 
 # Release limits, set by the owner. Generous here, so the ordinary checks pay
 # out at once; the queue has checks of its own that lower a limit.
@@ -211,6 +234,10 @@ node "$HERE/fault-proxy.mjs" --port $FAULT_PORT --target "http://127.0.0.1:$SEQ_
 FAULT_PID=$!
 for _ in $(seq 1 40); do curl -s "http://127.0.0.1:$FAULT_PORT/__fault" >/dev/null 2>&1 && break; sleep 0.25; done
 
+echo "== starting the mock attestation service"
+node "$HERE/mock-iris.mjs" --port $IRIS_PORT --eth "http://127.0.0.1:$ANVIL_PORT" --transmitter "$TRANSMITTER" > "$RUN/iris.log" 2>&1 &
+IRIS_PID=$!
+
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
 {
@@ -260,6 +287,16 @@ cat > "$RUN/config.json" <<EOF
       }
     }
   },
+  "cctp": {
+    "enabled": true,
+    "messageTransmitter": "$TRANSMITTER",
+    "tokenMessengerEvm": "$MESSENGER",
+    "irisUrl": "http://127.0.0.1:$IRIS_PORT",
+    "solFloatUnits": "1000000000000000",
+    "chains": [
+      { "domain": $REMOTE_DOMAIN, "name": "Mock Base", "chainId": 84532, "usdc": "$REMOTE_USDC" }
+    ]
+  },
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -279,6 +316,8 @@ echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
 OWNER_KEY=$OWNER_KEY GUARDIAN_KEY=$GUARDIAN_KEY RELEASE_DELAY=$RELEASE_DELAY REJECTOR=$REJECTOR \
+IRIS_PORT=$IRIS_PORT TRANSMITTER=$TRANSMITTER MESSENGER=$MESSENGER REMOTE_DOMAIN=$REMOTE_DOMAIN \
+REMOTE_MESSENGER=$REMOTE_MESSENGER REMOTE_USDC=$REMOTE_USDC \
 USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT FAULT_PORT=$FAULT_PORT \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" \

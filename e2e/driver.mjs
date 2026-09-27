@@ -1010,6 +1010,104 @@ if (process.env.REGISTRY_URL) {
   check("the owed ether can be claimed to another address", (await provider.getBalance(payTo)) === ethers.parseEther("0.05"));
 }
 
+// ---------------- test 12: USDC from and to other chains (CCTP) ----------------
+{
+  console.log("\n-- CCTP: USDC burned on another chain becomes USDC.e");
+  const IRIS = `http://127.0.0.1:${process.env.IRIS_PORT}`;
+  const ADMIN = { authorization: "Bearer e2e-admin" };
+  const pad = (a) => ethers.zeroPadValue(a, 32);
+  const usdcE = (await api("assets")).find((a) => a.unified && a.symbol === "USDC");
+  // A burn "on" the remote chain, as Circle's messenger there would format it,
+  // naming the vault as mint recipient and as the only relayer.
+  const remoteBurn = async (amount, hook) => {
+    const body = ethers.solidityPacked(
+      ["uint32", "bytes32", "bytes32", "uint256", "bytes32", "uint256", "uint256", "uint256", "bytes"],
+      [1, pad(process.env.REMOTE_USDC), pad(process.env.VAULT), amount, pad(user.address), 0, 0, 0, ethers.toUtf8Bytes(hook)]
+    );
+    const message = ethers.solidityPacked(
+      ["uint32", "uint32", "uint32", "bytes32", "bytes32", "bytes32", "bytes32", "uint32", "uint32", "bytes"],
+      [1, Number(process.env.REMOTE_DOMAIN), 0, ethers.hexlify(ethers.randomBytes(32)), process.env.REMOTE_MESSENGER,
+        pad(process.env.MESSENGER), pad(process.env.VAULT), 2000, 2000, body]
+    );
+    const txHash = ethers.hexlify(ethers.randomBytes(32));
+    await fetch(`${IRIS}/__add`, { method: "POST", body: JSON.stringify({ domain: Number(process.env.REMOTE_DOMAIN), txHash, message }) });
+    await api("cctp/deposit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceDomain: Number(process.env.REMOTE_DOMAIN), txHash }),
+    });
+    return txHash;
+  };
+  const inbound = async (txHash) => api(`cctp/deposit/${process.env.REMOTE_DOMAIN}/${txHash}`);
+  const decode = (hex) => {
+    const b = Buffer.from(hex.slice(2), "hex");
+    return {
+      destinationDomain: b.readUInt32BE(8),
+      mintRecipient: "0x" + b.subarray(148 + 36 + 12, 148 + 68).toString("hex"),
+      amount: BigInt("0x" + b.subarray(148 + 68, 148 + 100).toString("hex")),
+    };
+  };
+
+  const bal0 = await seqAssetBalance("user", usdcE.assetId);
+  const t1 = await remoteBurn(7_000_000n, `compages:deposit:${userSeqAddr}`);
+  const in1 = await waitFor("the remote burn is relayed and minted", async () => {
+    const r = await inbound(t1);
+    return r.deposit?.status === "minted" ? r : null;
+  }, 180_000);
+  check("a reported burn is attested, relayed through the vault and minted", in1.stage === "relayed" && !!in1.deposit, in1.relayTx);
+  const bal1 = await waitFor("user holds the new USDC.e", async () => {
+    const b = await seqAssetBalance("user", usdcE.assetId);
+    return b > bal0 ? b : null;
+  });
+  // USDC.e has precision 6: 7 USDC.e is 7,000,000 atoms, which the wallet
+  // reports as 0.07 in its 8-decimal display.
+  check("the user received exactly 7 USDC.e", bal1 - bal0 === 7_000_000, `${bal1 - bal0}`);
+
+  console.log("\n-- CCTP: a burn with a bad address, or no purpose, goes back to its chain");
+  const t2 = await remoteBurn(2_000_000n, "compages:deposit:not-a-sequentia-address");
+  const bad = await waitFor("the bad-address deposit is refunded", async () => {
+    const r = await inbound(t2);
+    return r.deposit?.status === "refunded" && r.deposit.cctpOut?.stage === "claimable" ? r.deposit : null;
+  }, 240_000);
+  const m2 = decode(bad.cctpOut.message);
+  check(
+    "a CCTP deposit to an invalid address is refunded to its source chain and sender",
+    m2.destinationDomain === Number(process.env.REMOTE_DOMAIN) && m2.mintRecipient === user.address.toLowerCase() && m2.amount === 2_000_000n,
+    JSON.stringify({ d: m2.destinationDomain, r: m2.mintRecipient, a: `${m2.amount}` })
+  );
+  await remoteBurn(1_500_000n, "hello");
+  const odd = await waitFor("the unrecognised arrival is refunded", async () => {
+    const all = await (await fetch(`${API}/admin/records?status=refunded`, { headers: ADMIN })).json();
+    return all.find((r) => String(r.key).includes(":cctp:") && r.cctpOut?.stage === "claimable") ?? null;
+  }, 240_000);
+  check("USDC that arrived for no recognised purpose is refunded, not kept", !!odd && decode(odd.cctpOut.message).amount === 1_500_000n);
+
+  console.log("\n-- CCTP: USDC.e redeemed to another chain is paid out there");
+  const intent = await api("redeem", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ethAddress: RECEIVER, destinationDomain: Number(process.env.REMOTE_DOMAIN) }),
+  });
+  const sent = await seqRpc(
+    "sendtoaddress",
+    // 5 USDC.e: 5,000,000 atoms, 0.05 in the wallet's 8-decimal units.
+    { address: intent.seqAddress, amount: 0.05, assetlabel: usdcE.assetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  const out = await waitFor("the cross-chain redemption is burned and attested", async () => {
+    const r = (await api(`redeem/${intent.seqAddress}`)).redemptions.find((x) => x.txid === sent);
+    return r?.status === "done" && r.cctpOut?.stage === "claimable" ? r : null;
+  }, 240_000);
+  const m3 = decode(out.cctpOut.message);
+  check(
+    "a redemption to another chain is burned by the vault for minting to the recipient there",
+    m3.destinationDomain === Number(process.env.REMOTE_DOMAIN) && m3.mintRecipient === RECEIVER.toLowerCase() && m3.amount === 5_000_000n,
+    JSON.stringify({ d: m3.destinationDomain, r: m3.mintRecipient, a: `${m3.amount}` })
+  );
+  const status = await api("status");
+  check("the page is told which chains and contracts CCTP uses", status.cctp?.chains?.[0]?.domain === Number(process.env.REMOTE_DOMAIN));
+}
+
 // ---------------- summary ----------------
 clearInterval(miner);
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : "\nALL CHECKS PASSED");

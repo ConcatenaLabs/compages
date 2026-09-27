@@ -32,6 +32,8 @@ import {
   splTransferChecked,
   ataAddress,
   isSolAddress,
+  b58encode,
+  b58decode,
   TOKEN_PROGRAM,
   FEE_LAMPORTS,
   RENT_EXEMPT_MIN_LAMPORTS,
@@ -639,6 +641,11 @@ export class Bridge {
         for (const ev of logs) {
           await this.handleDeposit(ev, address);
         }
+        if ((await this.eth.vaultVersion(vault)) >= 3) {
+          for (const ev of await vault.queryFilter(vault.filters.CctpUnrecognized(), from, to)) {
+            this.recordUnrecognized(ev, address);
+          }
+        }
       }
       s.lastEthBlock = to;
       this.state.save();
@@ -690,6 +697,33 @@ export class Bridge {
     this.missingDeposits = missing;
   }
 
+  /** USDC that reached a vault by CCTP for no purpose the vault recognised
+   *  (a malformed deposit instruction, say). It belongs to whoever burned it
+   *  on the source chain, so it is recorded for a refund there. */
+  recordUnrecognized(ev, vaultAddress) {
+    const s = this.state.data;
+    const key = `${vaultAddress}:cctp:${ev.args.cctpNonce}`;
+    if (s.deposits[key]) return;
+    s.deposits[key] = {
+      nonce: key,
+      key,
+      vault: vaultAddress,
+      tag: `cctp arrival ${String(ev.args.cctpNonce).slice(0, 10)}`,
+      ethTxHash: ev.transactionHash,
+      ethBlock: ev.blockNumber,
+      token: "cctp-usdc",
+      amountUnits: ev.args.amount.toString(),
+      cctp: { sourceDomain: Number(ev.args.sourceDomain), sender: ev.args.sender, cctpNonce: ev.args.cctpNonce },
+      refundIdHex: ethers.keccak256(ethers.toUtf8Bytes(`compages:cctp-unrecognized:${ev.args.cctpNonce}`)),
+      status: "refund_pending",
+      refundReason: "arrived by CCTP without a valid Sequentia address",
+      steps: {},
+      createdAt: new Date().toISOString(),
+    };
+    this.state.save();
+    this.log(`vault ${vaultAddress}: USDC arrived by CCTP for no recognised purpose; refunding it to domain ${ev.args.sourceDomain}`);
+  }
+
   async handleDeposit(ev, vaultAddress = null) {
     const s = this.state.data;
     const nonce = ev.args.nonce.toString();
@@ -710,6 +744,25 @@ export class Bridge {
     }
 
     const token = ev.args.token === ethers.ZeroAddress ? "eth" : ev.args.token.toLowerCase();
+    // A deposit that arrived by CCTP names no depositor on this chain (from
+    // is zero); its CctpDeposit event, in the same transaction, says where it
+    // came from, which is where a refund must go.
+    let cctp = null;
+    if (ev.args.from === ethers.ZeroAddress && vaultAddress) {
+      const vault = this.eth.vaultFor(vaultAddress);
+      const receipt = await this.eth.provider.getTransactionReceipt(ev.transactionHash);
+      for (const log of receipt?.logs ?? []) {
+        let e;
+        try {
+          e = vault.interface.parseLog(log);
+        } catch {
+          continue;
+        }
+        if (e?.name === "CctpDeposit" && e.args.nonce === ev.args.nonce) {
+          cctp = { sourceDomain: Number(e.args.sourceDomain), sender: e.args.sender, cctpNonce: e.args.cctpNonce };
+        }
+      }
+    }
     const dep = {
       nonce,
       key,
@@ -722,6 +775,7 @@ export class Bridge {
       from: ev.args.from,
       amountUnits: ev.args.amount.toString(),
       seqAddress: ev.args.sequentiaAddress,
+      ...(cctp ? { cctp } : {}),
       status: "minting",
       steps: {},
       createdAt: new Date().toISOString(),
@@ -1388,7 +1442,7 @@ export class Bridge {
   async processRefunds() {
     for (const dep of Object.values(this.state.data.deposits)) {
       if (!["refund_pending", "refunding", "refund_queued"].includes(dep.status)) continue;
-      const id = refundId(this.cfg.ethChainId, dep.nonce, dep.key === dep.nonce ? null : dep.vault);
+      const id = dep.refundIdHex ?? refundId(this.cfg.ethChainId, dep.nonce, dep.key === dep.nonce ? null : dep.vault);
       // Refund out of the vault that took the deposit: no other vault holds
       // escrow for it.
       const vault = this.eth.vaultFor(dep.vault);
@@ -1410,7 +1464,15 @@ export class Bridge {
         dep.status = "refunding";
         dep.refundFromBlock ??= await this.eth.provider.getBlockNumber();
         this.state.save();
-        const r = await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id], "refund");
+        // A CCTP deposit goes back to the chain and address it came from.
+        const r = dep.cctp
+          ? await this.payOut(
+              dep,
+              vault,
+              [dep.amountUnits, dep.cctp.sourceDomain, this.cctp.refundRecipient(dep.cctp.sourceDomain, dep.cctp.sender), id, 0n],
+              "refundCctp"
+            )
+          : await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id], "refund");
         if (r.revert) await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
         else if (r.paid || r.queued) this.applyRefundOutcome(dep, r, tag);
       } catch (e) {
@@ -1437,6 +1499,15 @@ export class Bridge {
       rec.status = "released";
       rec.releaseTxHash ??= o.paid ?? null;
       if (o.deferred) rec.deferred = o.deferred;
+      // Burned here for minting on another chain: follow it until claimed.
+      if (rec.viaCctp && rec.releaseTxHash && !rec.cctpOut) {
+        rec.cctpOut = {
+          domain: rec.destinationDomain ?? 5,
+          burnTx: rec.releaseTxHash,
+          ...(rec.solAddress ? { owner: rec.solAddress } : {}),
+          stage: "attesting",
+        };
+      }
       if (mapping) this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
       this.log(
         `${tag}: released ${rec.amountUnits} units of ${rec.symbol ?? ""} to ${rec.ethAddress}` +
@@ -1460,6 +1531,11 @@ export class Bridge {
     } else {
       dep.status = "refunded";
       dep.refundTxHash ??= o.paid ?? null;
+      if (dep.cctp && dep.refundTxHash && !dep.cctpOut) {
+        const owner =
+          dep.cctp.sourceDomain === 5 ? b58encode(Buffer.from(String(dep.cctp.sender).replace(/^0x/, ""), "hex")) : null;
+        dep.cctpOut = { domain: dep.cctp.sourceDomain, burnTx: dep.refundTxHash, ...(owner ? { owner } : {}), stage: "attesting" };
+      }
       if (o.deferred) dep.deferred = o.deferred;
       this.log(`${tag}: refunded (${dep.refundReason})${o.deferred ? "; the address refused it, so it is owed and claimable" : ""}`);
     }
@@ -1476,14 +1552,16 @@ export class Bridge {
    *  `kind` "refund" uses refund() on a vault that has it. */
   async payOut(rec, vault, args, kind = "release") {
     const v3 = (await this.eth.vaultVersion(vault)) >= 3;
-    const method = v3 && kind === "refund" ? "refund" : "release";
+    const method =
+      kind === "refundCctp" ? "refundViaCctp" : kind === "releaseCctp" ? "releaseViaCctp" : v3 && kind === "refund" ? "refund" : "release";
     try {
       const receipt = await this.eth.sendAndWait(vault, method, args, (sent) => {
         rec.ethTx = sent;
         this.state.save();
       });
       if (!receipt || receipt.status !== 1) return {}; // re-examined from the chain next tick
-      return v3 ? this.readPayoutOutcome(vault, receipt, args[3]) : { paid: receipt.hash };
+      const id = kind === "refundCctp" || kind === "releaseCctp" ? args[3] : args[3];
+      return v3 ? this.readPayoutOutcome(vault, receipt, id) : { paid: receipt.hash };
     } catch (e) {
       if (e?.code === "CALL_EXCEPTION" && typeof e.data === "string" && e.data.length >= 10) {
         return { revert: this.eth.revertName(e.data) ?? e.data };
@@ -1636,17 +1714,24 @@ export class Bridge {
 
   /** Create a redemption intent: a fresh Sequentia address bound to an
    *  Ethereum destination. Anything bridged that arrives there is redeemed. */
-  async createRedeemIntent(ethAddress) {
+  async createRedeemIntent(ethAddress, destinationDomain = 0) {
     const checksummed = ethers.getAddress(ethAddress); // throws on invalid
-    // One redemption address per Ethereum destination: asking again returns
-    // the same one, so a user who comes back finds their redemption instead
-    // of a fresh, empty address.
+    const domain = Number(destinationDomain ?? 0);
+    // Another CCTP chain as destination: USDC is paid out there instead of
+    // on Ethereum. Only EVM chains take an 0x address.
+    if (domain !== 0 && !(this.cctp?.chain(domain) && this.cctp.c.enabled)) {
+      throw Object.assign(new Error("the bridge does not pay out on that chain"), { badRequest: true });
+    }
+    // One redemption address per destination: asking again returns the same
+    // one, so a user who comes back finds their redemption instead of a
+    // fresh, empty address.
     for (const [addr, it] of Object.entries(this.state.data.redeemIntents)) {
-      if (it.ethAddress === checksummed) return addr;
+      if (it.ethAddress === checksummed && Number(it.destinationDomain ?? 0) === domain) return addr;
     }
     const seqAddress = await this.seq.call("getnewaddress", { label: "compages-redeem" });
     this.state.data.redeemIntents[seqAddress] = {
       ethAddress: checksummed,
+      ...(domain ? { destinationDomain: domain } : {}),
       createdAt: new Date().toISOString(),
     };
     this.state.save();
@@ -1692,6 +1777,7 @@ export class Bridge {
           vout: tx.vout,
           seqAddress: tx.address,
           ethAddress: intent.ethAddress,
+          ...(intent.destinationDomain ? { destinationDomain: intent.destinationDomain } : {}),
           assetId: tx.asset,
           sats: amountToSats(tx.amount).toString(),
           status: "awaiting_finality",
@@ -1917,7 +2003,17 @@ export class Bridge {
           : ethSrc?.token ?? mapping.token;
         const tag = `redemption ${rec.key}`;
         rec.releaseFromBlock ??= await this.eth.provider.getBlockNumber();
-        const r = await this.payOut(rec, vault, [tokenAddr, rec.ethAddress, rec.amountUnits, id]);
+        // USDC bound for another CCTP chain is burned by the vault for minting
+        // there; anything else (or a vault without CCTP) pays out on Ethereum,
+        // where the same 0x address is equally the recipient's.
+        const viaCctp =
+          rec.destinationDomain &&
+          (await this.eth.vaultVersion(vault)) >= 3 &&
+          String(tokenAddr).toLowerCase() === String(await vault.cctpUsdc()).toLowerCase();
+        const r = viaCctp
+          ? await this.payOut(rec, vault, [rec.amountUnits, rec.destinationDomain, ethers.zeroPadValue(rec.ethAddress, 32), id, 0n], "releaseCctp")
+          : await this.payOut(rec, vault, [tokenAddr, rec.ethAddress, rec.amountUnits, id]);
+        if (viaCctp) rec.viaCctp = true;
         if (r.paid || r.queued) {
           this.applyReleaseOutcome(rec, r, tag, mapping);
         } else if (r.revert) {
@@ -2464,13 +2560,34 @@ export class Bridge {
     // Per-escrow solvency, as on the Ethereum leg, and gated the same way:
     // only a source that keeps an escrow ledger is checked here.
     const escrowed = src.escrowedUnits === undefined ? null : BigInt(src.escrowedUnits);
-    if (escrowed !== null && escrowed < units) {
-      rec.status = "awaiting_liquidity";
+    if (escrowed !== null && escrowed < units && !rec.viaCctp) {
+      // The Solana float is short. A unified stablecoin's escrow lives in the
+      // Ethereum vault, which can pay the user on Solana directly through
+      // CCTP; the daemon then relays the mint on Solana.
+      const ethSrc = sourceForChain(mapping, this.cfg.ethChainId);
+      const ethVault = ethSrc?.vault ? this.eth.vaultFor(ethSrc.vault) : null;
+      const canCctp =
+        mapping.unified &&
+        this.cctp?.c.enabled &&
+        ethSrc &&
+        BigInt(ethSrc.escrowedUnits ?? "0") >= units &&
+        ethVault &&
+        (await this.eth.vaultVersion(ethVault)) >= 3 &&
+        String(await ethVault.cctpUsdc()).toLowerCase() === String(ethSrc.token).toLowerCase();
+      if (!canCctp) {
+        rec.status = "awaiting_liquidity";
+        this.state.save();
+        this.log(
+          `sol redemption ${rec.key}: ${src.tokenKey} escrow holds ${escrowed}, needs ${units}; awaiting rebalance`
+        );
+        return;
+      }
+      rec.viaCctp = true;
+      rec.payTokenKey = ethSrc.tokenKey;
+      rec.payVault = ethSrc.vault;
+      rec.solMint = src.token;
       this.state.save();
-      this.log(
-        `sol redemption ${rec.key}: ${src.tokenKey} escrow holds ${escrowed}, needs ${units}; awaiting rebalance`
-      );
-      return;
+      this.log(`sol redemption ${rec.key}: the Solana float is short; paying through the Ethereum vault via CCTP`);
     }
 
     // The same gate as the Ethereum leg: the release is irreversible, so the
@@ -2499,6 +2616,7 @@ export class Bridge {
   }
 
   async releaseSolRedemptionLocked(rec, mapping) {
+    if (rec.viaCctp) return this.releaseSolViaCctp(rec, mapping);
     // The mint, decimals and token program to pay with are this asset's
     // SOLANA source's, not those of whichever source an asset-id lookup
     // happened to return first (a unified asset has one per chain).
@@ -2643,6 +2761,50 @@ export class Bridge {
     }
   }
 
+  /** Pay a Solana redemption out of the Ethereum vault through CCTP: the
+   *  vault burns USDC for minting into the user's USDC account on Solana,
+   *  and the daemon relays the mint there (Cctp.advanceOutbound). Same
+   *  finality gate, replay guard and queue as any vault payout. */
+  async releaseSolViaCctp(rec, mapping) {
+    const tag = `sol redemption ${rec.key}`;
+    const vault = this.eth.vaultFor(rec.payVault);
+    const id = (rec.redemptionId ??= redemptionIdOf(this.cfg.seqChainLabel, rec.txid, rec.vout));
+    if (rec.status === "queued") {
+      await this.driveQueued(rec, vault, id, "release", tag);
+    } else if (["new", "releasing", "release_paused"].includes(rec.status)) {
+      if (await vault.processedRedemptions(id)) {
+        this.applySolCctpOutcome(rec, mapping, await this.settledOutcome(vault, id, rec.releaseFromBlock), tag);
+      } else {
+        const fin = await this.burnFinality(rec.txid);
+        if (!fin.final) {
+          rec.finality = fin.reason;
+          rec.status = "awaiting_finality";
+          this.state.save();
+          return;
+        }
+        rec.status = "releasing";
+        rec.releaseFromBlock ??= await this.eth.provider.getBlockNumber();
+        this.state.save();
+        const ata = ataAddress(rec.solAddress, rec.solMint, TOKEN_PROGRAM);
+        const recipient = `0x${Buffer.from(b58decode(ata)).toString("hex")}`;
+        const r = await this.payOut(rec, vault, [rec.amountUnits, 5, recipient, id, 0n], "releaseCctp");
+        if (r.paid || r.queued) this.applySolCctpOutcome(rec, mapping, r, tag);
+        else if (r.revert) await this.parkRevert(rec, r.revert, vault, null, rec.amountUnits, "redemption", tag);
+      }
+    }
+    if (["released", "destroy_pending", "destroying"].includes(rec.status)) {
+      await this.destroyRedeemed(rec, mapping, rec.ticker ?? mapping.symbol);
+    }
+  }
+
+  applySolCctpOutcome(rec, mapping, o, tag) {
+    rec.tokenKey = rec.payTokenKey; // the escrow that paid is the Ethereum one
+    rec.ethAddress ??= null;
+    rec.viaCctp = true;
+    rec.destinationDomain = 5;
+    this.applyReleaseOutcome(rec, o, tag, mapping);
+  }
+
   /** Destroy the returned amount after a release, so circulating supply
    *  keeps matching what the source chains hold. Used by every leg.
    *
@@ -2764,7 +2926,7 @@ export class Bridge {
       try {
         if (["awaiting_finality", "awaiting_liquidity", "halted"].includes(rec.status)) {
           await this.handleSolRedemption(rec);
-        } else if (["new", "releasing", "released", "destroy_pending", "destroying"].includes(rec.status)) {
+        } else if (["new", "releasing", "release_paused", "queued", "released", "destroy_pending", "destroying"].includes(rec.status)) {
           const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
           if (mapping) await this.releaseSolRedemption(rec, mapping);
         }

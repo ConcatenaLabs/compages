@@ -303,6 +303,34 @@ message, paid for from the treasury. Circle's program lets the payer close it
 five days after the burn; the daemon does so automatically, with the same
 persist-before-broadcast guard, and the rent returns to the treasury.
 
+### USDC from and to other chains
+
+USDC.e is one asset whichever chain the dollar came from, and Circle's
+Cross-Chain Transfer Protocol (CCTP) connects the bridge to every chain
+Circle supports, not only Ethereum and Solana:
+
+- **In.** On any chain in the bridge's CCTP list (`GET /api/status`, `cctp`),
+  a user burns USDC with Circle's TokenMessenger, naming the deposit vault as
+  mint recipient and as the only relayer, with hookData
+  `compages:deposit:<Sequentia address>`. The page builds that call and
+  reports the burn (`POST /api/cctp/deposit`); the daemon waits for Circle's
+  attestation and relays it through the vault's `receiveCctp`, which mints the
+  USDC into the vault and emits an ordinary deposit. From there it is minted
+  as USDC.e like any other deposit. A burn with an invalid Sequentia address,
+  or hookData the vault does not recognise, is refunded to the chain and
+  sender it came from (`refundViaCctp`).
+- **Out.** A redemption address can name another CCTP chain as its
+  destination (`POST /api/redeem` with `destinationDomain`). USDC.e returned
+  to it is paid out there: the vault burns the USDC (`releaseViaCctp`) for
+  minting to the recipient, and the redemption record carries `cctpOut` with
+  Circle's attestation once it exists, so the recipient (or anyone) can
+  complete the mint on that chain with `receiveMessage`. Any other asset
+  returned to such an address is paid on Ethereum, to the same address.
+- **Solana.** A USDC.e redemption to Solana that the Solana float cannot
+  cover is paid out of the Ethereum vault the same way, and the daemon relays
+  the mint on Solana itself (creating the recipient's USDC account first when
+  it has none).
+
 ### The vault contract
 
 `CompagesVault` (`contracts/src/CompagesVault.sol`) holds the Ethereum-side
@@ -526,6 +554,8 @@ their progress toward finality as numbers (`finalityProgress`:
 | `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
 | `GET /api/sol/redeem/<seqAddress>` | A Solana unwrap address's bound Solana destination and the status of every redemption seen on it |
 | `GET /api/sol/intents` | The Solana treasury and every deposit address the bridge has handed out, for anyone checking the Solana escrow |
+| `POST /api/cctp/deposit` `{"sourceDomain": 6, "txHash": "0x..."}` | Report a USDC burn made on another CCTP chain for relaying (see "USDC from and to other chains") |
+| `GET /api/cctp/deposit/<domain>/<txHash>` | Where a reported burn stands (`attesting`, `relaying`, `relayed`, `not_found`, `not_for_bridge`) and the deposit it became |
 | `GET /api/redeem/by-eth/<ethAddress>` | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one |
 | `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, and whether it is a blinded one; checked before any funds move |
 | `GET /api/health` | The operator's health report (see "Watch it and act on what it reports"); HTTP 503 while anything critical is wrong |
@@ -630,7 +660,7 @@ Configuration reference (`daemon/config.example.json`):
 | `solKeyFile` | 32-byte hex seed for the Solana treasury and deposit-address derivation; generated on first boot, never commit it |
 | `solWatchDays` | How long a wrap intent's deposit address is polled (default 7 days); re-requesting a wrap for the same Sequentia address revives it |
 | `solMinReleaseSats` | Smallest SOL.s return that is released (default 100000 sats = 0.001 SOL, clear of Solana's rent-exempt minimum) |
-| `cctp` | Moving unified-stablecoin escrow from Solana into the Ethereum vault through Circle's CCTP V2: `enabled`, `messageTransmitter` (Circle's MessageTransmitterV2 on the Ethereum chain), `irisUrl` (Circle's attestation service; the sandbox by default), `assets` (default `["USDC"]`), `solFloatUnits` (what stays on Solana for releases there, default 5 USDC), `minConsolidateUnits`, `consolidateEveryMinutes`, `stuckHours` |
+| `cctp` | Circle's CCTP V2 for the unified stablecoins: consolidating Solana escrow into the Ethereum vault, USDC in from and out to other CCTP chains. `enabled`, `chains` (the other chains, each `{domain, name, chainId, usdc, rpc, explorer}`; the testnets by default), `tokenMessengerEvm` (Circle's TokenMessengerV2, the same address on every EVM chain), `inboundGiveUpHours`, `messageTransmitter` (Circle's MessageTransmitterV2 on the Ethereum chain), `irisUrl` (Circle's attestation service; the sandbox by default), `assets` (default `["USDC"]`), `solFloatUnits` (what stays on Solana for releases there, default 5 USDC), `minConsolidateUnits`, `consolidateEveryMinutes`, `stuckHours` |
 | `unified` | Unified stablecoins, keyed by symbol: `name`, `ticker`, `precision`, `supervision` and the `sources` (one per chain) that all mint into the one asset (see "Unified stablecoins") |
 | `unifiedIssuerPubkey` | Pinned 33-byte compressed pubkey the bridge wallet controls; hashed into every unified asset id and later authorizes handing the asset to its issuer. Generate once, back up, never change |
 | `supervision` (per unified asset) | `enabled` issues the asset as a node-level supervised asset; `pause` additionally allows stopping every holding. Both permanent. `operationalKey`/`recoveryKey` pin the public keys; unset, the daemon derives them from the node wallet once |
