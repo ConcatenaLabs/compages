@@ -10,7 +10,7 @@ import { payloadHash, signSnapshot, verifyChain } from "./format.mjs";
 import { readAll, writeSnapshotOnce, writeIndex } from "./store.mjs";
 import { chooseHeight, unitsToAtoms, supplyFromAudit, backedVerdict, lastBlockAtOrBefore } from "./figures.mjs";
 import { runAudit, fileSha256, gitCommitOf } from "./audit.mjs";
-import { seqClient, ethProvider, vaultFigures, solClient, escrowAccounts, readSolanaAccounts, heldUnits, checkBurn } from "./chains.mjs";
+import { seqClient, ethProvider, vaultFigures, solClient, escrowAccounts, readSolanaAccounts, heldUnits, checkTransfer } from "./chains.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const TOOL_VERSION = JSON.parse(fs.readFileSync(path.join(here, "..", "package.json"), "utf8")).version;
@@ -31,6 +31,13 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
   const interval = cfg.intervalBlocks ?? 1440;
   const minDepth = cfg.minDepth ?? 10;
   const dir = cfg.snapshotDir;
+  // Every vault's interface version is configuration, never asked of the
+  // vault: an RPC backend without the state at B answers VERSION() the way an
+  // older vault does, and taking a version-3 vault for an older one would
+  // count its owed and queued payouts as backing.
+  for (const v of cfg.vaults) {
+    if (!Number.isInteger(v.version)) throw new Error(`vault ${v.address} has no "version" in the configuration`);
+  }
 
   // The history this snapshot extends must itself be intact: a snapshot
   // linked to a tampered predecessor would lend it a fresh signature.
@@ -132,7 +139,7 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
         if (String(s.chainId) === String(cfg.ethChainId)) {
           const token = s.token === "eth" ? ethers.ZeroAddress : s.token;
           for (const v of cfg.vaults) {
-            const f = await vaultFigures(eth, v.address, token, blockB.number);
+            const f = await vaultFigures(eth, v.address, token, blockB.number, v.version);
             src.holdings.push(f);
             units += BigInt(f.backing);
           }
@@ -144,11 +151,25 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
           }
           // Unified USDC moves between its escrows through CCTP: burned on
           // Solana, then minted into the vault. In between it is in neither
-          // balance, yet still backs the asset.
+          // balance, yet still backs the asset. The daemon lists recent
+          // transfers, not only those in flight now, because the question is
+          // which were in flight at H: burned before the Solana read, not yet
+          // received on Ethereum at block B. Both halves are checked on chain.
           if (m.unified && m.sources.some((x) => String(x.chainId) === String(cfg.ethChainId))) {
             const por = await daemonJson(cfg, `/api/por?asset=${m.assetId}`);
-            for (const b of por.assets?.[0]?.inTransit ?? []) {
-              const c = await checkBurn(sol, b, { mint: s.token, treasury: solana.treasury, readSlot: solana.slot });
+            const listed = por.assets?.[0]?.recentTransfers ?? por.assets?.[0]?.inTransit ?? [];
+            for (const b of listed) {
+              const c = await checkTransfer({
+                sol,
+                eth,
+                burn: b,
+                mint: s.token,
+                treasury: solana.treasury,
+                readSlot: solana.slot,
+                blockB: blockB.number,
+                irisUrl: cfg.irisUrl,
+                transmitter: cfg.cctpMessageTransmitter,
+              });
               inTransit.push(c);
               if (c.counted) inTransitAtoms += unitsToAtoms(c.amount, s.decimals, precision);
             }

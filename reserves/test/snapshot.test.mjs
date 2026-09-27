@@ -15,7 +15,7 @@ import { verifySnapshot, verifyChain, fileText } from "../lib/format.mjs";
 import { readSnapshot } from "../lib/store.mjs";
 import { checkFigures } from "../lib/consistency.mjs";
 import { escrowAccounts } from "../lib/chains.mjs";
-import { mockSequentia, mockEthereum, mockSolana, mockDaemon, tokenAccount } from "./mocks.mjs";
+import { mockSequentia, mockEthereum, mockSolana, mockDaemon, tokenAccount, mockIris, cctpMessage } from "./mocks.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const key = ethers.Wallet.createRandom(); // a throwaway test key
@@ -42,11 +42,18 @@ const auditEntry = (circ) => ({
   blinded_burns: 0,
 });
 
+const TRANSMITTER_ADDR = "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275";
+const NONCE_DONE = `0x${"d0".repeat(32)}`;
+const NONCE_BURN = `0x${"b1".repeat(32)}`;
+
 async function world() {
   const seq = await mockSequentia();
   const { chain } = seq;
   const eth = await mockEthereum({
     t0: chain.t0,
+    transmitter: TRANSMITTER_ADDR,
+    // DONE's message was received on Ethereum at block 0, before any B.
+    nonces: { [NONCE_DONE]: 0 },
     vaults: {
       [V3]: {
         deployedAt: 100,
@@ -64,6 +71,14 @@ async function world() {
     slot: 100,
     accounts: { [tAta.account]: tokenAccount(TREASURY, MINT, 3_000_000), [iAta.account]: tokenAccount(INTENT, MINT, 1_000_000) },
     transactions: {
+      DONE: {
+        slot: 80,
+        meta: {
+          err: null,
+          preTokenBalances: [{ mint: MINT, owner: TREASURY, uiTokenAmount: { amount: "7000000" } }],
+          postTokenBalances: [{ mint: MINT, owner: TREASURY, uiTokenAmount: { amount: "2000000" } }],
+        },
+      },
       BURN: {
         slot: 90,
         meta: {
@@ -101,6 +116,20 @@ async function world() {
     ],
     intents: { treasury: TREASURY, addresses: [INTENT] },
     inTransit: { [U]: [{ id: "c1", amount: "1000000", solanaBurn: "BURN", stage: "attesting" }] },
+    // The daemon's week of consolidations: one still in flight, one that
+    // Ethereum had received long before B and is in the vault's balance.
+    recentTransfers: {
+      [U]: [
+        { id: "c0", amount: "5000000", solanaBurn: "DONE", stage: "done" },
+        { id: "c1", amount: "1000000", solanaBurn: "BURN", stage: "relaying" },
+      ],
+    },
+  });
+  const iris = await mockIris({
+    messages: {
+      DONE: cctpMessage({ nonce: NONCE_DONE, amount: 5_000_000n }),
+      BURN: cctpMessage({ nonce: NONCE_BURN, amount: 1_000_000n }),
+    },
   });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "reserves-e2e-"));
   const auditLog = path.join(dir, "audit-args.json");
@@ -116,7 +145,9 @@ async function world() {
     ethChainId: 11155111,
     ethChainName: "Sepolia",
     ethRpcUrl: eth.url,
-    vaults: [{ address: V1 }, { address: LATE }, { address: V3 }],
+    vaults: [{ address: V1, version: 1 }, { address: LATE, version: 3 }, { address: V3, version: 3 }],
+    irisUrl: iris.url,
+    cctpMessageTransmitter: TRANSMITTER_ADDR,
     solRpcUrl: sol.url,
     solChainLabel: "solana-devnet",
     solTreasury: TREASURY,
@@ -125,7 +156,7 @@ async function world() {
   process.env.FAKE_AUDIT_LOG = auditLog;
   process.env.FAKE_AUDIT_EXIT = "0";
   process.env.FAKE_AUDIT_REPORT = JSON.stringify({ assets: { [U]: auditEntry(20_000_000), [E]: auditEntry(50_000_000) } });
-  const close = () => [seq, eth, sol, daemon].forEach((s) => s.server.close());
+  const close = () => [seq, eth, sol, daemon, iris].forEach((s) => s.server.close());
   return { seq, chain, eth: eth.eth, ethUrl: eth.url, sol: sol.sol, daemon: daemon.daemon, cfg, dir, auditLog, close };
 }
 
@@ -176,7 +207,15 @@ test("snapshots are taken, chained, skipped when current, and refused over a tam
   assert.equal(usdc.sources[1].escrowUnits, "4000000");
   assert.equal(usdc.escrowAtoms, "19000000");
   assert.equal(usdc.inTransitAtoms, "1000000");
-  assert.equal(usdc.inTransit[0].counted, true);
+  // The week's transfers, each judged on chain: DONE had reached Ethereum by
+  // B (its nonce was used) and is in the vault's balance; BURN had not.
+  assert.deepEqual(
+    usdc.inTransit.map((c) => [c.solanaBurn, c.counted, c.receivedByB, c.nonce]),
+    [
+      ["DONE", false, true, NONCE_DONE],
+      ["BURN", true, false, NONCE_BURN],
+    ]
+  );
   assert.equal(usdc.supply.circulatingAtoms, "20000000");
   assert.equal(usdc.backed, true);
   assert.equal(ether.escrowAtoms, "50000000", "0.5 ether in 8-decimal atoms");
@@ -312,4 +351,14 @@ test("a dry run signs and writes nothing", async (t) => {
   assert.equal(r.status, "dry-run");
   assert.equal(r.payload.height, 1440);
   assert.ok(!fs.existsSync(w.cfg.snapshotDir) || fs.readdirSync(w.cfg.snapshotDir).length === 0);
+});
+
+test("a vault without a configured version is refused before anything is read", async () => {
+  const w = await world();
+  try {
+    w.cfg.vaults = w.cfg.vaults.map(({ version, ...v }) => v);
+    await assert.rejects(run(w), /has no "version" in the configuration/);
+  } finally {
+    w.close();
+  }
 });

@@ -126,3 +126,33 @@ test("the consistency check recomputes every derived figure", () => {
   assert.match(bad((a) => (a.supply.burnedAtoms = "1")), /circulating 20000000 should be 19999999/);
   assert.match(bad((a) => (a.inTransit = [{ counted: true, amount: "5" }])), /inTransitAtoms 0 should be 5/);
 });
+
+test("a pinned vault version is used, so a backend without the state cannot make a v3 vault read long", async () => {
+  const { mockEthereum } = await import("./mocks.mjs");
+  const { ethProvider, vaultFigures } = await import("../lib/chains.mjs");
+  const { ethers } = await import("ethers");
+  const VAULT = ethers.getAddress("0x00000000000000000000000000000000000000a1");
+  const USDC = ethers.getAddress("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+  // A version-3 vault holding 7 with 2 owed, behind a backend whose answer
+  // to VERSION() is a data-less revert, as when it lacks the state at B.
+  const { eth, server, url } = await mockEthereum({
+    finalized: 100,
+    vaults: {
+      [VAULT]: { deployedAt: 1, version: 3, versionError: true, tokens: { [USDC]: () => 7n }, reserved: (fn) => (fn === "owedTotal" ? 2n : 0n) },
+    },
+  });
+  try {
+    const provider = ethProvider(url, eth.chainId);
+    const asked = await vaultFigures(provider, VAULT, USDC, 50);
+    assert.equal(asked.backing, "7", "asked, the failure reads as an older vault and the owed payout as backing");
+    eth.calls.length = 0;
+    const pinned = await vaultFigures(provider, VAULT, USDC, 50, 3);
+    assert.equal(pinned.version, 3);
+    assert.equal(pinned.owed, "2");
+    assert.equal(pinned.backing, "5");
+    const older = await vaultFigures(provider, VAULT, USDC, 50, 1);
+    assert.equal(older.version, null, "an older vault is recorded as having no VERSION()");
+  } finally {
+    server.close();
+  }
+});

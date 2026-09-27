@@ -26,7 +26,12 @@
 //   --seq-rpc URL        block H's hash and the genesis hash (http://user:pass@host:port)
 //   --audit-script PATH  with --seq-rpc: rerun the supply auditor to H and
 //                        compare every supply figure (a full scan)
-//   --sol-rpc URL        the cluster's genesis hash and every counted CCTP burn
+//   --sol-rpc URL        the cluster's genesis hash and every listed CCTP
+//                        transfer's burn; with --eth-rpc as well, whether each
+//                        was still in flight at block B (its CCTP nonce, from
+//                        Circle's attestation service, unused at B)
+//   --iris-url URL       Circle's attestation service (default: the sandbox)
+//   --transmitter 0x...  Circle's MessageTransmitterV2 on the Ethereum chain
 // Solana balances cannot be re-derived: Solana's RPC answers only for the
 // current state, never for a past slot.
 //
@@ -40,7 +45,7 @@ import { listHeights, readSnapshot } from "./lib/store.mjs";
 import { checkFigures } from "./lib/consistency.mjs";
 import { supplyFromAudit } from "./lib/figures.mjs";
 import { runAudit } from "./lib/audit.mjs";
-import { seqClient, ethProvider, vaultFigures, solClient, checkBurn } from "./lib/chains.mjs";
+import { seqClient, ethProvider, vaultFigures, solClient, checkBurn, checkTransfer } from "./lib/chains.mjs";
 
 function parseArgs(argv) {
   const o = { target: null };
@@ -152,7 +157,22 @@ async function rederive(snap) {
       for (const a of p.assets) {
         const s = a.sources.find((x) => x.chainId === p.solana.cluster);
         for (const b of a.inTransit ?? []) {
-          const c = await checkBurn(sol, b, { mint: s.token, treasury: p.solana.treasury, readSlot: p.solana.slot });
+          // With an Ethereum RPC the whole rule is re-derived: burned before
+          // the Solana read AND not received by block B. Without one, only
+          // the burn half can be.
+          const c = opts.ethRpc
+            ? await checkTransfer({
+                sol,
+                eth: ethProvider(opts.ethRpc, p.ethereum.chainId),
+                burn: b,
+                mint: s.token,
+                treasury: p.solana.treasury,
+                readSlot: p.solana.slot,
+                blockB: p.ethereum.block,
+                irisUrl: opts.irisUrl,
+                transmitter: opts.transmitter,
+              })
+            : await checkBurn(sol, b, { mint: s.token, treasury: p.solana.treasury, readSlot: p.solana.slot });
           if (c.counted === b.counted) ok(`${a.ticker ?? a.symbol}: CCTP burn ${b.solanaBurn} ${c.counted ? "counted" : "not counted"}`);
           else bad(`${a.ticker ?? a.symbol}: CCTP burn ${b.solanaBurn}: ${c.reason ?? "checks out"}, but the snapshot ${b.counted ? "counts" : "does not count"} it`);
         }
