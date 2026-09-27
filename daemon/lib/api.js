@@ -32,6 +32,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       return { token, tokenKey: key, ...publicMapping(mapping), bridged: true };
     }
     if (!metaCache.has(token)) {
+      if (metaCache.size > 2000) metaCache.clear();
       metaCache.set(
         token,
         eth.tokenMetadata(token).catch((e) => {
@@ -62,6 +63,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         escrowedUnits: s.escrowedUnits ?? "0",
       })),
       precision: m.precision ?? 8,
+      // A supervised asset can be frozen by its issuer and is never blinded,
+      // so a confidential destination receives it at its unconfidential form.
+      supervised: Boolean(m.supervision?.supervised),
       retired: m.retired ?? null,
       token: m.token,
       symbol: m.symbol,
@@ -83,15 +87,17 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   // behind a reverse proxy it trusts (`trustProxy`).
   const hits = new Map(); // ip -> { windowStart, count }
   function clientIp(req) {
+    let ip = req.socket.remoteAddress ?? "unknown";
     if (cfg.trustProxy) {
       const fwd = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
-      if (fwd) return fwd;
+      if (fwd) ip = fwd;
     }
-    return req.socket.remoteAddress ?? "unknown";
+    // One IPv6 client owns a whole /64; count it as one.
+    if (ip.includes(":") && !ip.startsWith("::ffff:")) ip = ip.split(":").slice(0, 4).join(":") + "::/64";
+    return ip;
   }
-  function overLimit(req) {
-    const limit = cfg.intentLimitPerHour ?? 30;
-    const ip = clientIp(req);
+  function overLimit(req, bucket = "intent", limit = cfg.intentLimitPerHour ?? 30) {
+    const ip = `${bucket}:${clientIp(req)}`;
     const now = Date.now();
     let h = hits.get(ip);
     if (!h || now - h.windowStart > 3_600_000) {
@@ -145,7 +151,14 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           delete r.deliveryFinal;
         }
         for (const k of ["pendingIssue", "pendingMint", "pendingSend", "issueCandidate", "mintCandidate", "sendCandidate"]) delete st[k];
-        r.status = st.issueTxid || st.mintTxid ? "send_retry" : r.status === "refund_failed_manual" ? "refund_pending" : "mint_retry";
+        // A record on its way back to its depositor stays on that path: sending
+        // it to minting while a refund may still be reinstated on the vault
+        // would pay the depositor on both chains.
+        r.status = String(before).startsWith("refund")
+          ? "refund_pending"
+          : st.issueTxid || st.mintTxid
+            ? "send_retry"
+            : "mint_retry";
       } else if (r.status === "destroy_manual") {
         delete r.pendingDestroy;
         delete r.burn;
@@ -161,6 +174,23 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     state.save();
     log(`admin: ${action} ${group}/${key} (${before} -> ${r.status})`);
     return r;
+  }
+
+  // Error text can carry an RPC endpoint, API key included (ethers puts the
+  // request URL into its messages). What the public API returns is scrubbed
+  // of URLs in every error-like field.
+  const ERROR_FIELDS = new Set(["error", "lastError", "detail", "waiting", "reason", "finality"]);
+  function scrub(v, key = null) {
+    if (typeof v === "string") {
+      return key && ERROR_FIELDS.has(key) ? v.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>,;)]+/gi, "<url>") : v;
+    }
+    if (Array.isArray(v)) return v.map((x) => scrub(x, key));
+    if (v && typeof v === "object") {
+      const out = {};
+      for (const [k, x] of Object.entries(v)) out[k] = scrub(x, k);
+      return out;
+    }
+    return v;
   }
 
   function publicDeposit(d) {
@@ -346,7 +376,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
 
     const send = (code, obj) => {
       res.writeHead(code, { "content-type": "application/json" });
-      res.end(JSON.stringify(obj, null, 1));
+      res.end(JSON.stringify(scrub(obj), null, 1));
     };
 
     try {
@@ -415,6 +445,12 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         }
       }
 
+      // The reads that cost the bridge RPC calls get a limit of their own.
+      const isHeavyRead =
+        req.method === "GET" && ["por", "seqaddress", "token", "health"].includes(parts[1]);
+      if (isHeavyRead && overLimit(req, "read", cfg.readLimitPerHour ?? 1200)) {
+        return send(429, { error: "too many requests from this address; try again later" });
+      }
       const isIntent =
         req.method === "POST" &&
         (parts[1] === "redeem" ||
@@ -790,7 +826,12 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         } catch {
           return send(400, { error: "invalid Ethereum address" });
         }
-        const entry = Object.entries(state.data.redeemIntents).find(([, it]) => it.ethAddress === ethAddress);
+        // ?domain=N asks for the address that pays out on that chain; without
+        // it, the first one found.
+        const wantDomain = url.searchParams.has("domain") ? Number(url.searchParams.get("domain")) : null;
+        const entry = Object.entries(state.data.redeemIntents).find(
+          ([, it]) => it.ethAddress === ethAddress && (wantDomain === null || Number(it.destinationDomain ?? 0) === wantDomain)
+        );
         if (!entry) return send(404, { error: "no redemption address for this Ethereum address yet" });
         const [seqAddress, intent] = entry;
         const redemptions = Object.values(state.data.redemptions).filter((r) => r.seqAddress === seqAddress);

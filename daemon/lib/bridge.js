@@ -751,7 +751,10 @@ export class Bridge {
     if (ev.args.from === ethers.ZeroAddress && vaultAddress) {
       const vault = this.eth.vaultFor(vaultAddress);
       const receipt = await this.eth.provider.getTransactionReceipt(ev.transactionHash);
-      for (const log of receipt?.logs ?? []) {
+      // Without the receipt the deposit's source is unknown, and a refund
+      // would have nowhere to go: retry the scan rather than record it so.
+      if (!receipt) throw new Error(`receipt of ${ev.transactionHash} not available yet`);
+      for (const log of receipt.logs ?? []) {
         let e;
         try {
           e = vault.interface.parseLog(log);
@@ -870,6 +873,17 @@ export class Bridge {
 
     let mapping = s.mappings[mappingKey];
     if (!mapping) {
+      // Only one first issuance per token may be in flight. If another
+      // deposit's issuance of this token is still being settled, issuing here
+      // could create a second, rival asset.
+      const other = this.issuanceInFlight(mappingKey, dep);
+      if (other) {
+        dep.waiting = `waiting for ${other.tag ?? `deposit #${other.nonce}`}'s issuance of this token to settle`;
+        dep.status = "mint_retry";
+        dep.nextAttemptAt = new Date(Date.now() + 60_000).toISOString();
+        this.state.save();
+        return null;
+      }
       // Anyone can create a token and bridge it, and each first bridge makes
       // the operator issue and register a new asset. Cap how many per day so
       // that cannot be turned into an unbounded fee and registry bill.
@@ -967,11 +981,42 @@ export class Bridge {
     return mapping;
   }
 
+  /** The key a deposit's token maps to, on either leg. */
+  depositTokenKey(d) {
+    if (d.tokenKey) return d.tokenKey;
+    const label = this.cfg.solChainLabel ?? "solana-devnet";
+    return !d.mint || d.mint === "sol" ? this.solTokenKey() : `${label}:${d.mint}`;
+  }
+
+  /** Another deposit whose first issuance of `mappingKey` is in flight or
+   *  unsettled (recorded, or interrupted before it could be), or null. */
+  issuanceInFlight(mappingKey, self) {
+    const s = this.state.data;
+    for (const d of [...Object.values(s.deposits), ...Object.values(s.solDeposits)]) {
+      if (d === self || !d.steps) continue;
+      const c = d.steps.issueCandidate;
+      if (c ? c.mappingKey === mappingKey : d.steps.pendingIssue && this.mappingKeyFor(this.depositTokenKey(d)) === mappingKey) {
+        return d;
+      }
+    }
+    return null;
+  }
+
   /** Record a confirmed first issuance: create the mapping, clear the marker. */
   finishIssue(dep) {
     const s = this.state.data;
     const c = dep.steps.issueCandidate;
     const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    const existing = s.mappings[c.mappingKey];
+    if (existing && existing.assetId !== c.asset) {
+      // Never overwrite a token's asset. This cannot happen while the
+      // in-flight guard holds; if it ever does, a person must look.
+      dep.status = "failed_manual";
+      dep.error = `issuance ${c.txid} created asset ${c.asset}, but ${c.mappingKey} already maps to ${existing.assetId}`;
+      this.state.save();
+      this.log(`${tag}: ${dep.error}`);
+      return existing;
+    }
     const mapping = {
       tokenKey: c.tokenKey,
       chainId: c.origin.chainId,
@@ -1329,6 +1374,15 @@ export class Bridge {
       }
       return;
     }
+    // Consensus never lets a supervised asset sit in a blinded output
+    // (bad-txns-supervised-blinded), so a confidential destination for one
+    // is delivered to the same script without its blinding key. Sending to
+    // the confidential form would be refused on every attempt.
+    const deliverTo = await this.deliveryAddress(dep.seqAddress, mapping);
+    if (deliverTo !== dep.seqAddress && dep.deliveredTo !== deliverTo) {
+      dep.deliveredTo = deliverTo;
+      this.log(`${tag}: ${mapping.symbol} is supervised and never blinded; delivering to ${deliverTo}`);
+    }
     dep.steps.pendingSend = true;
     this.state.save();
     let sendTxid;
@@ -1337,7 +1391,7 @@ export class Bridge {
       // asset being sent (a bridged asset the node has no exchange rate for),
       // so pin the fee to the asset the operator wallet holds for fees.
       sendTxid = await this.seq.call("sendtoaddress", {
-        address: dep.seqAddress,
+        address: deliverTo,
         amount: satsToAmount(dep.sats),
         assetlabel: mapping.assetId,
         ...(this.cfg.seqFeeAsset ? { fee_asset_label: this.cfg.seqFeeAsset } : {}),
@@ -1473,7 +1527,10 @@ export class Bridge {
               "refundCctp"
             )
           : await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id], "refund");
-        if (r.revert) await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
+        if (r.halted) {
+          dep.status = "refund_pending";
+          this.state.save();
+        } else if (r.revert) await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
         else if (r.paid || r.queued) this.applyRefundOutcome(dep, r, tag);
       } catch (e) {
         this.log(`${tag}: refund attempt failed: ${e.message}`);
@@ -1492,6 +1549,11 @@ export class Bridge {
       rec.executeAfter = new Date(o.queued * 1000).toISOString();
       if (o.block) rec.queuedBlock = o.block;
       this.log(`${tag}: over the vault's rate limit; queued until ${rec.executeAfter}`);
+    } else if (o.discarded) {
+      // Discarded by the vault's owner: never payable. Nothing is burned; a
+      // person decides what happens to the returned amount.
+      rec.status = "release_discarded";
+      this.log(`${tag}: the queued release was discarded on the vault; an operator must decide`);
     } else if (o.cancelled) {
       rec.status = "release_cancelled";
       this.log(`${tag}: the queued release was cancelled on the vault; an operator must decide`);
@@ -1499,6 +1561,7 @@ export class Bridge {
       rec.status = "released";
       rec.releaseTxHash ??= o.paid ?? null;
       if (o.deferred) rec.deferred = o.deferred;
+      if (o.viaCctp) rec.viaCctp = true;
       // Burned here for minting on another chain: follow it until claimed.
       if (rec.viaCctp && rec.releaseTxHash && !rec.cctpOut) {
         rec.cctpOut = {
@@ -1521,7 +1584,10 @@ export class Bridge {
     delete dep.ethTx;
     delete dep.waiting;
     if (o.queued && o.block) dep.queuedBlock = o.block;
-    if (o.queued) {
+    if (o.discarded) {
+      dep.status = "refund_discarded";
+      this.log(`${tag}: the queued refund was discarded on the vault; an operator must decide`);
+    } else if (o.queued) {
       dep.status = "refund_queued";
       dep.executeAfter = new Date(o.queued * 1000).toISOString();
       this.log(`${tag}: refund over the vault's rate limit; queued until ${dep.executeAfter}`);
@@ -1551,6 +1617,14 @@ export class Bridge {
    *    {}                                 sent, not mined yet (held as ethTx)
    *  `kind` "refund" uses refund() on a vault that has it. */
   async payOut(rec, vault, args, kind = "release") {
+    // A halt stops every payout, wherever it is in its life: checked right
+    // before sending, not only when the record was first handled.
+    const halted = rec.assetId ? this.haltedReason(rec.assetId, "release") : null;
+    if (halted) {
+      rec.waiting = halted;
+      this.state.save();
+      return { halted };
+    }
     const v3 = (await this.eth.vaultVersion(vault)) >= 3;
     const method =
       kind === "refundCctp" ? "refundViaCctp" : kind === "releaseCctp" ? "releaseViaCctp" : v3 && kind === "refund" ? "refund" : "release";
@@ -1590,12 +1664,24 @@ export class Bridge {
     const state = Number(q.state);
     if (state === 1) return { queued: Number(q.executeAfter) };
     if (state === 2) return { cancelled: true };
-    // Paid: look for an owed amount, which the page must tell the user about.
+    if (state === 4) return { discarded: true };
+    // Paid, possibly as an owed amount, possibly by a CCTP burn. The events
+    // say which, and carry the transaction a cross-chain payout needs for its
+    // attestation. An unreadable range is an outage, not "nothing found".
     const from = fromBlock ?? Math.max(0, (await this.eth.provider.getBlockNumber()) - (this.cfg.ethLookbackBlocks ?? 250_000));
-    const deferred = await vault.queryFilter(vault.filters.ReleaseDeferred(id), from).catch(() => []);
+    const deferred = await vault.queryFilter(vault.filters.ReleaseDeferred(id), from);
     if (deferred.length) {
       const a = deferred[0].args;
       return { paid: deferred[0].transactionHash, deferred: { to: a.to, amount: a.amount.toString() } };
+    }
+    for (const [filter, viaCctp] of [
+      [vault.filters.ReleasedViaCctp(id), true],
+      [vault.filters.RefundedViaCctp(id), true],
+      [vault.filters.Released(id), false],
+      [vault.filters.Refunded(null, null, id), false],
+    ]) {
+      const evs = await vault.queryFilter(filter, from);
+      if (evs.length) return { paid: evs[0].transactionHash, viaCctp };
     }
     return { paid: null };
   }
@@ -1613,6 +1699,12 @@ export class Bridge {
     const apply = (x) => (kind === "refund" ? this.applyRefundOutcome(rec, x, tag) : this.applyReleaseOutcome(rec, x, tag));
     if (!o.queued) return apply(o);
     rec.executeAfter = new Date(o.queued * 1000).toISOString();
+    const halted = rec.assetId ? this.haltedReason(rec.assetId, "release") : null;
+    if (halted) {
+      rec.waiting = halted;
+      this.state.save();
+      return;
+    }
     // The vault measures the delay in block time, so ask the chain.
     const now = (await this.eth.provider.getBlock("latest")).timestamp;
     if (now < o.queued) return;
@@ -1854,13 +1946,28 @@ export class Bridge {
       return { final: false, reason: `burn not confirmed (${gt.confirmations} conf)`, depth: 0, need: null, kind: null };
     }
 
-    let anchor = null;
+    // An error reading the anchor is an answer of "not final yet", never "this
+    // chain has no anchoring": treating a busy node as an unanchored chain
+    // would drop the gate from Bitcoin-anchor depth to a few Sequentia blocks
+    // exactly when the node is under stress.
+    let anchor;
     try {
       anchor = await this.seq.node("getanchorstatus");
-    } catch {
-      anchor = null; // chain built without Bitcoin anchoring
+    } catch (e) {
+      // A chain configured as unanchored (a local test chain) answers this
+      // call with an error; anywhere else an error is only "not final yet".
+      if (!this.cfg.allowUnanchoredFinality) {
+        return { final: false, reason: `could not read the node's anchor status: ${e.message}`, depth: null, need: null, kind: "bitcoin" };
+      }
+      anchor = null;
     }
+    // A node that does not validate Bitcoin anchors cannot say how final
+    // anything is. Only a chain configured as unanchored (a local test chain)
+    // falls back to Sequentia confirmations.
     if (!anchor || anchor.validateanchor === false) {
+      if (!this.cfg.allowUnanchoredFinality) {
+        return { final: false, reason: "the node does not validate Bitcoin anchors", depth: null, need: null, kind: "bitcoin" };
+      }
       const need = this.cfg.seqConfirmations ?? 6;
       return {
         final: gt.confirmations >= need,
@@ -2010,11 +2117,19 @@ export class Bridge {
           rec.destinationDomain &&
           (await this.eth.vaultVersion(vault)) >= 3 &&
           String(tokenAddr).toLowerCase() === String(await vault.cctpUsdc()).toLowerCase();
+        // Recorded before sending, so a payout learned about later from the
+        // vault (a timeout, a crash) is still followed to its claim.
+        if (viaCctp) {
+          rec.viaCctp = true;
+          this.state.save();
+        }
         const r = viaCctp
           ? await this.payOut(rec, vault, [rec.amountUnits, rec.destinationDomain, ethers.zeroPadValue(rec.ethAddress, 32), id, 0n], "releaseCctp")
           : await this.payOut(rec, vault, [tokenAddr, rec.ethAddress, rec.amountUnits, id]);
-        if (viaCctp) rec.viaCctp = true;
-        if (r.paid || r.queued) {
+        if (r.halted) {
+          rec.status = "halted";
+          this.state.save();
+        } else if (r.paid || r.queued) {
           this.applyReleaseOutcome(rec, r, tag, mapping);
         } else if (r.revert) {
           await this.parkRevert(rec, r.revert, vault, tokenAddr, rec.amountUnits, "redemption", tag);
@@ -2685,6 +2800,9 @@ export class Bridge {
         const treasuryBal = await this.sol.balance(treasury.address);
         if (isNative) {
           if (treasuryBal < units + FEE_LAMPORTS + RENT_EXEMPT_MIN_LAMPORTS) {
+            rec.status = "awaiting_liquidity";
+            rec.waiting = `the Solana treasury holds ${treasuryBal} lamports for a ${units} release`;
+            this.state.save();
             this.log(`sol redemption ${rec.key}: treasury underfunded (${treasuryBal} lamports for a ${units} release); waiting`);
             return;
           }
@@ -2697,9 +2815,21 @@ export class Bridge {
             .filter((t) => t.mint === src.token)
             .reduce((a, t) => a + t.amount, 0n);
           if (held < units) {
+            // Back to the liquidity gate, which can pay a unified stablecoin
+            // from the Ethereum vault through CCTP instead.
+            rec.status = "awaiting_liquidity";
+            rec.waiting = `the Solana treasury holds ${held} of ${mapping.symbol}, needs ${units}`;
+            this.state.save();
             this.log(`sol redemption ${rec.key}: treasury holds ${held} of ${mapping.symbol}, needs ${units}; waiting`);
             return;
           }
+        }
+        const halted = this.haltedReason(rec.assetId, "release");
+        if (halted) {
+          rec.status = "halted";
+          rec.waiting = halted;
+          this.state.save();
+          return;
         }
         rec.attempts = (rec.attempts ?? 0) + 1;
         if (rec.attempts > 10) {
@@ -2774,6 +2904,8 @@ export class Bridge {
     } else if (["new", "releasing", "release_paused"].includes(rec.status)) {
       if (await vault.processedRedemptions(id)) {
         this.applySolCctpOutcome(rec, mapping, await this.settledOutcome(vault, id, rec.releaseFromBlock), tag);
+      } else if (rec.status === "releasing" && (await this.settleSentTx(rec, tag)) === "wait") {
+        return; // a send is still pending; replaced if stuck, never re-sent beside it
       } else {
         const fin = await this.burnFinality(rec.txid);
         if (!fin.final) {
@@ -2788,7 +2920,10 @@ export class Bridge {
         const ata = ataAddress(rec.solAddress, rec.solMint, TOKEN_PROGRAM);
         const recipient = `0x${Buffer.from(b58decode(ata)).toString("hex")}`;
         const r = await this.payOut(rec, vault, [rec.amountUnits, 5, recipient, id, 0n], "releaseCctp");
-        if (r.paid || r.queued) this.applySolCctpOutcome(rec, mapping, r, tag);
+        if (r.halted) {
+          rec.status = "halted";
+          this.state.save();
+        } else if (r.paid || r.queued) this.applySolCctpOutcome(rec, mapping, r, tag);
         else if (r.revert) await this.parkRevert(rec, r.revert, vault, null, rec.amountUnits, "redemption", tag);
       }
     }
@@ -3182,6 +3317,8 @@ export class Bridge {
       "delivery_reorged",
       "release_cancelled",
       "refund_cancelled",
+      "release_discarded",
+      "refund_discarded",
     ]);
     const records = {};
     for (const [group, list] of Object.entries({
@@ -3207,7 +3344,7 @@ export class Bridge {
             key: `records:${group}:${status}`,
             severity: "warning",
             title: `${live} ${group} record(s) need an operator (${status})`,
-            detail: `oldest since ${e.oldest}; see /api/admin/records?status=${status}`,
+            detail: `oldest since ${e.oldest}; admin.js records ${status}`,
           });
         } else if (status === "unresolved" && ageH > 1) {
           problems.push({
@@ -3227,6 +3364,26 @@ export class Bridge {
       }
     }
 
+    // Cross-chain work that has stopped moving: a payout to Solana the daemon
+    // must relay, a burn from another chain it cannot relay, a queued payout
+    // the vault refuses to execute.
+    const hoursSince = (t) => (t ? (now - Date.parse(t)) / 3_600_000 : 0);
+    for (const [group, list] of [["redemptions", s.redemptions], ["deposits", s.deposits], ["solRedemptions", s.solRedemptions]]) {
+      for (const [k, r] of Object.entries(list ?? {})) {
+        const o = r.cctpOut;
+        if (o && o.domain === 5 && o.stage !== "claimed" && hoursSince(r.releasedAt ?? r.createdAt) > 2) {
+          problems.push({ key: `cctpout:${group}:${k}`, severity: "warning", title: `a payout to Solana is not relayed yet (${group} ${k.slice(0, 16)})`, detail: o.error ?? `stage ${o.stage}` });
+        }
+        if (["queued", "refund_queued"].includes(r.status) && r.waiting && hoursSince(r.executeAfter) > 1) {
+          problems.push({ key: `queue:${group}:${k}`, severity: "warning", title: `a queued payout cannot execute (${group} ${k.slice(0, 16)})`, detail: r.waiting });
+        }
+      }
+    }
+    for (const [k, r] of Object.entries(s.cctpInbound ?? {})) {
+      if (["attesting", "relaying"].includes(r.stage) && r.waiting && hoursSince(r.createdAt) > 2) {
+        problems.push({ key: `cctpin:${k}`, severity: "warning", title: `a burn from domain ${r.sourceDomain} is not relayed yet`, detail: r.waiting });
+      }
+    }
     for (const r of Object.values(s.cctpTransfers ?? {})) {
       if (r.stage === "done") continue;
       const ageH = (now - Date.parse(r.createdAt)) / 3_600_000;
@@ -3278,12 +3435,28 @@ export class Bridge {
 
   /** Whether `address` is a valid Sequentia address, and whether it is a
    *  blinded (confidential) one. Both forms are accepted everywhere; the page
-   *  uses this to check an address before any funds move. */
+   *  uses this to check an address before any funds move. `unconfidential`
+   *  is where a supervised asset is delivered for a blinded address, since
+   *  supervised assets are never blinded. */
   async checkSeqAddress(address) {
     const v = await this.seq.node("validateaddress", { address });
+    const blinded = Boolean(v.isvalid && v.confidential_key);
     return {
       valid: Boolean(v.isvalid),
-      blinded: Boolean(v.isvalid && v.confidential_key),
+      blinded,
+      ...(blinded && v.unconfidential ? { unconfidential: v.unconfidential } : {}),
     };
+  }
+
+  /** Where a delivery of `mapping`'s asset to `address` goes. A supervised
+   *  asset cannot be sent to a blinded output, so a confidential address is
+   *  reduced to its unconfidential form: the same script, so the same owner,
+   *  with the amount visible on chain as it is for every supervised asset. */
+  async deliveryAddress(address, mapping) {
+    if (!mapping?.supervision?.supervised) return address;
+    const v = await this.seq.node("validateaddress", { address });
+    if (!v.isvalid || !v.confidential_key) return address;
+    if (!v.unconfidential) throw new Error(`node gave no unconfidential form for ${address}`);
+    return v.unconfidential;
   }
 }
