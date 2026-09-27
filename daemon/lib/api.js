@@ -662,6 +662,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             escrowedAtoms: escrowedAtoms === null ? null : escrowedAtoms.toString(),
             inTransitAtoms: transit.atoms.toString(),
             inTransit: transit.burns,
+            recentTransfers: bridge.cctp?.recentTransfers(m.assetId) ?? [],
             ledgerCirculatingAtoms: ledger.toString(),
             chainCirculatingAtoms: chainSupply,
             chainSupplyError: chainError,

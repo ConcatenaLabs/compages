@@ -583,4 +583,28 @@ export class Cctp {
     }
     return { atoms, burns };
   }
+
+  /** Consolidations of `assetId` still in flight or finished within
+   *  `withinMs`, with what identifies each on chain: the Solana burn and
+   *  the CCTP nonce. A reserve snapshot taken at a past height uses these
+   *  to find transfers that were in flight AT that height, which the
+   *  current in-flight list no longer shows once they have landed. */
+  recentTransfers(assetId, withinMs = 7 * 24 * 3600_000) {
+    const since = Date.now() - withinMs;
+    const out = [];
+    for (const r of Object.values(this.records)) {
+      if (r.assetId !== assetId || !r.burn?.signature) continue;
+      if (r.stage === "burning") continue; // nothing has left the treasury for certain yet
+      if (r.stage === "done" && Date.parse(r.doneAt ?? 0) < since) continue;
+      out.push({
+        id: r.id,
+        amount: r.amount,
+        solanaBurn: r.burn.signature,
+        nonce: r.nonce ?? null,
+        stage: r.stage,
+        doneAt: r.doneAt ?? null,
+      });
+    }
+    return out;
+  }
 }

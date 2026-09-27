@@ -75,6 +75,7 @@ export async function mockSequentia({ user = "u", password = "p" } = {}) {
 // ---- Ethereum -----------------------------------------------------------------
 
 const ERC20 = new ethers.Interface(["function balanceOf(address) view returns (uint256)"]);
+const TRANSMITTER = new ethers.Interface(["function usedNonces(bytes32) view returns (uint256)"]);
 const VAULT = new ethers.Interface([
   "function VERSION() view returns (uint256)",
   "function owedTotal(address) view returns (uint256)",
@@ -85,8 +86,10 @@ const VAULT = new ethers.Interface([
 /** Blocks 12 s apart from `t0`. `vaults[address] = { deployedAt, version,
  *  ether(n), tokens: { [token]: (n) => balance }, reserved: (fn, token, n)
  *  => amount }`. `finalized` is the finalized block number. */
-export async function mockEthereum({ chainId = 11155111, t0 = 1_700_000_000, vaults = {}, finalized = 0 } = {}) {
-  const eth = { chainId, t0, vaults, finalized, calls: [] };
+/** `transmitter`/`nonces`: Circle's MessageTransmitter at that address,
+ *  where nonces[nonce] is the block from which it counts as used. */
+export async function mockEthereum({ chainId = 11155111, t0 = 1_700_000_000, vaults = {}, finalized = 0, transmitter = null, nonces = {} } = {}) {
+  const eth = { chainId, t0, vaults, finalized, transmitter, nonces, calls: [] };
   const blockHash = (n) => ethers.id(`eth block ${n}`);
   const blockOf = (n) => ({
     number: ethers.toQuantity(n),
@@ -134,10 +137,18 @@ export async function mockEthereum({ chainId = 11155111, t0 = 1_700_000_000, vau
           const bal = v?.tokens?.[ethers.getAddress(to)]?.(n) ?? 0n;
           return ok(ERC20.encodeFunctionResult("balanceOf", [bal]));
         }
+        if (eth.transmitter && to.toLowerCase() === eth.transmitter.toLowerCase()) {
+          const [nonce] = TRANSMITTER.decodeFunctionData("usedNonces", data);
+          const from = eth.nonces[nonce.toLowerCase()];
+          return ok(TRANSMITTER.encodeFunctionResult("usedNonces", [from !== undefined && n >= from ? 1n : 0n]));
+        }
         const v = vaultAt(to);
-        if (!v || n < v.deployedAt || v.version === null) return revert();
+        if (!v || n < v.deployedAt || (v.version === null && !v.versionError)) return revert();
         const f = VAULT.parseTransaction({ data });
         if (!f) return revert();
+        // publicnode answers an older vault's missing VERSION() with a revert
+        // that carries no data, which ethers cannot classify as one.
+        if (f.name === "VERSION" && v.versionError) return [200, { jsonrpc: "2.0", id, error: { code: 3, message: "execution reverted" } }];
         if (f.name === "VERSION") return ok(VAULT.encodeFunctionResult("VERSION", [v.version]));
         const token = ethers.getAddress(f.args[0]);
         return ok(VAULT.encodeFunctionResult(f.name, [v.reserved?.(f.name, token, n) ?? 0n]));
@@ -183,14 +194,43 @@ export const tokenAccount = (owner, mint, amount) => ({
 
 // ---- the daemon ---------------------------------------------------------------
 
-export async function mockDaemon({ assets = [], intents = { treasury: null, addresses: [] }, inTransit = {} } = {}) {
-  const d = { assets, intents, inTransit };
+export async function mockDaemon({ assets = [], intents = { treasury: null, addresses: [] }, inTransit = {}, recentTransfers = null } = {}) {
+  const d = { assets, intents, inTransit, recentTransfers };
   const { server, url } = await serve(async (req) => {
     const u = new URL(req.url, "http://x");
     if (u.pathname === "/api/assets") return [200, d.assets];
     if (u.pathname === "/api/sol/intents") return [200, d.intents];
-    if (u.pathname === "/api/por") return [200, { assets: [{ inTransit: d.inTransit[u.searchParams.get("asset")] ?? [] }] }];
+    if (u.pathname === "/api/por") {
+      const a = u.searchParams.get("asset");
+      const row = { inTransit: d.inTransit[a] ?? [] };
+      if (d.recentTransfers) row.recentTransfers = d.recentTransfers[a] ?? [];
+      return [200, { assets: [row] }];
+    }
     return [404, { error: "not found" }];
   });
   return { daemon: d, server, url };
+}
+
+// ---- Circle's attestation service ------------------------------------------------
+
+/** A CCTP V2 burn message with `nonce`, `amount` and `feeExecuted` at the
+ *  offsets Circle's format puts them. */
+export function cctpMessage({ nonce, amount, feeExecuted = 0n }) {
+  const b = Buffer.alloc(148 + 228);
+  Buffer.from(nonce.slice(2), "hex").copy(b, 12);
+  Buffer.from(ethers.toBeHex(BigInt(amount), 32).slice(2), "hex").copy(b, 148 + 68);
+  Buffer.from(ethers.toBeHex(BigInt(feeExecuted), 32).slice(2), "hex").copy(b, 148 + 164);
+  return `0x${b.toString("hex")}`;
+}
+
+/** `messages[signature]` is the message Circle has attested for that Solana
+ *  burn; any other burn is unknown (404), as for a burn not yet attested. */
+export async function mockIris({ messages = {} } = {}) {
+  const { server, url } = await serve(async (req) => {
+    const u = new URL(req.url, "http://x");
+    const m = messages[u.searchParams.get("transactionHash")];
+    if (!u.pathname.startsWith("/v2/messages/5") || !m) return [404, { error: "Message not found" }];
+    return [200, { messages: [{ status: "complete", message: m, attestation: "0x00" }] }];
+  });
+  return { server, url };
 }

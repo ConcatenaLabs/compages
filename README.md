@@ -640,7 +640,7 @@ their progress toward finality as numbers (`finalityProgress`:
 |---|---|
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
 | `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`), and whether the asset is `supervised` (freezable by its issuer and never blinded) |
-| `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero |
+| `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero. A unified asset also lists its CCTP consolidations in flight (`inTransit`) and those of the last week (`recentTransfers`, each with its Solana burn and CCTP nonce) |
 | `GET /api/por/history` | The index of signed reserve snapshots (see "Signed reserve snapshots"): every snapshot's height, payload hash and link. 404 before the first snapshot, and when `porHistoryDir` is not set |
 | `GET /api/por/history/<height>` | One signed reserve snapshot, byte for byte as it was signed; the height is a plain decimal number |
 | `GET /api/token/<address\|eth>` | Metadata for a token and whether it is already bridged (used by the front-end's token lookup) |
@@ -941,9 +941,15 @@ A snapshot describes one Sequentia height H:
   lamports, for SOL), read at `finalized` commitment, with the slots the reads
   were answered at and the cluster's genesis hash. USDC that a CCTP
   consolidation has burned on Solana and not yet minted into the vault still
-  backs the asset: such a burn is counted when it is final, succeeded, moved
-  exactly that amount out of the treasury, and landed no later than the
-  balances were read, and is listed either way.
+  backs the asset. The daemon lists every consolidation of the last week,
+  and each is checked on chain, never taken on the operator's word: the burn
+  must be final, have succeeded, have moved exactly that amount out of the
+  treasury, and have landed no later than the balances were read; and its
+  CCTP nonce, taken from Circle's attestation service, must still be unused
+  on Circle's MessageTransmitter at block B. A burn that passes is counted at
+  the amount it delivers (less Circle's fee); one Ethereum had already
+  received by B is in the vault's balance instead. Every listed transfer
+  appears in the snapshot with the reason it was or was not counted.
 - **Per asset.** The escrow total in the asset's atoms (`null` when any source
   could not be read, never zero), the in-transit total, and `backed`: true or
   false when the supply is exact and every source was measured, `null`
@@ -974,9 +980,9 @@ reports it live.
   the current state only. The Solana balances are therefore read when the
   snapshot is taken, shortly after H, and the snapshot records the slots and
   the time and says so (`pastSlotQueryable: false`). They can include deposits
-  made after H, and a CCTP consolidation that completes between B and the
-  read is counted on neither side, which makes an asset read short, never
-  long.
+  made after H. A CCTP consolidation in flight at B is counted through its
+  burn and nonce, as above, so a move between escrows reads as neither short
+  nor long.
 
 ### The file and the signature
 
@@ -1044,8 +1050,10 @@ node verify.mjs https://sequentiatestnet.com/bridge --attester <address> --reder
 and every vault figure at B (an old snapshot needs an archive node).
 `--seq-rpc` checks H's hash and the genesis hash, and with `--audit-script`
 reruns the auditor to H and compares every supply figure. `--sol-rpc` checks
-the cluster and every CCTP burn; the Solana balances themselves cannot be
-re-read at a past slot.
+the cluster and every listed CCTP burn, and with `--eth-rpc` as well whether
+each transfer was still in flight at B (`--iris-url` and `--transmitter`
+override Circle's attestation service and MessageTransmitterV2). The Solana
+balances themselves cannot be re-read at a past slot.
 
 Without any of this repository's code, one snapshot checks with `jq`,
 `sha256sum` and ethers:
@@ -1086,9 +1094,10 @@ above and pinned in the mirror (`ATTESTER` in its workflow).
 | `auditScript` | Path to `contrib/asset-supply-audit/audit.py` in a checkout of the node repository (`python`, default `python3`, runs it) |
 | `auditCheckpoint` | The auditor's checkpoint file (default: none, a full scan every time). The first run scans from genesis, at a few hundred blocks a second against a local node; later runs resume and read one interval. The checkpoint is discarded, and the chain rescanned, when the block it ends at is no longer on the chain, when the set of assets changes, or when the last run was interrupted |
 | `auditTimeoutMinutes` | How long one audit may run (default 360) |
-| `daemonUrl` | The daemon's API: the asset list, the Solana deposit addresses, and the CCTP burns in transit |
-| `ethChainId`, `ethChainName`, `ethRpcUrl` | The Ethereum chain (the chain id is checked against the RPC). The RPC must still have the state at B, which is about as old as H; a full node that keeps a day or more of recent state serves a daily snapshot |
-| `vaults` | Every vault that holds escrow, each `{address}` |
+| `daemonUrl` | The daemon's API: the asset list, the Solana deposit addresses, and the recent CCTP consolidations (each checked on chain before it counts) |
+| `ethChainId`, `ethChainName`, `ethRpcUrl` | The Ethereum chain (the chain id is checked against the RPC). The RPC must answer for the state at B, which is about as old as H, on every request: an archive endpoint. A load-balanced public endpoint whose backends keep different amounts of history answers some historical calls and not others |
+| `irisUrl`, `cctpMessageTransmitter` | Circle's attestation service (default: the sandbox) and MessageTransmitterV2 on the Ethereum chain (default: Circle's testnet address), used to tell whether a CCTP consolidation was still in flight at B |
+| `vaults` | Every vault that holds escrow, each `{address, version}`. `version` pins the vault's interface version (3 or later for a vault with `VERSION()` and its reservations; 1 or 2 for an older one) so each run reads only the figures that version has instead of first asking the vault which version it is |
 | `solRpcUrl`, `solChainLabel`, `solTreasury`, `solGenesisHash` | The Solana RPC, the chain label the bridge uses for it, and the treasury and cluster genesis hash, both checked before anything is read |
 | `toolSource`, `auditSource` | Repository URLs recorded in each snapshot (default the ConcatenaLabs repositories) |
 

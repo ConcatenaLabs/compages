@@ -67,8 +67,10 @@ const ERC20 = ["function balanceOf(address) view returns (uint256)"];
 /** One vault's figures for one token at `blockTag` (a block number):
  *  balance, the version-3 reservations, and the backing that leaves. A vault
  *  with no code at that block holds nothing it could reserve and backs
- *  nothing. */
-export async function vaultFigures(provider, vault, token, blockTag) {
+ *  nothing. `pinnedVersion`, when given, is the vault's known interface
+ *  version and replaces asking VERSION(): some RPCs answer an older vault's
+ *  missing function in a form that cannot be told apart from an outage. */
+export async function vaultFigures(provider, vault, token, blockTag, pinnedVersion) {
   const address = ethers.getAddress(vault);
   const native = token === "eth" || token === ethers.ZeroAddress;
   const code = await provider.getCode(address, blockTag);
@@ -80,10 +82,15 @@ export async function vaultFigures(provider, vault, token, blockTag) {
     : BigInt(await new ethers.Contract(ethers.getAddress(token), ERC20, provider).balanceOf(address, { blockTag }));
   const v = new ethers.Contract(address, VAULT_VIEWS, provider);
   let version = null;
-  try {
-    version = Number(await v.VERSION({ blockTag }));
-  } catch (e) {
-    if (e.code !== "CALL_EXCEPTION") throw e; // an older vault has no VERSION() and reserves nothing
+  if (pinnedVersion !== undefined && pinnedVersion !== null) {
+    // Versions before 3 have no VERSION() and are recorded as null.
+    version = Number(pinnedVersion) >= 3 ? Number(pinnedVersion) : null;
+  } else {
+    try {
+      version = Number(await v.VERSION({ blockTag }));
+    } catch (e) {
+      if (e.code !== "CALL_EXCEPTION") throw e; // an older vault has no VERSION() and reserves nothing
+    }
   }
   let owed = 0n;
   let queued = 0n;
@@ -202,5 +209,71 @@ export async function checkBurn(sol, burn, { mint, treasury, readSlot }) {
     return out;
   }
   out.counted = true;
+  return out;
+}
+
+// ---- CCTP transfers between escrows ------------------------------------------------
+
+export const IRIS_SANDBOX = "https://iris-api-sandbox.circle.com";
+export const MESSAGE_TRANSMITTER_V2 = "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275";
+const SOLANA_DOMAIN = 5;
+
+/** What Circle's attestation service knows of a Solana burn: the message's
+ *  nonce and the fee taken, or null while it has not attested the burn.
+ *  Offsets are CCTP V2's: the nonce is header bytes 12..44, and in the burn
+ *  body (after the 148-byte header) the amount is at 68 and feeExecuted at
+ *  164. */
+export async function cctpMessageOf(irisUrl, signature) {
+  const url = `${(irisUrl ?? IRIS_SANDBOX).replace(/\/+$/, "")}/v2/messages/${SOLANA_DOMAIN}?transactionHash=${encodeURIComponent(signature)}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Circle attestation service: HTTP ${res.status}`);
+  const m = ((await res.json()).messages ?? []).find((x) => typeof x.message === "string" && /^0x[0-9a-fA-F]+$/.test(x.message) && x.message.length > 2 + 2 * 344);
+  if (!m) return null;
+  const hex = m.message.slice(2);
+  const word = (at) => BigInt(`0x${hex.slice(at * 2, (at + 32) * 2)}`);
+  return {
+    nonce: `0x${hex.slice(24, 88)}`,
+    amount: word(148 + 68).toString(),
+    feeExecuted: word(148 + 164).toString(),
+  };
+}
+
+/** Whether Circle's MessageTransmitter had received the message with
+ *  `nonce` by block `blockTag`: it marks every nonce it accepts. */
+export async function nonceUsedAt(provider, transmitter, nonce, blockTag) {
+  const t = new ethers.Contract(transmitter, ["function usedNonces(bytes32) view returns (uint256)"], provider);
+  return (await t.usedNonces(nonce, { blockTag })) !== 0n;
+}
+
+/** A consolidation counts as in transit at a snapshot when its Solana burn
+ *  left the treasury before the Solana read (checkBurn) and Ethereum had not
+ *  received it by block B, so it is in neither balance. What counts is what
+ *  arrives: the burned amount less Circle's fee. The nonce comes from
+ *  Circle's attestation service, not from the operator; an unattested burn
+ *  cannot have been received yet. */
+export async function checkTransfer({ sol, eth, burn, mint, treasury, readSlot, blockB, irisUrl, transmitter }) {
+  const out = await checkBurn(sol, burn, { mint, treasury, readSlot });
+  out.nonce = null;
+  out.receivedByB = null;
+  if (!out.counted) return out;
+  const msg = await cctpMessageOf(irisUrl, burn.solanaBurn);
+  if (msg) {
+    out.nonce = msg.nonce;
+    if (BigInt(msg.amount) !== BigInt(burn.amount)) {
+      out.counted = false;
+      out.reason = `Circle's message is for ${msg.amount}, not ${burn.amount}`;
+      return out;
+    }
+    out.receivedByB = await nonceUsedAt(eth, transmitter ?? MESSAGE_TRANSMITTER_V2, msg.nonce, blockB);
+    if (out.receivedByB) {
+      out.counted = false;
+      out.reason = `received on Ethereum by block ${blockB}, so the vault balance already includes it`;
+      return out;
+    }
+    out.amount = (BigInt(burn.amount) - BigInt(msg.feeExecuted)).toString();
+  } else {
+    out.receivedByB = false;
+  }
   return out;
 }
