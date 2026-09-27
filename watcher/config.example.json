@@ -1,0 +1,31 @@
+{
+  "ethChainId": 11155111,
+  "ethRpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "ethLogsRpcUrl": "https://sepolia.gateway.tenderly.co",
+  "ethLogChunk": 5000,
+  "ethFinality": "finalized",
+  "vaults": [
+    {
+      "address": "0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41",
+      "deployBlock": 11188751
+    },
+    {
+      "address": "0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C",
+      "deployBlock": 11472082
+    }
+  ],
+  "esploraUrl": "http://127.0.0.1:3003",
+  "solRpcUrl": "https://api.devnet.solana.com",
+  "solChainLabel": "solana-devnet",
+  "solTreasury": "76ZPjfcZGjidKPm9eqmCADKvkYzsEfTwv1wroANJZuhv",
+  "daemonUrl": "http://127.0.0.1:9950",
+  "daemonAdminToken": "",
+  "alertUrl": "",
+  "breachMinutes": 10,
+  "daemonDownMinutes": 10,
+  "largePayout": {},
+  "announceEveryPayout": false,
+  "intervalMs": 60000,
+  "statusPort": 9951,
+  "stateFile": "state/watch-state.json"
+}

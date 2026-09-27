@@ -812,6 +812,15 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             note: `Send SOL or any SPL token (${solName}) to this address from any Solana wallet; SOL deposits need at least 0.001 SOL. Sequentia amounts have 8 decimal places, so decimals beyond 8 are dropped. Once the transfer is finalized on Solana and picked up by the bridge, usually under a minute, the matching .s asset is minted to ${body.seqAddress}: SOL as SOL.s, a token under its own ticker, issued on first bridge exactly like the Ethereum leg's ERC-20s.`,
           });
         }
+        if (req.method === "GET" && parts[2] === "intents") {
+          // Every deposit address the bridge has handed out. Escrow on this
+          // leg sits on these and on the treasury, so anyone checking the
+          // reserves needs the list; the addresses are public on chain anyway.
+          return send(200, {
+            treasury: bridge.sol.treasury.address,
+            addresses: Object.keys(state.data.solWrapIntents),
+          });
+        }
         if (req.method === "GET" && parts[2] === "wrap" && parts[3]) {
           const intent = Object.hasOwn(state.data.solWrapIntents, parts[3])
             ? state.data.solWrapIntents[parts[3]]

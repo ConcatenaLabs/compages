@@ -1,0 +1,14 @@
+{
+  "name": "compages-watch",
+  "version": "1.0.0",
+  "description": "An independent check on the Compages bridge: vault books, reserves, and the daemon's health",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node compages-watch.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
