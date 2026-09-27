@@ -1,0 +1,98 @@
+{
+  "chain": "sepolia",
+  "chainId": 11155111,
+  "contract": "src/CompagesVault.sol:CompagesVault",
+  "note": "Immutable deployment facts only. Role holders (owner, operator, guardian, pendingOwner) change over time; read them from the contract. Rebuilding sourceCommit with the listed compiler settings reproduces each vault's creation bytecode byte for byte, metadata hash included; the creation transaction's input is that bytecode followed by constructorArgsEncoded.",
+  "vaults": [
+    {
+      "version": 1,
+      "address": "0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41",
+      "deployBlock": 11188751,
+      "deployTx": "0xf9c188b3d3854528293b86df192574f446d149ffdb49974d4cc803eb36eb5ee2",
+      "deployer": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f",
+      "sourceCommit": "f5bdb1dfe0db5bfdd10c651511f34fa16122549a",
+      "constructor": "constructor(address _operator)",
+      "constructorArgs": {
+        "_operator": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f"
+      },
+      "constructorArgsEncoded": "0x0000000000000000000000004e5fc92fceb5351ab509adc562312692f94dce8f",
+      "compiler": {
+        "solc": "0.8.24+commit.e11b9ed9",
+        "optimizer": { "enabled": true, "runs": 200 },
+        "evmVersion": "cancun",
+        "bytecodeHash": "ipfs",
+        "remappings": ["forge-std/=lib/forge-std/src/"]
+      },
+      "verified": {
+        "sourcify": {
+          "match": "exact_match",
+          "url": "https://repo.sourcify.dev/11155111/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41"
+        },
+        "blockscout": {
+          "url": "https://eth-sepolia.blockscout.com/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41?tab=contract"
+        }
+      }
+    },
+    {
+      "version": 2,
+      "address": "0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C",
+      "deployBlock": 11472082,
+      "deployTx": "0x75b73e64a539772936d74fe1be28cd12cc584caf245659ccc055356fde7596f1",
+      "deployer": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f",
+      "sourceCommit": "f9910b5ec3063342a35eb98a76f464a6ebbacc39",
+      "constructor": "constructor(address _operator)",
+      "constructorArgs": {
+        "_operator": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f"
+      },
+      "constructorArgsEncoded": "0x0000000000000000000000004e5fc92fceb5351ab509adc562312692f94dce8f",
+      "compiler": {
+        "solc": "0.8.24+commit.e11b9ed9",
+        "optimizer": { "enabled": true, "runs": 200 },
+        "evmVersion": "cancun",
+        "bytecodeHash": "ipfs",
+        "remappings": ["forge-std/=lib/forge-std/src/"]
+      },
+      "verified": {
+        "sourcify": {
+          "match": "exact_match",
+          "url": "https://repo.sourcify.dev/11155111/0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C"
+        },
+        "blockscout": {
+          "url": "https://eth-sepolia.blockscout.com/address/0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C?tab=contract"
+        }
+      }
+    },
+    {
+      "version": 3,
+      "address": "0x7B702D6A2E2351F0c4E549642e65AbABC0324384",
+      "deployBlock": 11795555,
+      "deployTx": "0xf1090f8a8ad71db1128339dc107e9ac88d9e3f0c42fc8c993f6fd6bb5b1bb96c",
+      "deployer": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f",
+      "sourceCommit": "372702bd422803cea0de8900fc063f4d0a76d67e",
+      "constructor": "constructor(address owner_, address operator_, address guardian_, uint256 releaseDelay_)",
+      "constructorArgs": {
+        "owner_": "0xE1F4f2B6208de255B1F196cca785867E4443572a",
+        "operator_": "0x4E5fC92fCeb5351aB509aDC562312692f94dce8f",
+        "guardian_": "0xDf7b6A0F46DeF0637d3eDF10EB95D07c3f874416",
+        "releaseDelay_": 3600
+      },
+      "constructorArgsEncoded": "0x000000000000000000000000e1f4f2b6208de255b1f196cca785867e4443572a0000000000000000000000004e5fc92fceb5351ab509adc562312692f94dce8f000000000000000000000000df7b6a0f46def0637d3edf10eb95d07c3f8744160000000000000000000000000000000000000000000000000000000000000e10",
+      "compiler": {
+        "solc": "0.8.24+commit.e11b9ed9",
+        "optimizer": { "enabled": true, "runs": 200 },
+        "evmVersion": "cancun",
+        "bytecodeHash": "ipfs",
+        "remappings": ["forge-std/=lib/forge-std/src/"]
+      },
+      "verified": {
+        "sourcify": {
+          "match": "exact_match",
+          "url": "https://repo.sourcify.dev/11155111/0x7B702D6A2E2351F0c4E549642e65AbABC0324384"
+        },
+        "blockscout": {
+          "url": "https://eth-sepolia.blockscout.com/address/0x7B702D6A2E2351F0c4E549642e65AbABC0324384?tab=contract"
+        }
+      }
+    }
+  ]
+}
