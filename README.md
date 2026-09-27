@@ -103,12 +103,12 @@ in the node repository.
 |---|---|
 | Ethereum → Sequentia (lock, then mint) | ETH and ERC-20 deposits, first-bridge issuance, duplicate-free reissuance, automatic refunds |
 | Sequentia → Ethereum (return, then release) | Releases the locked funds against a returned bridged asset; live redemptions wait for 100 Bitcoin-anchor confirmations first (see "Finality") |
-| Vault contract | `CompagesVault` on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) (primary) and [`0x15b3c97ed82c62b7828a775456bd75e67a8ec42c`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c); the daemon watches both |
+| Vault contract | `CompagesVault` on Sepolia at [`0x7B702D6A2E2351F0c4E549642e65AbABC0324384`](https://sepolia.etherscan.io/address/0x7B702D6A2E2351F0c4E549642e65AbABC0324384), which takes deposits. Two earlier vaults, [`0xd72AF53b…`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) and [`0x15b3c97e…`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c), accept no new deposits; the daemon still watches all three |
 | Unified stablecoins | `USDC.e` and `EURC.e`, precision 6, fed from Sepolia and the Solana devnet, node-level supervised (see "Unified stablecoins") |
 | Bitcoin ↔ SBTC (wrap, unwrap) | Address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`); only for uses that need bitcoin on the Sequentia chain, since Sequentia wallets hold native bitcoin directly |
 | Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) |
 | Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
-| Web front-end | Served by the daemon itself at https://sequentiatestnet.com/bridge/: `web/index.html`, `web/app.js`, and `web/qr.js` (the page's own QR encoder) |
+| Web front-end | Served by the daemon itself at https://sequentiatestnet.com/bridge/: `web/index.html`, `web/app.js`, `web/abi.js` (the hand-written encoding of the few contract calls the page makes) and `web/qr.js` (the page's own QR encoder) |
 
 Every leg is exercised end to end by `e2e/run-e2e.sh`.
 
@@ -163,6 +163,38 @@ code pins it to a particular network. It has only ever run on testnets.
    visit, and "Look up a redemption address" finds one again by the
    redemption address or by the Ethereum address it pays.
 
+"Receive on" chooses where USDC.e is paid out: Sepolia, or any chain Circle's
+CCTP reaches from the vault. Every other asset is always paid on Sepolia. A
+redemption address is bound to the address and the chain together. For a
+payout on another EVM chain the vault burns the USDC on Sepolia; once Circle
+has attested the burn, the page offers "Claim on <chain>", which switches
+your wallet to that chain and sends the attested message there. Anyone may
+send it, and it mints only to the recipient the burn names. Payouts to
+Solana are completed by the bridge itself.
+
+A payout larger than the vault's rate limit waits in the vault's queue, and
+the page shows when it goes out. The bridge's guardian can stop a queued
+payout; the page then says so, and the operator decides what happens next.
+When the receiving address refuses a payout (a contract that rejects plain
+ether, for example), the vault holds it for that address, and the page
+offers "Claim": connect that account on Sepolia, choose where the funds
+should go, and the vault pays them there. Refunds of undeliverable deposits
+behave the same way.
+
+### USDC from another chain
+
+Choose "USDC from another chain" in the "Bridge from" selector to bridge USDC
+from a chain other than Sepolia over Circle's CCTP. Pick the chain, enter the
+amount and your Sequentia address, and confirm. The page switches your wallet
+to that chain (adding it when the wallet does not know it), asks you to let
+Circle's TokenMessenger spend the USDC, and burns it with the bridge's vault
+named as the only party allowed to complete the transfer. Circle attests a
+burn once its chain finalizes it, typically 15 to 30 minutes on these
+testnets; the bridge then relays it to the vault and mints USDC.e, the same
+asset as USDC bridged from Sepolia or Solana. The page follows each stage,
+remembers the last burn, and the "Track a burn" box follows any burn by its
+chain and transaction hash.
+
 ### Bitcoin ↔ SBTC and Solana ↔ SOL.s
 
 Bitcoin needs no bridge to be used on Sequentia: every Sequentia wallet holds
@@ -200,8 +232,8 @@ The page lists every transfer to a wrap or unwrap address with its status:
 confirmations so far with the time left, then crediting or releasing, then
 the transaction that paid you. It remembers the last address it gave you on
 each leg and shows it again when you come back, and the "Track" box on the
-Bitcoin leg looks up any Bitcoin deposit address or SBTC return address. A banner at the top names any asset whose minting the operator has
-paused.
+Bitcoin leg looks up any Bitcoin deposit address or SBTC return address. A
+banner at the top names any asset whose minting the operator has paused.
 
 SOL amounts should be at least 0.001 in both directions (below Solana's
 rent-exempt minimum a lamport transfer cannot create the destination account;
