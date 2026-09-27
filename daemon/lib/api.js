@@ -1,7 +1,10 @@
 // Compages HTTP API for the web front-end. JSON everywhere, permissive CORS
-// (the front-end is a static page; the API holds no secrets and every
-// mutating action is limited to creating a redemption intent).
+// (the front-end is a static page). Public calls hold no secrets, and the only
+// public mutating calls create deposit or redemption intents, rate-limited
+// per client. /api/admin/* exists only when `adminToken` is configured, and
+// answers 404 to any request without it.
 
+import crypto from "node:crypto";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -59,6 +62,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         escrowedUnits: s.escrowedUnits ?? "0",
       })),
       precision: m.precision ?? 8,
+      retired: m.retired ?? null,
       token: m.token,
       symbol: m.symbol,
       name: m.name,
@@ -71,6 +75,92 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       mintedSats: m.mintedSats,
       createdAt: m.createdAt,
     };
+  }
+
+  // Per-client limits on the calls that make the bridge do work: every intent
+  // is watched, and every redemption address is a wallet key. The client is
+  // the socket peer, or the first X-Forwarded-For hop when the daemon sits
+  // behind a reverse proxy it trusts (`trustProxy`).
+  const hits = new Map(); // ip -> { windowStart, count }
+  function clientIp(req) {
+    if (cfg.trustProxy) {
+      const fwd = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
+      if (fwd) return fwd;
+    }
+    return req.socket.remoteAddress ?? "unknown";
+  }
+  function overLimit(req) {
+    const limit = cfg.intentLimitPerHour ?? 30;
+    const ip = clientIp(req);
+    const now = Date.now();
+    let h = hits.get(ip);
+    if (!h || now - h.windowStart > 3_600_000) {
+      h = { windowStart: now, count: 0 };
+      hits.set(ip, h);
+    }
+    h.count++;
+    if (hits.size > 50_000) hits.clear(); // bounded memory under a flood
+    return h.count > limit;
+  }
+
+  function adminAuthorized(req) {
+    if (!cfg.adminToken) return false;
+    const got = String(req.headers.authorization ?? "");
+    const want = `Bearer ${cfg.adminToken}`;
+    return got.length === want.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want));
+  }
+
+  const RECORD_GROUPS = ["deposits", "solDeposits", "redemptions", "solRedemptions"];
+
+  /** An operator's decision about a record that stopped for a person.
+   *  Every action is appended to the state's admin log. */
+  function resolveRecord(group, key, action, body) {
+    const list = state.data[group];
+    if (!RECORD_GROUPS.includes(group) || !list || !Object.hasOwn(list, key)) {
+      throw Object.assign(new Error("no such record"), { status: 404 });
+    }
+    const r = list[key];
+    const before = r.status;
+    const isDeposit = group === "deposits" || group === "solDeposits";
+    if (action === "retire") {
+      r.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
+    } else if (action === "mark_delivered" && isDeposit) {
+      if (!/^[0-9a-f]{64}$/.test(String(body.txid ?? ""))) throw Object.assign(new Error("txid required"), { status: 400 });
+      r.steps ??= {};
+      delete r.steps.pendingSend;
+      delete r.steps.sendCandidate;
+      r.steps.sendTxid = body.txid;
+      r.status = "minted";
+    } else if (action === "retry") {
+      // The operator asserts that nothing from the stopped step is in flight
+      // (they checked the chain), so the step may run again.
+      delete r.error;
+      delete r.nextAttemptAt;
+      r.firstFailureAt = undefined;
+      r.attempts = 0;
+      if (isDeposit) {
+        const st = (r.steps ??= {});
+        if (r.status === "delivery_reorged") {
+          delete st.sendTxid;
+          delete r.deliveryFinal;
+        }
+        for (const k of ["pendingIssue", "pendingMint", "pendingSend", "issueCandidate", "mintCandidate", "sendCandidate"]) delete st[k];
+        r.status = st.issueTxid || st.mintTxid ? "send_retry" : r.status === "refund_failed_manual" ? "refund_pending" : "mint_retry";
+      } else if (r.status === "destroy_manual") {
+        delete r.pendingDestroy;
+        delete r.burn;
+        r.status = "destroy_pending";
+      } else {
+        r.status = "new";
+      }
+    } else {
+      throw Object.assign(new Error("unknown action"), { status: 400 });
+    }
+    state.data.adminLog ??= [];
+    state.data.adminLog.push({ at: new Date().toISOString(), group, key, action, from: before, to: r.status, note: body.note ?? null });
+    state.save();
+    log(`admin: ${action} ${group}/${key} (${before} -> ${r.status})`);
+    return r;
   }
 
   function publicDeposit(d) {
@@ -268,6 +358,68 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(404, { error: "not found" });
       }
 
+      if (parts[1] === "admin") {
+        if (!adminAuthorized(req)) return send(404, { error: "not found" });
+        if (req.method === "GET" && parts[2] === "records") {
+          const want = url.searchParams.get("status");
+          const out = [];
+          for (const g of RECORD_GROUPS) {
+            for (const [key, r] of Object.entries(state.data[g] ?? {})) {
+              if (!want || r.status === want) out.push({ group: g, key, ...r });
+            }
+          }
+          return send(200, out);
+        }
+        if (req.method === "POST" && parts[2] === "resolve") {
+          const body = parseJson(await readBody(req));
+          if (!body) return send(400, { error: "invalid JSON body" });
+          try {
+            return send(200, resolveRecord(String(body.group), String(body.key), String(body.action), body));
+          } catch (e) {
+            return send(e.status ?? 500, { error: e.message });
+          }
+        }
+        if (req.method === "POST" && (parts[2] === "halt" || parts[2] === "unhalt")) {
+          const body = parseJson(await readBody(req));
+          if (!body?.assetId) return send(400, { error: "assetId required" });
+          if (parts[2] === "unhalt") return send(200, { cleared: bridge.unhalt(String(body.assetId)) });
+          bridge.halt(String(body.assetId), body.scope === "mint" ? "mint" : "all", String(body.reason ?? "halted by the operator"));
+          return send(200, { halted: state.data.halted[body.assetId] });
+        }
+        if (req.method === "POST" && parts[2] === "retire-asset") {
+          const body = parseJson(await readBody(req));
+          const m = body && state.data.mappings[String(body.mappingKey)];
+          if (!m) return send(404, { error: "no such mapping" });
+          m.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
+          state.data.adminLog ??= [];
+          state.data.adminLog.push({ at: m.retired.at, mappingKey: body.mappingKey, action: "retire-asset", note: m.retired.note });
+          state.save();
+          log(`admin: retired asset mapping ${body.mappingKey}`);
+          return send(200, { retired: m.retired });
+        }
+        return send(404, { error: "not found" });
+      }
+
+      if (req.method === "GET" && parts[1] === "health") {
+        const h = await bridge.health();
+        return send(h.status === "failing" ? 503 : 200, h);
+      }
+
+      if (req.method === "GET" && parts[1] === "seqaddress" && parts[2]) {
+        try {
+          return send(200, await bridge.checkSeqAddress(decodeURIComponent(parts[2])));
+        } catch (e) {
+          return send(502, { error: `the Sequentia node could not check the address: ${e.message}` });
+        }
+      }
+
+      const isIntent =
+        req.method === "POST" &&
+        (parts[1] === "redeem" || (["sol", "btc"].includes(parts[1]) && ["wrap", "unwrap"].includes(parts[2])));
+      if (isIntent && overLimit(req)) {
+        return send(429, { error: "too many requests from this address; try again in an hour" });
+      }
+
       if (req.method === "GET" && parts[1] === "status") {
         // Where the Bitcoin reserve actually sits, so the page can show custody
         // for every leg rather than for Ethereum alone. Cached and best-effort:
@@ -292,6 +444,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           vaultAddresses: eth.vaultAddresses ?? [cfg.vaultAddress].filter(Boolean),
           seqChainLabel: cfg.seqChainLabel,
           ethConfirmations: cfg.ethConfirmations,
+          // "finalized": deposits mint once Ethereum finalizes their block
+          // (about 13 minutes on mainnet and Sepolia); "confirmations": after
+          // ethConfirmations blocks.
+          ethFinality: cfg.ethFinality ?? "finalized",
           seqConfirmations: cfg.seqConfirmations,
           btcAnchorConfirmations: cfg.btcAnchorConfirmations ?? 3,
           btcChainName: cfg.btcChainName ?? "Bitcoin testnet4",
@@ -407,6 +563,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             chainCirculatingAtoms: chainSupply,
             chainSupplyError: chainError,
             backed: comparable ? escrowedAtoms >= BigInt(chainSupply) : null,
+            // An asset the operator has retired (for example one issued
+            // before a chain reset, whose tokens no longer exist) is listed
+            // with the reason rather than hidden.
+            retired: m.retired ?? null,
             ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
           });
         }
@@ -541,6 +701,20 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         });
       }
 
+      if (req.method === "GET" && parts[1] === "redeem" && parts[2] === "by-eth" && parts[3]) {
+        let ethAddress;
+        try {
+          ethAddress = ethers.getAddress(parts[3]);
+        } catch {
+          return send(400, { error: "invalid Ethereum address" });
+        }
+        const entry = Object.entries(state.data.redeemIntents).find(([, it]) => it.ethAddress === ethAddress);
+        if (!entry) return send(404, { error: "no redemption address for this Ethereum address yet" });
+        const [seqAddress, intent] = entry;
+        const redemptions = Object.values(state.data.redemptions).filter((r) => r.seqAddress === seqAddress);
+        return send(200, { seqAddress, ...intent, redemptions });
+      }
+
       if (req.method === "GET" && parts[1] === "redeem" && parts[2]) {
         const seqAddress = parts[2];
         const intent = Object.hasOwn(state.data.redeemIntents, seqAddress)
@@ -604,6 +778,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             depositAddress = await bridge.createSolWrapIntent(String(body.seqAddress));
           } catch (e) {
             if (e.badRequest) return send(400, { error: e.message });
+            if (e.busy) return send(503, { error: e.message });
             throw e;
           }
           return send(200, {
