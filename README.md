@@ -500,7 +500,7 @@ node admin.js show deposits 12
 node admin.js retry redemptions <txid:vout> "checked: the release never landed"
 node admin.js delivered deposits 12 <seqTxid> "sent by hand"
 node admin.js retire redemptions <txid:vout> "recipient can never accept ether"
-node admin.js retire-asset <mappingKey> "issued before the chain reset"
+node admin.js retire-asset <mappingKey> "issued before the chain reset"   # the token's next deposit issues a fresh asset
 node admin.js halt <assetId> mint "investigating"
 node admin.js unhalt <assetId>
 ```
