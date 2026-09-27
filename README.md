@@ -150,8 +150,8 @@ code pins it to a particular network. It has only ever run on testnets.
    receive the released funds and click "Get my redemption address". The
    bridge returns the Sequentia address bound to that Ethereum address; each
    Ethereum address has one, and asking again returns the same one. With an
-   Ethereum wallet connected, the page shows its redemption address and
-   redemptions without asking.
+   Ethereum wallet connected, the page shows its redemption address for the
+   chain chosen under "Receive on", and its redemptions, without asking.
 2. Send the bridged asset to that address from any Sequentia wallet. No
    special transaction format is needed.
 3. Once the transfer is **final under Bitcoin anchoring** (100 Bitcoin-anchor
@@ -163,14 +163,16 @@ code pins it to a particular network. It has only ever run on testnets.
    visit, and "Look up a redemption address" finds one again by the
    redemption address or by the Ethereum address it pays.
 
-"Receive on" chooses where USDC.e is paid out: Sepolia, or any chain Circle's
-CCTP reaches from the vault. Every other asset is always paid on Sepolia. A
-redemption address is bound to the address and the chain together. For a
-payout on another EVM chain the vault burns the USDC on Sepolia; once Circle
-has attested the burn, the page offers "Claim on <chain>", which switches
-your wallet to that chain and sends the attested message there. Anyone may
-send it, and it mints only to the recipient the burn names. Payouts to
-Solana are completed by the bridge itself.
+"Receive on" chooses where USDC.e is paid out: Sepolia, or another EVM chain
+Circle's CCTP reaches from the vault. Every other asset is always paid on
+Sepolia. A redemption address is bound to the address and the chain
+together, and "Receive on" always shows the chain of the redemption address
+on screen. For a payout on another EVM chain the vault burns the USDC on
+Sepolia; once Circle has attested the burn, the page offers "Claim on
+<chain>", which switches your wallet to that chain and sends the attested
+message there. Anyone may send it, and it mints only to the recipient the
+burn names; once it is mined the page shows "Claimed" with the transaction.
+To receive USDC.e on Solana, use the Solana leg's unwrap address instead.
 
 A payout larger than the vault's rate limit waits in the vault's queue, and
 the page shows when it goes out. The bridge's guardian can stop a queued
@@ -188,12 +190,15 @@ from a chain other than Sepolia over Circle's CCTP. Pick the chain, enter the
 amount and your Sequentia address, and confirm. The page switches your wallet
 to that chain (adding it when the wallet does not know it), asks you to let
 Circle's TokenMessenger spend the USDC, and burns it with the bridge's vault
-named as the only party allowed to complete the transfer. Circle attests a
-burn once its chain finalizes it, typically 15 to 30 minutes on these
-testnets; the bridge then relays it to the vault and mints USDC.e, the same
-asset as USDC bridged from Sepolia or Solana. The page follows each stage,
-remembers the last burn, and the "Track a burn" box follows any burn by its
-chain and transaction hash.
+named as the only party allowed to complete the transfer. The page reports
+the burn to the bridge as soon as your wallet returns its hash, so it
+completes even if you close the page. Circle attests a burn once its chain
+finalizes it, typically 15 to 30 minutes on these testnets; the bridge then
+relays it to the vault, and the deposit mints USDC.e once Sepolia finalizes
+the relay, about 15 more minutes. USDC.e is the same asset as USDC bridged
+from Sepolia or Solana. The page follows each stage and remembers the last
+burn. A burn made elsewhere, in another tab or on another device, is picked
+up by entering its chain and transaction hash in the "Track a burn" box.
 
 ### Bitcoin ↔ SBTC and Solana ↔ SOL.s
 
