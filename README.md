@@ -911,8 +911,7 @@ bridge's attestation key and linked by hash to the snapshot before it.
 one that checks them (`verify.mjs`).
 
 The live bridge signs with the attestation address
-**`ATTESTER_ADDRESS_NOT_SET`** (placeholder: replaced by the address the
-operator's key prints when it is generated, see "Taking snapshots"). Its
+**`0x4d66517923cDd6E374969fF68BdedF818415cDfC`**. Its
 history is served at `https://sequentiatestnet.com/bridge/api/por/history`
 and copied, verified, into the public repository
 [ConcatenaLabs/compages-reserves](https://github.com/ConcatenaLabs/compages-reserves),
