@@ -13,6 +13,7 @@ import { Sol } from "./lib/sol.js";
 import { Bridge } from "./lib/bridge.js";
 import { startApi } from "./lib/api.js";
 import { Alerts } from "./lib/alerts.js";
+import { Cctp } from "./lib/cctp.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgPath = process.argv[2] ?? path.join(here, "config.json");
@@ -46,6 +47,8 @@ const seq = new SeqRpc(cfg.seqRpcUrl, cfg.seqWallet);
 const bridge = new Bridge(cfg, eth, seq, state, log, sol);
 const alerts = new Alerts(cfg, log);
 bridge.startedAt = Date.now();
+const cctp = new Cctp(cfg, bridge);
+bridge.cctp = cctp;
 
 async function main() {
   // --- startup checks ---
@@ -158,6 +161,7 @@ async function main() {
       ["seqRedemptions", () => bridge.processRedemptions()],
       ["ethRedemptions", () => bridge.advanceRedemptions()],
       ["ethRetries", () => bridge.retryRedemptions()],
+      ["cctpTransfers", () => cctp.advance()],
       ["invariants", () => bridge.checkInvariants()],
     ],
     interval
@@ -170,6 +174,7 @@ async function main() {
         ["solRetries", () => bridge.retrySolDeposits()],
         ["solSweeps", () => bridge.sweepSolIntents()],
         ["solRedemptions", () => bridge.advanceSolRedemptions()],
+        ["cctpConsolidate", () => cctp.consolidate()],
       ],
       cfg.solPollIntervalMs ?? interval
     );

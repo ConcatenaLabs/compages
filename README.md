@@ -229,6 +229,25 @@ byte-for-byte verified against `@solana/web3.js` and `@solana/spl-token`
 during development; the e2e mock RPC independently decodes and
 signature-checks every submitted transaction.
 
+### One escrow for a unified stablecoin: CCTP
+
+A unified stablecoin arrives from several chains, and each chain's deposits
+are escrowed there. Circle adopts a bridged USDC by burning a single escrow,
+so the daemon keeps the escrow in one place: whatever the Solana treasury
+holds beyond a working float (`solFloatUnits`, kept for releases on Solana)
+is moved into the Ethereum vault with Circle's own Cross-Chain Transfer
+Protocol. The USDC is burned on Solana and minted by Circle into the vault,
+so nothing but native USDC ever backs the asset.
+
+Each move is recorded before anything is sent, and the Solana burn's
+signature is persisted before broadcast, like every other outbound Solana
+transfer. The daemon fetches Circle's attestation and relays the mint on
+Ethereum itself; the message names no destination caller, so anyone else may
+relay it too, and the message's nonce says whether someone did. Between the
+burn and the mint the amount is in transit: the reserves page
+(`inTransitAtoms`, with each Solana burn listed) and the supply invariant
+count it as backing, so a move in flight never reads as a shortfall.
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
 Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
@@ -428,6 +447,7 @@ Configuration reference (`daemon/config.example.json`):
 | `solKeyFile` | 32-byte hex seed for the Solana treasury and deposit-address derivation; generated on first boot, never commit it |
 | `solWatchDays` | How long a wrap intent's deposit address is polled (default 7 days); re-requesting a wrap for the same Sequentia address revives it |
 | `solMinReleaseSats` | Smallest SOL.s return that is released (default 100000 sats = 0.001 SOL, clear of Solana's rent-exempt minimum) |
+| `cctp` | Moving unified-stablecoin escrow from Solana into the Ethereum vault through Circle's CCTP V2: `enabled`, `messageTransmitter` (Circle's MessageTransmitterV2 on the Ethereum chain), `irisUrl` (Circle's attestation service; the sandbox by default), `assets` (default `["USDC"]`), `solFloatUnits` (what stays on Solana for releases there, default 5 USDC), `minConsolidateUnits`, `consolidateEveryMinutes`, `stuckHours` |
 | `unified` | Unified stablecoins, keyed by symbol: `name`, `ticker`, `precision`, `supervision` and the `sources` (one per chain) that all mint into the one asset (see "Unified stablecoins") |
 | `unifiedIssuerPubkey` | Pinned 33-byte compressed pubkey the bridge wallet controls; hashed into every unified asset id and later authorizes handing the asset to its issuer. Generate once, back up, never change |
 | `supervision` (per unified asset) | `enabled` issues the asset as a node-level supervised asset; `pause` additionally allows stopping every holding. Both permanent. `operationalKey`/`recoveryKey` pin the public keys; unset, the daemon derives them from the node wallet once |
