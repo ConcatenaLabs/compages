@@ -146,6 +146,19 @@ export function redemptionIdOf(seqChain, txid, vout) {
   return ethers.keccak256(ethers.toUtf8Bytes(`compages:redeem:${seqChain}:${txid}:${vout}`));
 }
 
+/** A minimal async mutex: `run` executes `fn` after every earlier `run` has
+ *  settled. */
+class Mutex {
+  constructor() {
+    this.tail = Promise.resolve();
+  }
+  run(fn) {
+    const result = this.tail.then(() => fn());
+    this.tail = result.catch(() => {});
+    return result;
+  }
+}
+
 export class Bridge {
   /**
    * @param {object} cfg     daemon config
@@ -162,6 +175,38 @@ export class Bridge {
     this.state = state;
     this.log = log;
     this.sol = sol;
+    // The core and Solana loops run concurrently. Two things must still happen
+    // one at a time: building-and-broadcasting a burn (two burns funded at
+    // once could pick the same coins), and driving any one Solana redemption
+    // (both loops reach them, and two concurrent drives could each build a
+    // release with its own signature, which is a double payment).
+    this.burnLock = new Mutex();
+    this.recordLocks = new Set();
+    this.phases = {};
+  }
+
+  /** Run `fn` unless the record `key` is already being driven elsewhere. */
+  async withRecord(key, fn) {
+    if (this.recordLocks.has(key)) return;
+    this.recordLocks.add(key);
+    try {
+      return await fn();
+    } finally {
+      this.recordLocks.delete(key);
+    }
+  }
+
+  phaseOk(name) {
+    const p = (this.phases[name] ??= {});
+    p.lastOk = Date.now();
+    p.consecutiveFailures = 0;
+  }
+
+  phaseFailed(name, e) {
+    const p = (this.phases[name] ??= {});
+    p.lastError = e.message;
+    p.lastErrorAt = Date.now();
+    p.consecutiveFailures = (p.consecutiveFailures ?? 0) + 1;
   }
 
   // ================= Unified assets =================
@@ -504,15 +549,22 @@ export class Bridge {
       // In the raw transaction they are not: an explicit amount appears as
       // `assetamount`, a blinded one as `assetamountcommitment`, and an
       // issuance that mints no units of the asset carries neither.
-      const wtx = await this.seq.call("gettransaction", { txid: iss.txid });
-      const decoded = await this.seq.call("decoderawtransaction", { hexstring: wtx.hex });
-      const issuance = decoded.vin?.[iss.vin]?.issuance;
-      if (!issuance) continue;
-      if (issuance.assetamountcommitment) {
-        throw new Error(`asset ${assetId} has a blinded issuance; supply is not knowable`);
+      // An issuance's amount never changes once it is in a transaction, so
+      // it is read once and remembered.
+      this._issuanceCache ??= new Map();
+      const ck = `${iss.txid}:${iss.vin}`;
+      let amt = this._issuanceCache.get(ck);
+      if (amt === undefined) {
+        const wtx = await this.seq.call("gettransaction", { txid: iss.txid });
+        const decoded = await this.seq.call("decoderawtransaction", { hexstring: wtx.hex });
+        const issuance = decoded.vin?.[iss.vin]?.issuance;
+        if (issuance?.assetamountcommitment) {
+          throw new Error(`asset ${assetId} has a blinded issuance; supply is not knowable`);
+        }
+        amt = issuance?.assetamount === undefined ? 0n : amountToSats(issuance.assetamount);
+        if ((wtx.confirmations ?? 0) >= (this.cfg.seqConfirmations ?? 6)) this._issuanceCache.set(ck, amt);
       }
-      if (issuance.assetamount === undefined) continue; // mints no units
-      atoms += amountToSats(issuance.assetamount);
+      atoms += amt;
     }
     const burned = await this.burnedAtoms(assetId);
     return atoms - burned;
@@ -542,15 +594,35 @@ export class Bridge {
     const src = mapping.sources?.[tokenKey];
     if (!src) return;
     const now = BigInt(src.escrowedUnits ?? "0") - BigInt(units);
+    if (now < 0n) {
+      // More left this escrow than ever entered it. That cannot happen
+      // unless something paid out that should not have: stop paying.
+      this.halt(mapping.assetId, "all", `${tokenKey} escrow ledger went negative by ${-now} units`);
+    }
     src.escrowedUnits = (now < 0n ? 0n : now).toString();
   }
 
   // ================= Ethereum -> Sequentia =================
 
+  /** The newest block whose deposits may be minted against. By default the
+   *  chain's own finalized block: a deposit minted on Sequentia cannot be
+   *  taken back if an Ethereum reorg removes it, so it waits until Ethereum
+   *  itself says it cannot be reorged. A fixed confirmation count
+   *  (`ethFinality: "confirmations"`) is for local test chains. */
+  async ethSafeHead() {
+    if ((this.cfg.ethFinality ?? "finalized") === "finalized") {
+      const b = await this.eth.provider.getBlock("finalized");
+      if (!b) throw new Error("the Ethereum RPC returned no finalized block");
+      return b.number;
+    }
+    return (await this.eth.provider.getBlockNumber()) - this.cfg.ethConfirmations;
+  }
+
   async processDeposits() {
     const s = this.state.data;
-    const head = await this.eth.provider.getBlockNumber();
-    const confirmedHead = head - this.cfg.ethConfirmations;
+    const confirmedHead = await this.ethSafeHead();
+    this.lastEthSafeHead = confirmedHead;
+    await this.checkDepositGaps(confirmedHead);
     if (confirmedHead <= s.lastEthBlock) return;
 
     const chunk = this.cfg.ethLogChunk ?? 5000;
@@ -573,6 +645,50 @@ export class Bridge {
     }
   }
 
+  /** The state key of deposit `nonce` on `vaultAddress`. The primary vault
+   *  keeps the bare nonce so existing records and refund ids stay valid. */
+  depositKey(nonce, vaultAddress) {
+    const isPrimary =
+      !vaultAddress || String(this.cfg.vaultAddress ?? "").toLowerCase() === String(vaultAddress).toLowerCase();
+    return isPrimary ? String(nonce) : `${vaultAddress}:${nonce}`;
+  }
+
+  /** Every vault numbers its deposits 0, 1, 2, ... with no gaps, so the
+   *  count at the safe head says exactly which records must exist. A missing
+   *  one means a log the RPC failed to return (a lagging node behind a load
+   *  balancer can answer an eth_getLogs range with nothing and let the cursor
+   *  move past it). Re-read the whole vault once; if a deposit is still
+   *  missing, report it rather than let it vanish silently. */
+  async checkDepositGaps(safeHead) {
+    const s = this.state.data;
+    const every = this.cfg.gapCheckMinutes ?? 10;
+    if (this._lastGapCheck && Date.now() - this._lastGapCheck < every * 60_000) return;
+    if (safeHead > s.lastEthBlock) return; // still catching up; check once level
+    this._lastGapCheck = Date.now();
+    const missing = [];
+    for (const address of this.eth.vaultAddresses) {
+      const vault = this.eth.vaultFor(address);
+      let count;
+      try {
+        count = Number(await vault.depositCount({ blockTag: s.lastEthBlock }));
+      } catch {
+        continue; // a vault not yet deployed at that height
+      }
+      const lost = [];
+      for (let n = 0; n < count; n++) if (!s.deposits[this.depositKey(n, address)]) lost.push(n);
+      if (!lost.length) continue;
+      this.log(`vault ${address}: deposits ${lost.join(",")} have no record; re-reading the vault`);
+      const from = this.eth.deployBlockOf(address) ?? this.cfg.vaultDeployBlock ?? 0;
+      const chunk = this.cfg.ethLogChunk ?? 5000;
+      for (let b = from; b <= s.lastEthBlock; b += chunk) {
+        const logs = await vault.queryFilter(vault.filters.Deposited(), b, Math.min(b + chunk - 1, s.lastEthBlock));
+        for (const ev of logs) await this.handleDeposit(ev, address);
+      }
+      for (const n of lost) if (!s.deposits[this.depositKey(n, address)]) missing.push(`${address}#${n}`);
+    }
+    this.missingDeposits = missing;
+  }
+
   async handleDeposit(ev, vaultAddress = null) {
     const s = this.state.data;
     const nonce = ev.args.nonce.toString();
@@ -580,10 +696,17 @@ export class Bridge {
     // unique the moment a second vault is watched. The primary vault keeps
     // the bare nonce as its key so existing records and their on-chain refund
     // ids are untouched.
-    const isPrimary =
-      !vaultAddress || String(this.cfg.vaultAddress ?? "").toLowerCase() === String(vaultAddress).toLowerCase();
-    const key = isPrimary ? nonce : `${vaultAddress}:${nonce}`;
-    if (s.deposits[key]) return; // already seen (rescan)
+    const key = this.depositKey(nonce, vaultAddress);
+    if (s.deposits[key]) {
+      // Already seen. The same nonce with a different transaction would mean
+      // a reorg rewrote the vault's history under a record: say so loudly.
+      const known = s.deposits[key];
+      if (known.ethTxHash && known.ethTxHash.toLowerCase() !== ev.transactionHash.toLowerCase()) {
+        this.log(`deposit ${key}: seen again in a DIFFERENT transaction (${ev.transactionHash} vs ${known.ethTxHash})`);
+        this.depositConflicts = [...new Set([...(this.depositConflicts ?? []), key])];
+      }
+      return;
+    }
 
     const token = ev.args.token === ethers.ZeroAddress ? "eth" : ev.args.token.toLowerCase();
     const dep = {
@@ -650,6 +773,7 @@ export class Bridge {
       return;
     }
     dep.sats = sats.toString();
+    if (mapping && this.haltedReason(mapping.assetId, "mint")) return this.holdForHalt(dep, mapping.assetId);
 
     // 3. First bridge of this token: issue a brand-new reissuable asset with
     //    exactly the deposit amount. Later deposits: reissue the same asset.
@@ -690,6 +814,16 @@ export class Bridge {
 
     let mapping = s.mappings[mappingKey];
     if (!mapping) {
+      // Anyone can create a token and bridge it, and each first bridge makes
+      // the operator issue and register a new asset. Cap how many per day so
+      // that cannot be turned into an unbounded fee and registry bill.
+      const dayAgo = Date.now() - 86_400_000;
+      const recent = Object.values(s.mappings).filter((m) => Date.parse(m.createdAt ?? 0) > dayAgo && !m.unified).length;
+      if (recent >= (this.cfg.maxNewAssetsPerDay ?? 20)) {
+        dep.waiting = "the daily limit on newly bridged tokens is reached; this deposit mints tomorrow";
+        this.deferMint(dep, "pendingIssue", new Error(dep.waiting));
+        return null;
+      }
       // Build the registry contract up front and issue the asset committed to
       // its hash, so the metadata is bound on-chain and independently verifiable.
       const contract = await this.buildAssetContract(origin.meta, origin.chainName, origin.tickerSuffix);
@@ -1377,6 +1511,12 @@ export class Bridge {
    *  Ethereum destination. Anything bridged that arrives there is redeemed. */
   async createRedeemIntent(ethAddress) {
     const checksummed = ethers.getAddress(ethAddress); // throws on invalid
+    // One redemption address per Ethereum destination: asking again returns
+    // the same one, so a user who comes back finds their redemption instead
+    // of a fresh, empty address.
+    for (const [addr, it] of Object.entries(this.state.data.redeemIntents)) {
+      if (it.ethAddress === checksummed) return addr;
+    }
     const seqAddress = await this.seq.call("getnewaddress", { label: "compages-redeem" });
     this.state.data.redeemIntents[seqAddress] = {
       ethAddress: checksummed,
@@ -1470,7 +1610,7 @@ export class Bridge {
    *  and is idempotent, so re-driving a still-blocked record just re-parks it. */
   async advanceRedemptions() {
     for (const rec of Object.values(this.state.data.redemptions)) {
-      if (rec.status !== "awaiting_finality" && rec.status !== "awaiting_liquidity") continue;
+      if (!["awaiting_finality", "awaiting_liquidity", "halted"].includes(rec.status)) continue;
       try {
         await this.handleRedemption(rec);
       } catch (e) {
@@ -1498,7 +1638,7 @@ export class Bridge {
     // A reorged/conflicted burn shows <1 (often negative) confirmations: never
     // final, so a reverted burn can never trigger a release.
     if (!gt.blockhash || gt.confirmations < 1) {
-      return { final: false, reason: `burn not confirmed (${gt.confirmations} conf)` };
+      return { final: false, reason: `burn not confirmed (${gt.confirmations} conf)`, depth: 0, need: null, kind: null };
     }
 
     let anchor = null;
@@ -1512,10 +1652,13 @@ export class Bridge {
       return {
         final: gt.confirmations >= need,
         reason: `no Bitcoin anchoring; ${gt.confirmations}/${need} Sequentia confirmations`,
+        depth: gt.confirmations,
+        need,
+        kind: "sequentia",
       };
     }
     if (anchor.anchorstatus !== "ok") {
-      return { final: false, reason: `node anchor status is ${anchor.anchorstatus}` };
+      return { final: false, reason: `node anchor status is ${anchor.anchorstatus}`, depth: null, need: null, kind: "bitcoin" };
     }
 
     const hdr = await this.seq.call("getblockheader", {
@@ -1524,14 +1667,17 @@ export class Bridge {
     });
     // poscertified is feature-detected: enforce it only when the node reports it
     // (null on nodes/chains that predate committee certification).
+    const need = this.cfg.btcAnchorConfirmations ?? 3;
     if (hdr.poscertified === false) {
-      return { final: false, reason: "burn block not yet committee-certified" };
+      return { final: false, reason: "burn block not yet committee-certified", depth: 0, need, kind: "bitcoin" };
     }
     const depth = Number(anchor.anchorheight) - Number(hdr.anchorheight);
-    const need = this.cfg.btcAnchorConfirmations ?? 3;
     return {
       final: depth >= need,
       reason: `${depth}/${need} Bitcoin-anchor confirmations`,
+      depth: Math.max(0, depth),
+      need,
+      kind: "bitcoin",
     };
   }
 
@@ -1558,6 +1704,12 @@ export class Bridge {
       return;
     }
     rec.tokenKey = src.tokenKey;
+    if (this.haltedReason(mapping.assetId, "release")) {
+      rec.status = "halted";
+      rec.waiting = this.haltedReason(mapping.assetId, "release");
+      this.state.save();
+      return;
+    }
     // Pin the vault holding this source's escrow now, so a later config change
     // cannot redirect an in-flight release to a vault that never held it.
     rec.vault = src.vault ?? this.cfg.vaultAddress ?? null;
@@ -1592,6 +1744,7 @@ export class Bridge {
     // a Sequentia block count (anchoring is supreme; see burnFinality).
     const fin = await this.burnFinality(rec.txid);
     rec.finality = fin.reason;
+    rec.finalityProgress = { depth: fin.depth, need: fin.need, kind: fin.kind };
     if (!fin.final) {
       rec.status = "awaiting_finality";
       this.state.save();
@@ -1769,6 +1922,14 @@ export class Bridge {
         this.log(`sol wrap intent ${it.index}: revived ${addr} -> ${seqAddress}`);
         return addr;
       }
+    }
+    // Every intent is polled for days, so an unbounded number of them is an
+    // unbounded RPC bill; past the cap, new ones wait for old ones to expire.
+    const watched = Object.entries(s.solWrapIntents).filter(([a, it]) => this.solIntentWatched(a, it)).length;
+    if (watched >= (this.cfg.solMaxWatchedIntents ?? 1000)) {
+      throw Object.assign(new Error("the bridge is watching too many deposit addresses right now; try again later"), {
+        busy: true,
+      });
     }
     const index = s.solIntentIndex ?? 0;
     s.solIntentIndex = index + 1;
@@ -1950,6 +2111,7 @@ export class Bridge {
       return;
     }
     dep.sats = sats.toString();
+    if (existing && this.haltedReason(existing.assetId, "mint")) return this.holdForHalt(dep, existing.assetId);
     const mapping = await this.ensureMintedMapping(dep, tokenKey, sats, {
       chainId: chainLabel,
       token: isNative ? "sol" : dep.mint,
@@ -2114,6 +2276,9 @@ export class Bridge {
     if (!isSolAddress(solAddress)) {
       throw Object.assign(new Error("invalid Solana address"), { badRequest: true });
     }
+    for (const [addr, it] of Object.entries(this.state.data.solRedeemIntents)) {
+      if (it.solAddress === solAddress) return addr;
+    }
     const seqAddress = await this.seq.call("getnewaddress", { label: "compages-sol-redeem" });
     this.state.data.solRedeemIntents[seqAddress] = {
       solAddress,
@@ -2125,6 +2290,10 @@ export class Bridge {
   }
 
   async handleSolRedemption(rec) {
+    return this.withRecord(`sol:${rec.key}`, () => this.handleSolRedemptionLocked(rec));
+  }
+
+  async handleSolRedemptionLocked(rec) {
     const s = this.state.data;
     const chainLabel = this.cfg.solChainLabel ?? "solana-devnet";
     const mapping = Object.values(s.mappings).find(
@@ -2143,6 +2312,12 @@ export class Bridge {
     rec.symbol = mapping.symbol;
     rec.ticker = mapping.contract?.ticker ?? null;
     rec.tokenKey = src.tokenKey;
+    if (this.haltedReason(mapping.assetId, "release")) {
+      rec.status = "halted";
+      rec.waiting = this.haltedReason(mapping.assetId, "release");
+      this.state.save();
+      return;
+    }
     if (src.token === "sol") {
       // Below Solana's rent-exempt minimum, a lamport release to a fresh
       // account cannot execute; park tiny redemptions instead of burning
@@ -2181,6 +2356,7 @@ export class Bridge {
     // burn must be final under Bitcoin anchoring, never a Sequentia block count.
     const fin = await this.burnFinality(rec.txid);
     rec.finality = fin.reason;
+    rec.finalityProgress = { depth: fin.depth, need: fin.need, kind: fin.kind };
     if (!fin.final) {
       rec.status = "awaiting_finality";
       this.state.save();
@@ -2194,10 +2370,14 @@ export class Bridge {
     // gates every tick yet never releasing.
     rec.status = "new";
     this.state.save();
-    await this.releaseSolRedemption(rec, mapping);
+    await this.releaseSolRedemptionLocked(rec, mapping);
   }
 
   async releaseSolRedemption(rec, mapping) {
+    return this.withRecord(`sol:${rec.key}`, () => this.releaseSolRedemptionLocked(rec, mapping));
+  }
+
+  async releaseSolRedemptionLocked(rec, mapping) {
     // The mint, decimals and token program to pay with are this asset's
     // SOLANA source's, not those of whichever source an asset-id lookup
     // happened to return first (a unified asset has one per chain).
@@ -2352,6 +2532,10 @@ export class Bridge {
    *  its own. A fresh burn is built only once the recorded one provably can
    *  never land: its inputs were spent by something else. */
   async destroyRedeemed(rec, mapping, label) {
+    return this.burnLock.run(() => this.destroyRedeemedLocked(rec, mapping, label));
+  }
+
+  async destroyRedeemedLocked(rec, mapping, label) {
     if (rec.destroyTxid) return this.finishDestroy(rec, mapping, label, rec.destroyTxid);
     if (rec.pendingDestroy && !rec.burn) {
       // A burn interrupted by an older daemon that did not record its
@@ -2438,6 +2622,7 @@ export class Bridge {
 
   finishDestroy(rec, mapping, label, txid) {
     if (rec.status === "done") return;
+    this.escrowEpoch = (this.escrowEpoch ?? 0) + 1;
     rec.destroyTxid = txid;
     delete rec.burn;
     delete rec.pendingDestroy;
@@ -2456,7 +2641,7 @@ export class Bridge {
     const s = this.state.data;
     for (const rec of Object.values(s.solRedemptions)) {
       try {
-        if (rec.status === "awaiting_finality" || rec.status === "awaiting_liquidity") {
+        if (["awaiting_finality", "awaiting_liquidity", "halted"].includes(rec.status)) {
           await this.handleSolRedemption(rec);
         } else if (["new", "releasing", "released", "destroy_pending", "destroying"].includes(rec.status)) {
           const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
@@ -2466,5 +2651,310 @@ export class Bridge {
         this.log(`sol redemption ${rec.key}: advance failed: ${e.message}`);
       }
     }
+  }
+
+  // ================= Supervision: halts, deliveries, health =================
+
+  /** Why the asset is halted for `kind` ("mint" or "release"), or null. */
+  haltedReason(assetId, kind) {
+    const h = this.state.data.halted?.[assetId];
+    if (!h) return null;
+    return h.scope === "all" || h.scope === kind ? `halted: ${h.reason}` : null;
+  }
+
+  /** Stop minting (scope "mint") or everything (scope "all") for an asset
+   *  until an operator clears it. Sticky on purpose: an invariant that broke
+   *  once is not trusted again because it looks fine a minute later. */
+  halt(assetId, scope, reason) {
+    const s = this.state.data;
+    s.halted ??= {};
+    const prev = s.halted[assetId];
+    if (prev && (prev.scope === "all" || prev.scope === scope)) return;
+    s.halted[assetId] = { scope: prev ? "all" : scope, reason, at: new Date().toISOString() };
+    this.state.save();
+    this.log(`HALTED ${scope} for ${assetId}: ${reason}`);
+  }
+
+  unhalt(assetId) {
+    const s = this.state.data;
+    if (!s.halted?.[assetId]) return false;
+    delete s.halted[assetId];
+    this.state.save();
+    this.log(`halt cleared for ${assetId}`);
+    return true;
+  }
+
+  holdForHalt(dep, assetId) {
+    dep.status = "mint_retry";
+    dep.waiting = this.haltedReason(assetId, "mint");
+    dep.nextAttemptAt = new Date(Date.now() + 60_000).toISOString();
+    this.state.save();
+  }
+
+  /** Watch each delivery until it is final under Bitcoin anchoring. A
+   *  delivery counts as done once it reaches the mempool, but a Sequentia
+   *  reorg can still undo it; one that ends up conflicted must be seen by a
+   *  person, not discovered by the user. */
+  async watchDeliveries() {
+    const s = this.state.data;
+    const pending = [...Object.values(s.deposits), ...Object.values(s.solDeposits)].filter(
+      (d) => d.status === "minted" && d.steps?.sendTxid && !d.deliveryFinal
+    );
+    for (const d of pending.slice(0, this.cfg.deliveryWatchBatch ?? 25)) {
+      const txid = d.steps.sendTxid;
+      let gt;
+      try {
+        gt = await this.seq.call("gettransaction", { txid });
+      } catch {
+        continue;
+      }
+      if (gt.confirmations < 0) {
+        d.status = "delivery_reorged";
+        d.error = `delivery ${txid} was displaced by a conflicting transaction`;
+        this.state.save();
+        this.log(`${d.tag ?? `deposit #${d.nonce}`}: ${d.error}`);
+        continue;
+      }
+      const fin = await this.burnFinality(txid);
+      if (fin.final) {
+        d.deliveryFinal = true;
+        d.deliveryFinalAt = new Date().toISOString();
+        this.state.save();
+      }
+    }
+  }
+
+  /** Check each asset's supply against what backs it, and halt what fails.
+   *
+   *  Two rules, from the unified-asset standard: the supply the CHAIN reports
+   *  may never exceed this daemon's own ledger (anything beyond it was minted
+   *  by something other than a verified deposit), and for assets that keep an
+   *  escrow ledger, circulating supply may never exceed escrow beyond what is
+   *  in flight (paid out, not yet burned). A breach halts minting for the
+   *  asset; the operator investigates and clears it (admin API). */
+  async checkInvariants() {
+    const every = this.cfg.invariantIntervalMs ?? 60_000;
+    if (this._lastInvariants && Date.now() - this._lastInvariants < every) return;
+    this._lastInvariants = Date.now();
+    const s = this.state.data;
+    const report = {};
+    // Mints broadcast but not yet recorded (in flight, or unresolved) are in
+    // the chain's supply before they are in the ledger; allow for them.
+    const pendingMint = {};
+    for (const d of [...Object.values(s.deposits), ...Object.values(s.solDeposits)]) {
+      const c = d.steps?.mintCandidate;
+      if (c && s.mappings[c.mappingKey]) {
+        const a = s.mappings[c.mappingKey].assetId;
+        pendingMint[a] = (pendingMint[a] ?? 0n) + BigInt(c.sats);
+      }
+    }
+    // A breach must be seen on two consecutive passes before it halts: one
+    // read can race a mint whose RPC answer has not been processed yet.
+    const seenNow = new Set();
+    const breach = (assetId, rule, reason) => {
+      const k = `${assetId}:${rule}`;
+      seenNow.add(k);
+      if (this._suspect?.has(k)) this.halt(assetId, "mint", reason);
+      else this.log(`invariant ${rule} failed once for ${assetId} (${reason}); halting if it repeats`);
+    };
+    for (const [key, m] of Object.entries(s.mappings)) {
+      if (m.retired) continue;
+      let supply;
+      try {
+        supply = await this.chainSupplyAtoms(m.assetId);
+      } catch (e) {
+        report[key] = { error: e.message };
+        continue;
+      }
+      const ledger = BigInt(m.mintedSats ?? "0");
+      const row = { chainSupply: supply.toString(), ledger: ledger.toString() };
+      if (supply < 0n) {
+        row.note = "issuance not visible on this chain";
+        report[key] = row;
+        continue;
+      }
+      const pending = pendingMint[m.assetId] ?? 0n;
+      if (supply > ledger + pending) {
+        breach(m.assetId, "supply", `chain supply ${supply} exceeds the ledger ${ledger}`);
+      }
+      if (m.sources && Object.values(m.sources).every((src) => src.escrowedUnits !== undefined)) {
+        let escrow = 0n;
+        for (const src of Object.values(m.sources)) {
+          escrow += unitsToAtoms(src.escrowedUnits, src.decimals, m.precision);
+        }
+        let inFlight = 0n;
+        for (const r of [...Object.values(s.redemptions), ...Object.values(s.solRedemptions)]) {
+          if (r.assetId === m.assetId && ["released", "destroy_pending", "destroying"].includes(r.status)) {
+            inFlight += BigInt(r.sats);
+          }
+        }
+        row.escrow = escrow.toString();
+        row.inFlight = inFlight.toString();
+        if (supply - inFlight - pending > escrow) {
+          breach(m.assetId, "escrow", `circulating ${supply - inFlight} exceeds escrow ${escrow}`);
+        }
+      }
+      report[key] = row;
+    }
+    this._suspect = seenNow;
+    this.invariantReport = { at: new Date().toISOString(), assets: report };
+  }
+
+  /** Balances that stop the bridge when they run out, read at most every
+   *  five minutes. */
+  async operatingBalances() {
+    if (this._balances && Date.now() - this._balances.at < 300_000) return this._balances.value;
+    const out = {};
+    try {
+      out.ethGasWei = (await this.eth.provider.getBalance(this.eth.wallet.address)).toString();
+    } catch (e) {
+      out.ethGasError = e.message;
+    }
+    if (this.cfg.seqFeeAsset) {
+      try {
+        const b = await this.seq.call("getbalance", {});
+        out.seqFeeAsset = String(b?.[this.cfg.seqFeeAsset] ?? 0);
+      } catch (e) {
+        out.seqFeeError = e.message;
+      }
+    }
+    if (this.sol) {
+      try {
+        out.solTreasuryLamports = (await this.sol.balance(this.sol.treasury.address)).toString();
+      } catch (e) {
+        out.solError = e.message;
+      }
+    }
+    this._balances = { at: Date.now(), value: out };
+    return out;
+  }
+
+  /** One report of everything an operator needs to know, used by
+   *  /api/health and by the alerts. `problems` lists each thing that needs
+   *  attention with a stable key, so an alert can be raised and cleared. */
+  async health() {
+    const s = this.state.data;
+    const now = Date.now();
+    const problems = [];
+    const staleMs = (this.cfg.phaseStaleMinutes ?? 10) * 60_000;
+    const started = this.startedAt ?? now;
+
+    const phases = {};
+    for (const [name, p] of Object.entries(this.phases)) {
+      const since = p.lastOk ?? started;
+      phases[name] = {
+        lastOk: p.lastOk ? new Date(p.lastOk).toISOString() : null,
+        lastError: p.lastError ?? null,
+        lastErrorAt: p.lastErrorAt ? new Date(p.lastErrorAt).toISOString() : null,
+        consecutiveFailures: p.consecutiveFailures ?? 0,
+      };
+      if (now - since > staleMs && (p.consecutiveFailures ?? 0) > 0) {
+        problems.push({
+          key: `phase:${name}`,
+          severity: "critical",
+          title: `${name} has not succeeded for ${Math.round((now - since) / 60_000)} min`,
+          detail: p.lastError ?? "no error recorded",
+        });
+      }
+    }
+
+    const ATTENTION = new Set([
+      "failed_manual",
+      "dust_manual",
+      "release_failed_manual",
+      "refund_failed_manual",
+      "destroy_manual",
+      "delivery_reorged",
+    ]);
+    const records = {};
+    for (const [group, list] of Object.entries({
+      deposits: s.deposits,
+      solDeposits: s.solDeposits,
+      redemptions: s.redemptions,
+      solRedemptions: s.solRedemptions,
+    })) {
+      const g = (records[group] = {});
+      for (const r of Object.values(list ?? {})) {
+        const e = (g[r.status] ??= { count: 0, oldest: null });
+        e.count++;
+        const t = r.unresolvedSince ?? r.createdAt;
+        if (t && (!e.oldest || t < e.oldest)) e.oldest = t;
+        if (r.retired) e.retired = (e.retired ?? 0) + 1;
+      }
+      for (const [status, e] of Object.entries(g)) {
+        const live = e.count - (e.retired ?? 0);
+        if (!live) continue;
+        const ageH = e.oldest ? (now - Date.parse(e.oldest)) / 3_600_000 : 0;
+        if (ATTENTION.has(status)) {
+          problems.push({
+            key: `records:${group}:${status}`,
+            severity: "warning",
+            title: `${live} ${group} record(s) need an operator (${status})`,
+            detail: `oldest since ${e.oldest}; see /api/admin/records?status=${status}`,
+          });
+        } else if (status === "unresolved" && ageH > 1) {
+          problems.push({
+            key: `records:${group}:unresolved`,
+            severity: "warning",
+            title: `${live} ${group} record(s) unresolved for over an hour`,
+            detail: `the node has not been able to confirm a transaction since ${e.oldest}`,
+          });
+        } else if (status === "awaiting_liquidity") {
+          problems.push({
+            key: `records:${group}:awaiting_liquidity`,
+            severity: "warning",
+            title: `${live} ${group} redemption(s) waiting for escrow to be rebalanced`,
+            detail: `oldest since ${e.oldest}`,
+          });
+        }
+      }
+    }
+
+    for (const [assetId, h] of Object.entries(s.halted ?? {})) {
+      problems.push({
+        key: `halt:${assetId}`,
+        severity: "critical",
+        title: `asset ${assetId.slice(0, 12)} halted (${h.scope})`,
+        detail: h.reason,
+      });
+    }
+    for (const miss of this.missingDeposits ?? []) {
+      problems.push({ key: `missing:${miss}`, severity: "critical", title: `deposit ${miss} has no record`, detail: "the vault counts it but no log was found" });
+    }
+    for (const key of this.depositConflicts ?? []) {
+      problems.push({ key: `conflict:${key}`, severity: "critical", title: `deposit ${key} reappeared in a different transaction`, detail: "an Ethereum reorg rewrote a deposit already recorded" });
+    }
+
+    const balances = await this.operatingBalances();
+    const low = (cond, key, title, detail) => cond && problems.push({ key, severity: "warning", title, detail });
+    const minGas = BigInt(this.cfg.minOperatorGasWei ?? "20000000000000000"); // 0.02 ETH
+    low(balances.ethGasWei && BigInt(balances.ethGasWei) < minGas, "balance:eth", "operator gas is low", `${balances.ethGasWei} wei`);
+    const minFee = Number(this.cfg.minFeeAssetBalance ?? 1);
+    low(balances.seqFeeAsset !== undefined && Number(balances.seqFeeAsset) < minFee, "balance:fee", "Sequentia fee asset is low", `${balances.seqFeeAsset}`);
+    const minSol = BigInt(this.cfg.minSolTreasuryLamports ?? 50_000_000);
+    low(balances.solTreasuryLamports && BigInt(balances.solTreasuryLamports) < minSol, "balance:sol", "Solana treasury is low", `${balances.solTreasuryLamports} lamports`);
+
+    return {
+      status: problems.some((p) => p.severity === "critical") ? "failing" : problems.length ? "degraded" : "ok",
+      generatedAt: new Date(now).toISOString(),
+      startedAt: new Date(started).toISOString(),
+      phases,
+      records,
+      halted: s.halted ?? {},
+      invariants: this.invariantReport ?? null,
+      balances,
+      problems,
+    };
+  }
+
+  /** Whether `address` is a valid Sequentia address, and whether it is a
+   *  blinded (confidential) one. Both forms are accepted everywhere; the page
+   *  uses this to check an address before any funds move. */
+  async checkSeqAddress(address) {
+    const v = await this.seq.node("validateaddress", { address });
+    return {
+      valid: Boolean(v.isvalid),
+      blinded: Boolean(v.isvalid && v.confidential_key),
+    };
   }
 }

@@ -12,6 +12,7 @@ import { Eth } from "./lib/eth.js";
 import { Sol } from "./lib/sol.js";
 import { Bridge } from "./lib/bridge.js";
 import { startApi } from "./lib/api.js";
+import { Alerts } from "./lib/alerts.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgPath = process.argv[2] ?? path.join(here, "config.json");
@@ -43,6 +44,8 @@ const state = new State(path.resolve(path.dirname(cfgPath), cfg.stateFile));
 const eth = new Eth(cfg, operatorKey);
 const seq = new SeqRpc(cfg.seqRpcUrl, cfg.seqWallet);
 const bridge = new Bridge(cfg, eth, seq, state, log, sol);
+const alerts = new Alerts(cfg, log);
+bridge.startedAt = Date.now();
 
 async function main() {
   // --- startup checks ---
@@ -115,37 +118,79 @@ async function main() {
 
   startApi(cfg, eth, seq, state, bridge, log);
 
-  // --- main loop, one pass at a time ---
+  // --- main loops, one pass at a time each ---
   // Each phase fails independently, so an outage on one chain's RPC never
-  // starves the other legs.
-  const phases = [
-    () => bridge.processDeposits(),
-    () => bridge.retryDeposits(),
-    () => bridge.registerPendingAssets(),
-    () => bridge.processRefunds(),
-    () => bridge.processRedemptions(),
-    () => bridge.advanceRedemptions(),
-    () => bridge.retryRedemptions(),
-    () => bridge.processSolDeposits(),
-    () => bridge.retrySolDeposits(),
-    () => bridge.sweepSolIntents(),
-    () => bridge.advanceSolRedemptions(),
-  ];
-  let running = false;
-  const tick = async () => {
-    if (running) return;
-    running = true;
-    for (const phase of phases) {
-      try {
-        await phase();
-      } catch (e) {
-        log(`tick error: ${e.message}`);
+  // starves the other legs, and the Solana leg runs on a loop of its own: a
+  // slow or throttled cluster must not delay an Ethereum release, nor the
+  // other way round. Every phase records when it last succeeded, which is
+  // what /api/health and the alerts read to tell a quiet bridge from a
+  // stalled one.
+  const runLoop = (name, phases, intervalMs) => {
+    let running = false;
+    const tick = async () => {
+      if (running) return;
+      running = true;
+      for (const [phaseName, phase] of phases) {
+        try {
+          await phase();
+          bridge.phaseOk(phaseName);
+        } catch (e) {
+          bridge.phaseFailed(phaseName, e);
+          log(`tick error (${phaseName}): ${e.message}`);
+        }
       }
-    }
-    running = false;
+      running = false;
+    };
+    tick();
+    setInterval(tick, intervalMs);
+    log(`${name} loop running every ${intervalMs} ms`);
   };
-  await tick();
-  setInterval(tick, cfg.pollIntervalMs ?? 15000);
+
+  const interval = cfg.pollIntervalMs ?? 15000;
+  runLoop(
+    "core",
+    [
+      ["ethDeposits", () => bridge.processDeposits()],
+      ["depositRetries", () => bridge.retryDeposits()],
+      ["deliveries", () => bridge.watchDeliveries()],
+      ["registry", () => bridge.registerPendingAssets()],
+      ["refunds", () => bridge.processRefunds()],
+      ["seqRedemptions", () => bridge.processRedemptions()],
+      ["ethRedemptions", () => bridge.advanceRedemptions()],
+      ["ethRetries", () => bridge.retryRedemptions()],
+      ["invariants", () => bridge.checkInvariants()],
+    ],
+    interval
+  );
+  if (sol) {
+    runLoop(
+      "solana",
+      [
+        ["solDeposits", () => bridge.processSolDeposits()],
+        ["solRetries", () => bridge.retrySolDeposits()],
+        ["solSweeps", () => bridge.sweepSolIntents()],
+        ["solRedemptions", () => bridge.advanceSolRedemptions()],
+      ],
+      cfg.solPollIntervalMs ?? interval
+    );
+  }
+
+  // Alerts: one pass a minute over the same health report the API serves.
+  const checkAlerts = async () => {
+    try {
+      const h = await bridge.health();
+      const active = new Set();
+      for (const p of h.problems) {
+        active.add(p.key);
+        await alerts.raise(p.key, p.title, p.detail, { priority: p.severity === "critical" ? 5 : 4 });
+      }
+      await alerts.settle(active);
+    } catch (e) {
+      log(`alert check failed: ${e.message}`);
+    }
+  };
+  setTimeout(checkAlerts, 30_000);
+  setInterval(checkAlerts, 60_000);
 }
 
 main().catch((e) => {

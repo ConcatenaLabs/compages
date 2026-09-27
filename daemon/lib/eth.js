@@ -72,12 +72,19 @@ export class Eth {
       ? cfg.vaults
       : [{ address: cfg.vaultAddress, deployBlock: cfg.vaultDeployBlock }];
     this.vaults = new Map();
+    this.deployBlocks = new Map();
     for (const v of configured) {
       if (!v?.address) continue;
+      if (v.deployBlock !== undefined) this.deployBlocks.set(v.address.toLowerCase(), v.deployBlock);
       this.vaults.set(v.address.toLowerCase(), new ethers.Contract(v.address, VAULT_ABI, this.wallet));
     }
     this.vaultAddresses = [...this.vaults.keys()];
     this.vault = this.vaults.get(String(cfg.vaultAddress ?? "").toLowerCase()) ?? this.vaults.values().next().value;
+  }
+
+  /** The block a watched vault was deployed in, when configured. */
+  deployBlockOf(address) {
+    return this.deployBlocks.get(String(address).toLowerCase()) ?? null;
   }
 
   /** The vault contract at `address`, or the primary vault when a record

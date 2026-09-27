@@ -119,8 +119,8 @@ code pins it to a particular network. It has only ever run on testnets.
    from any Sequentia wallet works). A preview shows the exact amount you will
    receive before you commit.
 4. Confirm the deposit (for ERC-20s the page first requests an `approve`).
-   After 5 Ethereum confirmations the daemon mints on Sequentia and sends the
-   asset to your address; the page tracks each stage. If you close the page,
+   Once Ethereum finalizes the block holding your deposit (about 15 minutes),
+   the daemon mints on Sequentia and sends the asset to your address; the page tracks each stage. If you close the page,
    the "Track an existing deposit" box resumes tracking from the Ethereum
    transaction hash.
 
@@ -176,7 +176,9 @@ operator, never released on the wrong chain.
 1. The user calls `depositEther(seqAddress)` or
    `depositToken(token, amount, seqAddress)` on the `CompagesVault` contract.
 2. The daemon (`compagesd`) picks the deposit up from the `Deposited` event
-   after `ethConfirmations` confirmations.
+   once Ethereum has finalized its block (`ethFinality`), and checks that
+   every deposit number the vault has counted has a record, so a log an RPC
+   failed to return is found rather than lost.
 3. First deposit of a token: the daemon issues a new reissuable Sequentia
    asset carrying the token's symbol, name and decimals, and records the
    mapping. Every later deposit of that token, by anyone, reissues the same
@@ -321,8 +323,10 @@ operator. Registration is best-effort and retried; it never blocks a mint.
 The daemon serves the static web app and a JSON API from the same port
 (`apiPort`, default 9950). The live instance is reverse-proxied under
 `https://sequentiatestnet.com/bridge/`. CORS is permissive; the API holds no
-secrets, and the only mutating calls create deposit or redemption intents;
-none moves funds.
+secrets, and the only public mutating calls create deposit or redemption
+intents, rate-limited per client; none moves funds. Redemption records report
+their progress toward finality as numbers (`finalityProgress`:
+`{depth, need, kind}`), so a page can draw it.
 
 | Method and path | Purpose |
 |---|---|
@@ -339,15 +343,22 @@ none moves funds.
 | `GET /api/sol/wrap/<solAddress>` | A wrap intent's bound Sequentia address and the status of every deposit seen on it |
 | `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
 | `GET /api/sol/redeem/<seqAddress>` | A Solana unwrap address's bound Solana destination and the status of every redemption seen on it |
+| `GET /api/redeem/by-eth/<ethAddress>` | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one |
+| `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, and whether it is a blinded one; checked before any funds move |
+| `GET /api/health` | The operator's health report (see "Watch it and act on what it reports"); HTTP 503 while anything critical is wrong |
+| `/api/admin/*` | Operator actions (records, resolve, halt, unhalt, retire-asset); exists only with `adminToken`, and answers 404 without it |
 
 Deposit records move through the statuses `minting`, `mint_retry` and
 `send_retry` (a safe retry, with backoff), `unresolved` (a chain write whose
 outcome the node could not confirm yet; re-checked every tick), `minted`
-(delivered), `refund_pending`, `refunding`, `refunded`, and `failed_manual`
-(paused for operator review; Solana deposits use `dust_manual` instead of the
-refund states). Redemption records move through `awaiting_finality`,
-`awaiting_liquidity`, `new`, `releasing`, `release_paused` (the vault's
-releases are paused), `released`, `destroy_pending`, `destroying`, `done`,
+(delivered; watched until the delivery is final under Bitcoin anchoring),
+`delivery_reorged` (a delivery later displaced on Sequentia), `refund_pending`,
+`refunding`, `refunded`, `refund_failed_manual`, and `failed_manual` (paused
+for operator review; Solana deposits use `dust_manual` instead of the refund
+states). A deposit of a halted asset waits in `mint_retry` with a `waiting`
+reason. Redemption records move through `awaiting_finality`,
+`awaiting_liquidity`, `halted`, `new`, `releasing`, `release_paused` (the
+vault's releases are paused), `released`, `destroy_pending`, `destroying`, `done`,
 plus the terminal `dust_ignored`, `ignored_unknown_asset`,
 `ignored_wrong_network` (an asset returned to the wrong leg's address),
 `release_failed_manual` (the recipient address does not accept the payout)
@@ -397,7 +408,8 @@ Configuration reference (`daemon/config.example.json`):
 | `ethRpcUrl` | Ethereum JSON-RPC endpoint (must support `eth_getLogs`) |
 | `vaultAddress`, `vaultDeployBlock` | The primary `CompagesVault` and the block to start scanning from |
 | `vaults` | Optional list of `{address, deployBlock}`; the daemon watches every vault in it (`vaultAddress` stays the primary). Omit to watch `vaultAddress` alone |
-| `ethConfirmations` | Confirmations before a deposit is processed |
+| `ethFinality` | `finalized` (default): a deposit mints once Ethereum finalizes its block, so no Ethereum reorg can undo a deposit that was already minted. `confirmations`: after `ethConfirmations` blocks instead, for local test chains |
+| `ethConfirmations` | Confirmations before a deposit is processed when `ethFinality` is `confirmations` |
 | `ethLogChunk` | Max block range per `eth_getLogs` call |
 | `operatorKeyFile` | File containing the operator's private key (never commit it) |
 | `seqRpcUrl` | Sequentia node RPC, `http://user:pass@host:port` |
@@ -420,7 +432,15 @@ Configuration reference (`daemon/config.example.json`):
 | `btcChainName` | Display name of the Bitcoin network behind the SBTC leg (default `Bitcoin testnet4`) |
 | `webDir` | Directory of the static web app to serve (default: the repository's `web/`) |
 | `apiHost`, `apiPort` | Where the API + web app listen |
-| `pollIntervalMs` | Main loop interval |
+| `pollIntervalMs`, `solPollIntervalMs` | Interval of the main loop and of the Solana leg's own loop |
+| `adminToken` | Enables `/api/admin/*` and `admin.js` for anyone presenting it. Unset, the admin API does not exist |
+| `alertUrl`, `alertToken`, `alertCooldownMinutes` | Where alerts are POSTed (an ntfy topic URL, or anything that takes a plain-text POST), an optional bearer token, and how often an unchanged alert repeats (default 360). Unset, alerts go to the log only |
+| `trustProxy`, `intentLimitPerHour` | Take the client address from `X-Forwarded-For` (only behind a proxy you run), and how many intents one client may create per hour (default 30) |
+| `solMaxWatchedIntents`, `maxNewAssetsPerDay` | Caps on Solana deposit addresses watched at once (default 1000) and on newly bridged tokens issued per day (default 20) |
+| `retryHours`, `unresolvedHours` | How long a safe retry, or an unconfirmable transaction, keeps being tried before it becomes an operator case (default 24 each) |
+| `ethStuckMinutes`, `ethTxWaitMs` | When an unmined payout is replaced at the same nonce with higher fees (default 10), and how long one send waits for mining (default 180000) |
+| `minOperatorGasWei`, `minFeeAssetBalance`, `minSolTreasuryLamports` | Balances below which the health report and alerts warn (defaults 0.02 ETH, 1 unit, 0.05 SOL) |
+| `phaseStaleMinutes`, `invariantIntervalMs`, `gapCheckMinutes` | When a loop phase that keeps failing is reported (default 10), how often supply invariants are checked (default 60000) and how often vault deposit counts are reconciled (default 10) |
 | `stateFile` | Path of the JSON state file |
 
 The Sequentia wallet named in `seqWallet` must hold enough of `seqFeeAsset`
@@ -452,12 +472,49 @@ WantedBy=multi-user.target
 The daemon is crash-safe by design (state file + on-chain replay guards), so
 `Restart=on-failure` is safe.
 
+### 4. Watch it and act on what it reports
+
+`GET /api/health` is the one report an operator needs: when each loop phase
+last succeeded, how many records sit in each status and since when, halted
+assets, the last supply-invariant check, the balances that stop the bridge
+when they run out, and a `problems` list. It answers 503 while anything
+critical is wrong, so an uptime monitor can watch it directly. The same
+problems are pushed to `alertUrl` once a minute, repeated every
+`alertCooldownMinutes` while they last, with one "resolved" note when they
+clear.
+
+Supply invariants are checked every minute against the chain: the supply the
+Sequentia chain reports may never exceed the daemon's ledger, and for assets
+that keep an escrow ledger, circulating supply may never exceed escrow beyond
+what is in flight. A breach seen on two consecutive checks halts minting for
+that asset until an operator clears it, and an escrow ledger that would go
+negative halts payouts too. A halt is sticky on purpose.
+
+Records that need a person, and halts, are handled with `admin.js`, which
+talks to the running daemon's admin API (enabled by `adminToken`):
+
+```
+node admin.js health
+node admin.js records failed_manual
+node admin.js show deposits 12
+node admin.js retry redemptions <txid:vout> "checked: the release never landed"
+node admin.js delivered deposits 12 <seqTxid> "sent by hand"
+node admin.js retire redemptions <txid:vout> "recipient can never accept ether"
+node admin.js retire-asset <mappingKey> "issued before the chain reset"
+node admin.js halt <assetId> mint "investigating"
+node admin.js unhalt <assetId>
+```
+
+`retry` is for when you have checked the chain and nothing from the stopped
+step is in flight. Every admin action is recorded in the state file's
+`adminLog`.
+
 ## Repository layout
 
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule) |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server) |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
 

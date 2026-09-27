@@ -827,7 +827,9 @@ if (process.env.REGISTRY_URL) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ ethAddress: RECEIVER }),
   });
-  await seqRpc(
+  // The address is stable per Ethereum destination, so it already carries
+  // earlier redemptions; follow this one by its own transaction.
+  const fSendTxid = await seqRpc(
     "sendtoaddress",
     { address: fIntent.seqAddress, amount: 2, assetlabel: musdAssetId, fee_asset_label: process.env.FEEX },
     "user"
@@ -836,7 +838,8 @@ if (process.env.REGISTRY_URL) {
     "redemption with a lost burn response completes",
     async () => {
       const r = await api(`redeem/${fIntent.seqAddress}`);
-      return r.redemptions[0]?.status === "done" ? r.redemptions[0] : null;
+      const mine = r.redemptions.find((x) => x.txid === fSendTxid);
+      return mine?.status === "done" ? mine : null;
     },
     120_000
   );
@@ -883,6 +886,48 @@ if (process.env.REGISTRY_URL) {
     row.ledgerMatchesChain === true,
     `${row.chainCirculatingAtoms} vs ${row.ledgerCirculatingAtoms}`
   );
+}
+
+// ---------------- test 10: the operator surface ----------------
+{
+  console.log("\n-- health, address checks, stable redemption addresses, admin");
+  const ADMIN = { authorization: "Bearer e2e-admin", "content-type": "application/json" };
+  const health = await (await fetch(`${API}/health`)).json();
+  check("/api/health reports a status and per-phase timings", ["ok", "degraded", "failing"].includes(health.status) && !!health.phases.ethDeposits?.lastOk, health.status);
+  check("health reports the invariant check ran", !!health.invariants?.at);
+  const good = await api(`seqaddress/${encodeURIComponent(userSeqAddr)}`);
+  const bad = await api("seqaddress/not-an-address");
+  check("a Sequentia address is checked before any funds move", good.valid === true && bad.valid === false);
+  const post = (path, body) =>
+    api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const i1 = await post("redeem", { ethAddress: RECEIVER });
+  const i2 = await post("redeem", { ethAddress: RECEIVER });
+  check("the same Ethereum address always gets the same redemption address", i1.seqAddress === i2.seqAddress, i1.seqAddress);
+  const byEth = await api(`redeem/by-eth/${RECEIVER}`);
+  check("redemptions can be looked up by the Ethereum address they pay", byEth.seqAddress === i1.seqAddress && byEth.redemptions.length >= 1);
+  const withProgress = byEth.redemptions.find((r) => r.finalityProgress);
+  check("a redemption reports its finality progress as numbers", !!withProgress && Number.isInteger(withProgress.finalityProgress.need), JSON.stringify(withProgress?.finalityProgress));
+  const noAuth = await fetch(`${API}/admin/records`);
+  check("the admin API is invisible without the token", noAuth.status === 404);
+
+  // Halt minting for MUSD, deposit, see it held; clear the halt, see it mint.
+  const musdId = minted1.assetId;
+  await fetch(`${API}/admin/halt`, { method: "POST", headers: ADMIN, body: JSON.stringify({ assetId: musdId, scope: "mint", reason: "e2e" }) });
+  await (await musd.approve(process.env.VAULT, 1_000_000n)).wait();
+  const h1 = await (await vault.depositToken(process.env.MUSD, 1_000_000n, userSeqAddr)).wait();
+  const held = await waitFor("deposit held by the halt", async () => {
+    const d = (await api(`deposit/tx/${h1.hash}`))[0];
+    return d?.status === "mint_retry" && /halted/.test(d.waiting ?? "") ? d : null;
+  });
+  check("a halted asset mints nothing", !!held, held?.waiting);
+  const unhalt = await (await fetch(`${API}/admin/unhalt`, { method: "POST", headers: ADMIN, body: JSON.stringify({ assetId: musdId }) })).json();
+  check("the operator can clear a halt", unhalt.cleared === true);
+  await waitFor("held deposit mints after the halt clears", async () =>
+    (await api(`deposit/tx/${h1.hash}`))[0]?.status === "minted" ? true : null
+  , 180_000);
+  check("the held deposit minted once the halt was cleared", true);
+  const recs = await (await fetch(`${API}/admin/records?status=minted`, { headers: ADMIN })).json();
+  check("the admin API lists records by status", Array.isArray(recs) && recs.length > 0, `${recs.length}`);
 }
 
 // ---------------- summary ----------------
