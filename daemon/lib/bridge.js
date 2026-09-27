@@ -2675,6 +2675,27 @@ export class Bridge {
     this.log(`HALTED ${scope} for ${assetId}: ${reason}`);
   }
 
+  /** Retire a bridged asset: its mapping moves to `retiredMappings`, so
+   *  the next deposit of the same token issues a fresh asset instead of
+   *  trying to reissue one that no longer exists (an asset issued before a
+   *  chain reset, say). The record is kept, with the reason, for the
+   *  reserves page and the history. A unified asset cannot be retired this
+   *  way: its identity is meant to outlive any one chain. */
+  retireMapping(mappingKey, note) {
+    const s = this.state.data;
+    const m = s.mappings[mappingKey];
+    if (!m) throw Object.assign(new Error("no such mapping"), { status: 404 });
+    if (m.unified) throw Object.assign(new Error("a unified asset is never retired"), { status: 400 });
+    const at = new Date().toISOString();
+    s.retiredMappings ??= {};
+    s.retiredMappings[`${mappingKey}@${at}`] = { ...m, retired: { note, at } };
+    delete s.mappings[mappingKey];
+    for (const [k, v] of Object.entries(s.tokenRoutes ?? {})) if (v === mappingKey) delete s.tokenRoutes[k];
+    this.state.save();
+    this.log(`retired asset ${m.assetId} (${mappingKey}): ${note}`);
+    return s.retiredMappings[`${mappingKey}@${at}`];
+  }
+
   unhalt(assetId) {
     const s = this.state.data;
     if (!s.halted?.[assetId]) return false;
@@ -2815,8 +2836,11 @@ export class Bridge {
     }
     if (this.cfg.seqFeeAsset) {
       try {
-        const b = await this.seq.call("getbalance", {});
-        out.seqFeeAsset = String(b?.[this.cfg.seqFeeAsset] ?? 0);
+        // Asked for by label: the balance map keys a registered asset by its
+        // ticker, so looking a hex id up in it reads zero for an asset the
+        // wallet holds plenty of.
+        const b = await this.seq.call("getbalance", { assetlabel: this.cfg.seqFeeAsset });
+        out.seqFeeAsset = String(typeof b === "object" ? b?.[this.cfg.seqFeeAsset] ?? 0 : b);
       } catch (e) {
         out.seqFeeError = e.message;
       }

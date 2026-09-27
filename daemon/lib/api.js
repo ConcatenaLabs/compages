@@ -388,14 +388,16 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         }
         if (req.method === "POST" && parts[2] === "retire-asset") {
           const body = parseJson(await readBody(req));
-          const m = body && state.data.mappings[String(body.mappingKey)];
-          if (!m) return send(404, { error: "no such mapping" });
-          m.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
-          state.data.adminLog ??= [];
-          state.data.adminLog.push({ at: m.retired.at, mappingKey: body.mappingKey, action: "retire-asset", note: m.retired.note });
-          state.save();
-          log(`admin: retired asset mapping ${body.mappingKey}`);
-          return send(200, { retired: m.retired });
+          if (!body?.mappingKey) return send(400, { error: "mappingKey required" });
+          try {
+            const r = bridge.retireMapping(String(body.mappingKey), String(body.note ?? ""));
+            state.data.adminLog ??= [];
+            state.data.adminLog.push({ at: r.retired.at, mappingKey: body.mappingKey, action: "retire-asset", note: r.retired.note });
+            state.save();
+            return send(200, { retired: r.retired, assetId: r.assetId });
+          } catch (e) {
+            return send(e.status ?? 500, { error: e.message });
+          }
         }
         return send(404, { error: "not found" });
       }
@@ -662,6 +664,29 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             row.backed = BigInt(row.escrowedAtoms) >= BigInt(row.chainCirculatingAtoms);
           }
           out.push(row);
+        }
+        // Retired assets (issued before a chain reset, for example) are listed
+        // with the reason, not measured: their supply no longer exists here.
+        if (!only) {
+          for (const m of Object.values(state.data.retiredMappings ?? {})) {
+            out.push({
+              assetId: m.assetId,
+              symbol: m.symbol,
+              ticker: m.contract?.ticker ?? null,
+              precision: m.precision ?? 8,
+              unified: false,
+              sources: [],
+              escrowTracked: false,
+              escrowSource: null,
+              escrowedAtoms: null,
+              ledgerCirculatingAtoms: null,
+              chainCirculatingAtoms: null,
+              chainSupplyError: null,
+              backed: null,
+              ledgerMatchesChain: null,
+              retired: m.retired,
+            });
+          }
         }
         return send(200, {
           generatedAt: new Date().toISOString(),
