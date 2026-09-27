@@ -17,12 +17,13 @@ Node and consensus conventions live in the
 | Path | What |
 |---|---|
 | `contracts/` | Foundry project. One contract, `src/CompagesVault.sol`, with `test/CompagesVault.t.sol` and `script/Deploy.s.sol`. |
-| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,seqrpc,state}.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format; keep it dependency-free). It also serves the web front-end. |
+| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp-sol,seqrpc,state}.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
 | `web/` | `index.html` + `app.js`, served by the daemon. |
 | `e2e/` | `run-e2e.sh`, `driver.mjs`, `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions), and `fault-proxy.mjs` (sits between the daemon and the node and fails chosen calls on command). |
 
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
+cd daemon && npm test                     # node --test (unit tests)
 cd contracts && forge test                # the vault unit tests
 ```
 
