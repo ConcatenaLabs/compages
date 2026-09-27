@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FOUNDRY_VERSION: v1.7.1
+  NODE_VERSION: "22"
+  # The Sequentia node the end-to-end suite runs against: a published Linux
+  # release, pinned by version and by the SHA-256 of its tarball.
+  SEQ_CORE_VERSION: 24.7.12
+  SEQ_CORE_SHA256: 610210a38f02da204301c8158da05bfdd941b65db04640f57e3122fa70a54d86
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: forge build
+        working-directory: contracts
+        run: forge build
+      # The hand-off rehearsal forks Sepolia and skips itself unless
+      # REHEARSAL_RPC_URL is set, which it never is here.
+      - name: forge test
+        working-directory: contracts
+        run: forge test
+
+  daemon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - working-directory: daemon
+        run: npm ci
+      - working-directory: daemon
+        run: npm test
+
+  watcher:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - working-directory: watcher
+        run: npm ci
+      - working-directory: watcher
+        run: npm test
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Install the daemon's dependencies
+        working-directory: daemon
+        run: npm ci
+      - name: Download the Sequentia node
+        run: |
+          tarball="sequentia-core-${SEQ_CORE_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" "https://sequentiatestnet.com/download/$tarball"
+          echo "${SEQ_CORE_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          bin="$RUNNER_TEMP/sequentia-core-${SEQ_CORE_VERSION}/bin"
+          "$bin/sequentiad" --version | head -1
+          echo "SEQ_BIN_DIR=$bin" >> "$GITHUB_ENV"
+      - name: Run the end-to-end suite
+        run: e2e/run-e2e.sh
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-logs
+          path: |
+            e2e/run/*.log
+            e2e/run/seq/elementsregtest/debug.log
+          if-no-files-found: ignore

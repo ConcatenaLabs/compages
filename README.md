@@ -879,13 +879,29 @@ cd contracts
 forge test
 ```
 
-Daemon unit tests (the Solana CCTP V2 encoders and parsers, checked against
-fixtures produced by `@solana/web3.js` and Anchor over Circle's program IDLs,
-real attestation-service responses and a devnet simulation; no dependency
-needed):
+Daemon unit tests, which need no network: the Solana CCTP V2 encoders and
+parsers, checked against fixtures produced by `@solana/web3.js` and Anchor
+over Circle's program IDLs, real attestation-service responses and a devnet
+simulation; the record state machines (what a paid, owed, queued, cancelled,
+discarded or CCTP payout does to a redemption or refund, and how a payout
+the vault already took on is read back from its queue and events); the
+Bitcoin-anchor finality gate; an operator's retry and resolve decisions;
+per-client rate limits, including IPv6 /64 grouping and trusted proxies; the
+redaction of RPC URLs from API errors; and alert cooldowns:
 
 ```
 cd daemon
+npm ci
+npm test
+```
+
+Watcher unit tests: rebuilding a vault's books from its events, backing net
+of owed, queued and cancelled reservations, how long a reserve gap must last
+before it is a breach, and what the brake pauses and halts:
+
+```
+cd watcher
+npm ci
 npm test
 ```
 
@@ -909,13 +925,26 @@ the node through `e2e/fault-proxy.mjs`, which makes the node go silent right
 after a reissuance or a delivery is broadcast, drops the answer to a burn the
 node accepted, and the suite kills and restarts the daemon mid-mint. After
 each, the user must hold exactly what they deposited and the supply the chain
-reports must equal the daemon's ledger. Requires foundry, node >= 20 and a
-build of the Sequentia node (`sequentiad`/`sequentia-cli`; set `SEQ_REPO` to
-your checkout of the
-[Sequentia repo](https://github.com/ConcatenaLabs/Sequentia),
-the script looks in `build-linux/src` then `src`);
-the registry checks are skipped unless `REGISTRY_REPO` points at a checkout of
-`sequentia-registry`.
+reports must equal the daemon's ledger. Requires foundry, node >= 20, the
+daemon's dependencies (`npm ci` in `daemon/`) and the Sequentia node
+(`sequentiad`/`sequentia-cli`): either a release from the
+[download page](https://sequentiatestnet.com/download/core/), with
+`SEQ_BIN_DIR` set to the `bin/` directory of the unpacked tarball, or a build
+of the [Sequentia repo](https://github.com/ConcatenaLabs/Sequentia), with
+`SEQ_REPO` set to the checkout (the script looks in `build-linux/src`, then
+`src`). The registry checks are skipped unless `REGISTRY_REPO` points at a
+checkout of `sequentia-registry`. The suite takes about a quarter of an hour.
+
+```
+SEQ_BIN_DIR=~/sequentia-core-<version>/bin e2e/run-e2e.sh
+```
+
+GitHub Actions runs all of the above on every pull request and every push to
+`main` (`.github/workflows/ci.yml`): `forge build` and `forge test`, the
+daemon and watcher unit tests on Node 22, and the end-to-end suite against the
+Sequentia node release named in the workflow, whose tarball it checks against
+a pinned SHA-256. No job needs a secret; the Sepolia fork rehearsal is not
+run there.
 
 The keys in the e2e script are anvil's standard, publicly known development
 keys; they hold nothing on any real network.
@@ -1044,7 +1073,8 @@ protocol documentation lives in
 
 Development happens on `main`; open pull requests against it. Before
 committing, run `forge test` and, for daemon changes, `npm test` in `daemon/`
-and `e2e/run-e2e.sh`.
+and `e2e/run-e2e.sh`; for watcher changes, `npm test` in `watcher/`. CI runs
+the same checks on the pull request.
 Never commit `config.json`, `operator.key`, or state files (they are
 `.gitignore`d; keep it that way).
 

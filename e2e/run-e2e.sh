@@ -7,6 +7,11 @@
 # elementsd/elements-cli are accepted as a fallback. Needs 23.3.8 or later:
 # earlier consensus rejects the unblinded reissuance the bridge performs),
 # the daemon's node_modules installed.
+#
+# The node binaries are found in $SEQ_BIN_DIR when that is set (a directory
+# holding sequentiad and sequentia-cli, such as the bin/ of a release
+# tarball), otherwise under $SEQ_REPO (default ~/Sequentia): build-linux/src
+# on an out-of-tree build, else src/.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,12 +31,17 @@ SEQ_BIN="$SEQ_REPO/build-linux/src"
 [ -n "$(node_bin_in "$SEQ_BIN")" ] || SEQ_BIN="$SEQ_REPO/src"
 # A downloaded release build (with its shared libs beside it) beats a stale
 # in-tree binary; set SEQ_REPO explicitly to override either.
-if [ -z "${SEQ_REPO_SET:-}" ] && [ -n "$(node_bin_in "$HOME/seq-binaries-23.3.8/src")" ]; then
+if [ -z "${SEQ_REPO_SET:-}" ] && [ -z "${SEQ_BIN_DIR:-}" ] && [ -n "$(node_bin_in "$HOME/seq-binaries-23.3.8/src")" ]; then
   case "$("$(node_bin_in "$SEQ_BIN")" --version 2>/dev/null | head -1)" in
     *v23.3.[89]*|*v23.4*|*v24*) : ;; # in-tree binary is new enough
     *) SEQ_BIN="$HOME/seq-binaries-23.3.8/src"
        export LD_LIBRARY_PATH="$HOME/seq-binaries-23.3.8/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
   esac
+fi
+# An explicit binary directory beats every guess above.
+if [ -n "${SEQ_BIN_DIR:-}" ]; then
+  SEQ_BIN="$SEQ_BIN_DIR"
+  [ -n "$(node_bin_in "$SEQ_BIN")" ] || { echo "no sequentiad (or elementsd) in SEQ_BIN_DIR=$SEQ_BIN_DIR" >&2; exit 1; }
 fi
 ELD="$(node_bin_in "$SEQ_BIN")"
 if [ -x "$SEQ_BIN/sequentia-cli" ]; then ELC="$SEQ_BIN/sequentia-cli"; else ELC="$SEQ_BIN/elements-cli"; fi
