@@ -514,7 +514,7 @@ step is in flight. Every admin action is recorded in the state file's
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule) |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
 
@@ -528,6 +528,16 @@ protection, access control):
 ```
 cd contracts
 forge test
+```
+
+Daemon unit tests (the Solana CCTP V2 encoders and parsers, checked against
+fixtures produced by `@solana/web3.js` and Anchor over Circle's program IDLs,
+real attestation-service responses and a devnet simulation; no dependency
+needed):
+
+```
+cd daemon
+npm test
 ```
 
 Full end-to-end test:
@@ -605,7 +615,8 @@ protocol documentation lives in
 ## Contributing
 
 Development happens on `main`; open pull requests against it. Before
-committing, run `forge test` and, for daemon changes, `e2e/run-e2e.sh`.
+committing, run `forge test` and, for daemon changes, `npm test` in `daemon/`
+and `e2e/run-e2e.sh`.
 Never commit `config.json`, `operator.key`, or state files (they are
 `.gitignore`d; keep it that way).
 
