@@ -171,7 +171,9 @@ in the "Bridge from" selector:
 1. **Wrap**: enter the Sequentia address that should receive the bridged
    asset; the bridge returns a deposit address on the origin chain. Send BTC
    (testnet4), or SOL **or any SPL token** (devnet), to it from any wallet.
-   After 2 Bitcoin confirmations you receive SBTC 1:1; a Solana deposit is
+   Once a BTC deposit has one confirmation and Sequentia has anchored the
+   Bitcoin block holding it, you receive SBTC 1:1 (a Bitcoin reorg that undid
+   the deposit would then undo the credit too); a Solana deposit is
    minted once it is finalized and picked up by the bridge, usually under a
    minute: SOL as SOL.s, a token under its own origin-suffixed ticker, with
    the first deposit issuing the asset and later deposits by anyone minting
@@ -484,7 +486,7 @@ Configuration reference (`daemon/config.example.json`):
 | `registryUrl`, `registryAdminToken`, `assetDomain` | Asset Registry endpoint, optional admin token, and the entity domain written into asset contracts |
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
-| `sbtcBridgeUrl`, `sbtcBridgeToken`, `btcConfirmations` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg) |
+| `sbtcBridgeUrl`, `sbtcBridgeToken` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg); it decides when a deposit is credited, and reports it per address |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |
 | `solGenesisHash` | Expected cluster genesis hash, verified before the leg acts (the Ethereum chain-id check's Solana equivalent) |
 | `solKeyFile` | 32-byte hex seed for the Solana treasury and deposit-address derivation; generated on first boot, never commit it |
