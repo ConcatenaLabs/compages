@@ -13,23 +13,29 @@
 // so a condition that lasts a day produces a few messages rather than a
 // thousand.
 
+// How soon an alert whose delivery failed is tried again.
+const RETRY_MS = 5 * 60_000;
+
 export class Alerts {
   constructor(cfg, log) {
     this.url = cfg.alertUrl ?? null;
     this.token = cfg.alertToken ?? null;
     this.cooldownMs = (cfg.alertCooldownMinutes ?? 360) * 60_000;
     this.log = log;
-    this.active = new Map(); // key -> { lastSent, title }
+    this.active = new Map(); // key -> { nextAt, title }
   }
 
   /** Raise (or keep raising) the alert `key`. */
   async raise(key, title, message, { priority = 4, tags = ["warning"] } = {}) {
     const now = Date.now();
     const prev = this.active.get(key);
-    if (prev && now - prev.lastSent < this.cooldownMs) return;
-    this.active.set(key, { lastSent: now, title });
+    if (prev && now < prev.nextAt) return;
     this.log(`ALERT ${title}: ${message}`);
-    await this.post(title, message, priority, tags);
+    const delivered = await this.post(title, message, priority, tags);
+    // An alert that never reached the operator has not been sent: try it
+    // again soon rather than staying silent for the whole cooldown.
+    const wait = delivered ? this.cooldownMs : Math.min(this.cooldownMs, RETRY_MS);
+    this.active.set(key, { nextAt: now + wait, title });
   }
 
   /** Clear every active alert whose key is not in `stillActive`, telling the
@@ -43,10 +49,12 @@ export class Alerts {
     }
   }
 
+  /** Send one message. Answers whether it was delivered (true when no
+   *  alert URL is configured, since the log is then the only channel). */
   async post(title, message, priority, tags) {
-    if (!this.url) return;
+    if (!this.url) return true;
     try {
-      await fetch(this.url, {
+      const res = await fetch(this.url, {
         method: "POST",
         headers: {
           Title: `Compages: ${title}`.slice(0, 250),
@@ -57,8 +65,14 @@ export class Alerts {
         body: message,
         signal: AbortSignal.timeout(10_000),
       });
+      if (!res.ok) {
+        this.log(`alert delivery failed: HTTP ${res.status}`);
+        return false;
+      }
+      return true;
     } catch (e) {
       this.log(`alert delivery failed: ${e.message}`);
+      return false;
     }
   }
 }
