@@ -127,7 +127,15 @@ export class Cctp {
       const ata = ataAddress(treasury.address, src.token, src.tokenProgram ?? TOKEN_PROGRAM);
       const held = await sol.escrowBalance(treasury.address, src.token, src.tokenProgram ?? TOKEN_PROGRAM);
       const ledger = BigInt(src.escrowedUnits ?? "0");
-      const movable = (held < ledger ? held : ledger) - BigInt(this.c.solFloatUnits ?? "5000000");
+      // Releases already on their way out of the treasury are not movable:
+      // a burn and a release competing for the same funds leaves one waiting.
+      let inFlight = 0n;
+      for (const r of Object.values(this.bridge.state.data.solRedemptions ?? {})) {
+        if (r.tokenKey === src.tokenKey && !r.viaCctp && ["new", "releasing"].includes(r.status)) {
+          inFlight += BigInt(r.amountUnits ?? "0");
+        }
+      }
+      const movable = (held < ledger ? held : ledger) - inFlight - BigInt(this.c.solFloatUnits ?? "5000000");
       if (movable < BigInt(this.c.minConsolidateUnits ?? "1000000")) continue;
       if ((await sol.balance(treasury.address)) < BURN_LAMPORTS_NEEDED) {
         this.bridge.log(`cctp ${mapping.symbol}: treasury lamports too low to pay for a burn; waiting`);
@@ -388,7 +396,25 @@ export class Cctp {
     const vaultAddr = (await vault.getAddress()).toLowerCase();
     if (rec.stage === "attesting") {
       const msgs = await irisMessages({ sourceDomain: rec.sourceDomain, txHash: rec.txHash, baseUrl: this.iris });
-      const m = msgs.find((x) => x.status === "complete" && x.message && x.attestation);
+      // A transaction can carry several messages; take the one addressed to
+      // this bridge: minted to the vault (all 32 bytes), relayable by it.
+      const vault32 = ethers.zeroPadValue(vaultAddr, 32).toLowerCase();
+      const forUs = (x) => {
+        try {
+          const hh = parseMessageV2(x.message);
+          const bb = parseBurnBodyV2(hh.body);
+          const caller = `0x${Buffer.from(hh.destinationCaller).toString("hex")}`;
+          return (
+            hh.destinationDomain === DOMAIN.ethereum &&
+            `0x${Buffer.from(bb.mintRecipient).toString("hex")}` === vault32 &&
+            (caller === vault32 || /^0x0{64}$/.test(caller))
+          );
+        } catch {
+          return false;
+        }
+      };
+      const complete = msgs.filter((x) => x.status === "complete" && x.message && x.attestation);
+      const m = complete.find(forUs) ?? complete[0];
       if (!m) {
         const ageH = (Date.now() - Date.parse(rec.createdAt)) / 3_600_000;
         rec.waiting = msgs.length ? "waiting for Circle's attestation" : "Circle has not seen this burn yet";

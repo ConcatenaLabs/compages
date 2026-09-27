@@ -1,9 +1,10 @@
 {
   "ethChainName": "Sepolia",
   "ethChainId": 11155111,
-  "ethRpcUrl": "https://sepolia.drpc.org",
+  "ethRpcUrl": "<Sepolia JSON-RPC endpoint that answers eth_getLogs over the vault's whole history>",
   "vaultAddress": "0x0000000000000000000000000000000000000000",
   "vaultDeployBlock": 0,
+  "vaults": [{ "address": "0x0000000000000000000000000000000000000000", "deployBlock": 0, "version": 3 }],
   "ethConfirmations": 5,
   "ethLogChunk": 5000,
   "operatorKeyFile": "operator.key",

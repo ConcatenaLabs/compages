@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Compages: bridge into the Sequentia network</title>
-<meta name="description" content="Compages bridges assets into the Sequentia network from Ethereum, Solana and Bitcoin.">
+<meta name="description" content="Compages bridges assets into the Sequentia network from Ethereum and Solana, pegs bitcoin as SBTC for the few uses that need it, and connects USDC from other chains through Circle's CCTP.">
 <style>
   :root {
     --ink: #0b0e11;
@@ -492,7 +492,7 @@
       </div>
 
       <div class="field">
-        <span class="flabel">Ethereum wallet</span>
+        <span class="flabel">Wallet</span>
         <div class="row">
           <button class="action secondary" id="cctp-connect" aria-describedby="cctp-wallet-line">Connect wallet</button>
           <span class="statusline" id="cctp-wallet-line" aria-live="polite"></span>
@@ -541,6 +541,7 @@
           <input class="mono" id="cctp-track-hash" placeholder="0x&hellip; transaction hash" spellcheck="false" autocomplete="off">
           <button class="action secondary" id="btn-cctp-track">Track</button>
         </div>
+        <div class="note" style="margin-top:6px">A burn made elsewhere, in another tab or on another device, is picked up by entering its hash here.</div>
       </div>
     </div>
   </div>
@@ -764,6 +765,8 @@
     single operator. It locks ether and ERC-20 tokens in a vault on Ethereum,
     SOL and SPL tokens with the operator on Solana, and bitcoin in an
     operator-held reserve for SBTC, and mints the matching asset on Sequentia.
+    USDC from other chains arrives through Circle's CCTP in the same Ethereum
+    vault.
     The operator performs every mint and release and holds every reserve, so
     using the bridge means trusting the operator. How each reserve is held is
     stated below; do not assume a threshold of signers where none is named.

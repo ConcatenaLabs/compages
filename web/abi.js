@@ -16,8 +16,19 @@ export const SEL = {
 };
 
 const strip0x = (h) => (h.startsWith("0x") ? h.slice(2) : h);
-export const word = (v) => BigInt(v).toString(16).padStart(64, "0");
-export const wordAddr = (a) => strip0x(a).toLowerCase().padStart(64, "0");
+const WORD_LIMIT = 1n << 256n;
+/** A uint256 head word. Anything outside 0 ≤ v < 2^256 would encode a
+ *  different number than the caller meant, so it is refused. */
+export function word(v) {
+  const b = BigInt(v);
+  if (b < 0n || b >= WORD_LIMIT) throw new RangeError(`not a uint256: ${String(v)}`);
+  return b.toString(16).padStart(64, "0");
+}
+/** An address head word: exactly 20 bytes, 0x-prefixed. */
+export function wordAddr(a) {
+  if (typeof a !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(a)) throw new Error(`not a 20-byte address: ${String(a)}`);
+  return a.slice(2).toLowerCase().padStart(64, "0");
+}
 
 /** Dynamic `bytes` from hex: its length, then the data right-padded to 32. */
 export function encBytesHex(hex) {
