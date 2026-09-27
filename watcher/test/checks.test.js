@@ -15,6 +15,7 @@ function books(events) {
 test("balanced books raise nothing", () => {
   const b = books([
     ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
     ["Released", { token: USDC, amount: 40n, to: "0xabc" }],
   ]);
   assert.deepEqual(checkVault(V, b, { [USDC]: 60n }, 1), []);
@@ -32,19 +33,28 @@ test("paying out more than was deposited is critical", () => {
 });
 
 test("funds leaving without an event are caught by the balance", () => {
-  const b = books([["Deposited", { token: USDC, amount: 100n }]]);
+  const b = books([
+    ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
+  ]);
   const p = checkVault(V, b, { [USDC]: 70n }, 1);
   assert.equal(p.length, 1);
   assert.match(p[0].key, /short$/);
 });
 
 test("a donation (more held than booked) is not a problem", () => {
-  const b = books([["Deposited", { token: USDC, amount: 100n }]]);
+  const b = books([
+    ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
+  ]);
   assert.deepEqual(checkVault(V, b, { [USDC]: 150n }, 1), []);
 });
 
 test("an RPC that drops a deposit log is caught by the vault's own counter", () => {
-  const b = books([["Deposited", { token: USDC, amount: 100n }]]);
+  const b = books([
+    ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
+  ]);
   const p = checkVault(V, b, { [USDC]: 100n }, 2);
   assert.equal(p.length, 1);
   assert.equal(p[0].rescan, true);
@@ -66,7 +76,9 @@ test("owed payouts count as committed until claimed", () => {
 test("rebalancing in and out, and the Circle hand-off burn, are booked", () => {
   const b = books([
     ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
     ["RebalancedIn", { token: USDC, amount: 50n }],
+    ["TokenIn", { token: USDC, amount: 50n }],
     ["Rebalanced", { token: USDC, amount: 20n }],
     ["LockedStablecoinBurned", { token: USDC, amount: 130n }],
   ]);
@@ -78,9 +90,28 @@ test("rebalancing in and out, and the Circle hand-off burn, are booked", () => {
 test("USDC that arrived with an unrecognised purpose is booked as in", () => {
   const b = books([
     ["CctpUnrecognized", { token: USDC, amount: 7n }],
+    ["TokenIn", { token: USDC, amount: 7n }],
     ["Refunded", { token: USDC, amount: 7n, to: "0xabc" }],
   ]);
   assert.deepEqual(checkVault(V, b, { [USDC]: 0n }, 0), []);
+});
+
+test("ERC-20 arriving with no vault event (a CCTP mint, a migration) still counts as in", () => {
+  // A migration from another vault is a plain transfer; paying it back out
+  // must not read as paying out more than came in.
+  const b = books([
+    ["TokenIn", { token: USDC, amount: 15n }],
+    ["Rebalanced", { token: USDC, amount: 15n }],
+  ]);
+  assert.deepEqual(checkVault(V, b, { [USDC]: 0n }, 0), []);
+});
+
+test("an ERC-20 vault event alone does not double-count what the Transfer logs already count", () => {
+  const b = books([
+    ["Deposited", { token: USDC, amount: 100n }],
+    ["TokenIn", { token: USDC, amount: 100n }],
+  ]);
+  assert.equal(b.tokens[USDC].in, 100n);
 });
 
 test("an unknown event moves nothing", () => {
