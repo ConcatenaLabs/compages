@@ -17,6 +17,7 @@
     --ether: #8b95fc;
     --btc: #f7931a;
     --sol: #9d6cff;
+    --usdc: #5b9bff;
     --ok: #57c98a;
     --warn: #ff6f61;
     --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
@@ -73,6 +74,7 @@
   .net.eth { border-color: color-mix(in srgb, var(--ether) 45%, transparent); color: var(--ether); }
   .net.btc { border-color: color-mix(in srgb, var(--btc) 45%, transparent); color: var(--btc); }
   .net.sol { border-color: color-mix(in srgb, var(--sol) 45%, transparent); color: var(--sol); }
+  .net.cctp { border-color: color-mix(in srgb, var(--usdc) 45%, transparent); color: var(--usdc); }
   .net.seq { border-color: color-mix(in srgb, var(--gold) 45%, transparent); color: var(--gold); }
   .nets .beam { color: var(--gold); letter-spacing: -1px; }
 
@@ -263,6 +265,22 @@
   .porrow.retired { opacity: .6; }
   .result { display: flex; flex-direction: column; gap: 18px; }
   .trackbox { border-top: 1px solid var(--line); padding-top: 18px; gap: 10px; }
+  .claimbtn { margin-left: 4px; color: var(--gold); border-color: color-mix(in srgb, var(--gold) 45%, transparent); }
+  .inline.wrap { flex-wrap: wrap; }
+  .inline.wrap select { width: auto; }
+  .inline.wrap input { min-width: 12em; }
+
+  /* One dialog for every claim the page can make: a payout the vault holds
+     for its recipient, or a CCTP mint waiting on another chain. */
+  dialog {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px; width: min(520px, calc(100vw - 24px)); max-width: none;
+    margin: auto; /* the page resets every margin; a modal dialog centres on auto */
+  }
+  dialog .note { overflow-wrap: anywhere; }
+  dialog::backdrop { background: rgb(0 0 0 / 60%); }
+  dialog h2 { font-size: 17px; margin-bottom: 10px; }
+  dialog .stack { display: flex; flex-direction: column; gap: 14px; }
   .hide { display: none !important; }
 
   @media (max-width: 520px) {
@@ -277,6 +295,8 @@
     .payside { width: 100%; }
     .truss .labels div { font-size: 10.5px; }
     .state { text-align: left; }
+    .inline.wrap select { flex-basis: 100%; }
+    dialog { padding: 16px; }
   }
 </style>
 </head>
@@ -412,8 +432,16 @@
         <div class="events scrolllist" id="red-assets"><span class="note">none bridged yet</span></div>
       </div>
 
+      <!-- USDC.e can be paid out on any chain Circle's CCTP reaches; every
+           other asset is released from the vault on Sepolia. -->
+      <div class="field hide" id="red-domain-field">
+        <label for="red-domain">Receive on</label>
+        <select class="mono" id="red-domain" aria-describedby="red-domain-note"></select>
+        <div class="note" id="red-domain-note" style="margin-top:6px"></div>
+      </div>
+
       <div class="field">
-        <label for="ethaddr-input">Your Ethereum address (receives the funds)</label>
+        <label for="ethaddr-input" id="ethaddr-label">Your Ethereum address (receives the funds)</label>
         <input class="mono" id="ethaddr-input" placeholder="0x&hellip; address" spellcheck="false" autocomplete="off">
       </div>
 
@@ -443,6 +471,75 @@
         <div class="inline">
           <input class="mono" id="resume-red-input" placeholder="tb1&hellip; redemption address" spellcheck="false" autocomplete="off">
           <button class="action secondary" id="btn-resume-red">Look up</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  </section>
+
+  <!-- ===================== USDC from another chain (CCTP) ===================== -->
+  <!-- The user burns USDC on another chain with Circle's CCTP; the burn names
+       the vault as the only party that can complete it, and the vault turns it
+       into a deposit of the one USDC.e asset. -->
+  <section class="leg hide" id="leg-cctp" aria-label="USDC from another chain">
+  <div class="card" id="cctp-card">
+    <div class="body">
+      <div class="note" id="cctp-intro"></div>
+
+      <div class="field">
+        <label for="cctp-chain">Source chain</label>
+        <select class="mono" id="cctp-chain"></select>
+      </div>
+
+      <div class="field">
+        <span class="flabel">Ethereum wallet</span>
+        <div class="row">
+          <button class="action secondary" id="cctp-connect" aria-describedby="cctp-wallet-line">Connect wallet</button>
+          <span class="statusline" id="cctp-wallet-line" aria-live="polite"></span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="cctp-amount">Amount of USDC</label>
+        <input class="mono" id="cctp-amount" placeholder="0.0" inputmode="decimal" spellcheck="false" autocomplete="off" aria-describedby="cctp-amount-note">
+        <div class="note" id="cctp-amount-note" style="margin-top:6px">Up to 6 decimal places.</div>
+      </div>
+
+      <div class="field">
+        <div class="labelrow">
+          <label for="cctp-seqaddr">Your Sequentia address (receives USDC.e)</label>
+          <button type="button" class="walletfill hide" data-fill="cctp-seqaddr">Use my Sequentia wallet</button>
+        </div>
+        <input class="mono" id="cctp-seqaddr" data-seqaddr placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="cctp-seqaddr-check">
+        <div class="addrcheck" id="cctp-seqaddr-check" aria-live="polite"></div>
+      </div>
+
+      <div class="tokencard preview hide" id="cctp-preview" aria-live="polite"></div>
+
+      <button class="action" id="btn-cctp" disabled>Burn USDC and bridge it</button>
+      <div class="statusline" id="cctp-status" aria-live="polite"></div>
+
+      <div class="truss" id="cctp-truss">
+        <div class="spans" aria-hidden="true">
+          <div class="span-seg" id="cseg-0"></div>
+          <div class="span-seg" id="cseg-1"></div>
+          <div class="span-seg" id="cseg-2"></div>
+          <div class="span-seg" id="cseg-3"></div>
+        </div>
+        <div class="labels">
+          <div id="clab-0">burned</div>
+          <div id="clab-1">attested</div>
+          <div id="clab-2">at the vault</div>
+          <div id="clab-3">delivered</div>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:6px">
+        <label for="cctp-track-hash">Track a burn</label>
+        <div class="inline wrap">
+          <select class="mono" id="cctp-track-chain" aria-label="Chain the burn was made on"></select>
+          <input class="mono" id="cctp-track-hash" placeholder="0x&hellip; transaction hash" spellcheck="false" autocomplete="off">
+          <button class="action secondary" id="btn-cctp-track">Track</button>
         </div>
       </div>
     </div>
@@ -689,6 +786,22 @@
   </div>
   <div class="por" id="por-body" aria-live="polite"><div class="center">&hellip;</div></div>
 </footer>
+
+<dialog id="claim-dialog" aria-labelledby="claim-title">
+  <div class="stack">
+    <h2 id="claim-title">Claim</h2>
+    <div class="note" id="claim-body"></div>
+    <div class="field hide" id="claim-payto-field">
+      <label for="claim-payto">Pay to</label>
+      <input class="mono" id="claim-payto" placeholder="0x&hellip; address" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="row">
+      <button class="action" id="claim-go" style="width:auto;padding:11px 18px">Claim</button>
+      <button class="action secondary" id="claim-close">Close</button>
+    </div>
+    <div class="statusline" id="claim-status" aria-live="polite"></div>
+  </div>
+</dialog>
 
 <div class="sr-only" id="announce" aria-live="polite"></div>
 <script type="module" src="app.js"></script>

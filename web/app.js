@@ -1,15 +1,18 @@
 // Compages web app. No framework, no external dependencies: contract calls
-// are ABI-encoded by hand against the vault's small, fixed interface, and QR
+// are ABI-encoded by hand (abi.js) against small, fixed interfaces, and QR
 // codes come from the page's own encoder (qr.js).
 
 import { qrSvg } from "./qr.js";
-
-const SEL = {
-  depositEther: "0x77c76321", // depositEther(string)
-  depositToken: "0xa10d0960", // depositToken(address,uint256,string)
-  allowance: "0xdd62ed3e", // allowance(address,address)
-  approve: "0x095ea7b3", // approve(address,uint256)
-};
+import {
+  ZERO_ADDRESS,
+  dataAllowance,
+  dataApprove,
+  dataClaim,
+  dataDepositEther,
+  dataDepositForBurnWithHook,
+  dataDepositToken,
+  dataReceiveMessage,
+} from "./abi.js";
 
 const $ = (id) => document.getElementById(id);
 // Resolve the API relative to this module's own URL, so the app works whether
@@ -105,23 +108,6 @@ function sayHtml(id, html, tone) {
   el.classList.toggle("err", tone === "err");
   el.classList.toggle("ok", tone === "ok");
 }
-
-// ---------- ABI helpers ----------
-const strip0x = (h) => (h.startsWith("0x") ? h.slice(2) : h);
-const word = (v) => BigInt(v).toString(16).padStart(64, "0");
-const wordAddr = (a) => strip0x(a).toLowerCase().padStart(64, "0");
-function wordsString(s) {
-  const bytes = new TextEncoder().encode(s);
-  let hex = "";
-  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
-  const padded = hex.padEnd(Math.ceil(hex.length / 64) * 64 || 64, "0");
-  return word(bytes.length) + padded;
-}
-const dataDepositEther = (seqAddr) => SEL.depositEther + word(0x20) + wordsString(seqAddr);
-const dataDepositToken = (tok, units, seqAddr) =>
-  SEL.depositToken + wordAddr(tok) + word(units) + word(0x60) + wordsString(seqAddr);
-const dataAllowance = (owner, spender) => SEL.allowance + wordAddr(owner) + wordAddr(spender);
-const dataApprove = (spender, units) => SEL.approve + wordAddr(spender) + word(units);
 
 // ---------- amounts ----------
 /** Parse a decimal amount into base units. `precision` is the Sequentia
@@ -508,6 +494,8 @@ function renderWallet() {
     say("wallet-line", "connected", "ok");
   }
   updateDepositButton();
+  renderCctpWallet();
+  renderClaim();
 }
 
 /** With a connected account, fill the redemption form and show that
@@ -809,12 +797,12 @@ function renderDepositPreview() {
  *  the receipt, or why there is none: replaced (a speed-up or cancel reused
  *  its nonce), missing (Ethereum never saw it), timeout, or cancelled (a
  *  newer tracker took over). */
-async function waitReceipt(hash, trackId = null, onNote = () => {}) {
+async function waitReceipt(hash, alive = () => true, onNote = () => {}) {
   const started = Date.now();
   let seen = null;
   let lastSeenAt = Date.now();
   for (;;) {
-    if (trackId !== null && trackId !== depTrackId) return { kind: "cancelled" };
+    if (!alive()) return { kind: "cancelled" };
     try {
       const r = await rpc("eth_getTransactionReceipt", [hash]);
       if (r) return { kind: "receipt", receipt: r };
@@ -841,16 +829,36 @@ async function waitReceipt(hash, trackId = null, onNote = () => {}) {
   }
 }
 
-async function waitApproval(hash) {
+async function waitApproval(hash, again = "press Deposit again") {
   const r = await waitReceipt(hash);
   if (r.kind === "receipt") {
-    if (r.receipt.status !== "0x1") throw new Error("The approval failed on Ethereum. Nothing was deposited.");
+    if (r.receipt.status !== "0x1") throw new Error("The approval failed. Nothing was deposited.");
     return;
   }
   if (r.kind === "replaced") {
-    throw new Error("The approval was replaced in your wallet. Once the new one is mined, press Deposit again.");
+    throw new Error(`The approval was replaced in your wallet. Once the new one is mined, ${again}.`);
   }
-  throw new Error("The approval was not mined. Check your wallet, then press Deposit again.");
+  throw new Error(`The approval was not mined. Check your wallet, then ${again}.`);
+}
+
+/** Make sure `spender` may take `units` of `tokenAddr` from the account,
+ *  approving if not. Some tokens (USDT among them) refuse to change one
+ *  non-zero allowance into another, so an existing one goes to zero first. */
+async function ensureAllowance(tokenAddr, spender, units, symbol, statusId, btn, again) {
+  const hex = await rpc("eth_call", [{ to: tokenAddr, data: dataAllowance(account, spender) }, "latest"]);
+  const allowance = BigInt(!hex || hex === "0x" ? 0 : hex);
+  if (allowance >= units) return;
+  if (allowance > 0n) {
+    btn.textContent = "Reset the allowance in your wallet…";
+    say(statusId, `${symbol} needs its current allowance set to zero before a new one. Confirm that first.`);
+    const h0 = await rpc("eth_sendTransaction", [{ from: account, to: tokenAddr, data: dataApprove(spender, 0n) }]);
+    say(statusId, `Allowance reset sent (${short(h0)}); waiting for it to be mined.`);
+    await waitApproval(h0, again);
+  }
+  btn.textContent = `Approve ${symbol} in your wallet…`;
+  const h = await rpc("eth_sendTransaction", [{ from: account, to: tokenAddr, data: dataApprove(spender, units) }]);
+  say(statusId, `Approval sent (${short(h)}); waiting for it to be mined.`);
+  await waitApproval(h, again);
 }
 
 async function deposit() {
@@ -878,23 +886,7 @@ async function deposit() {
     if (t.token === "eth") {
       txParams = { from: account, to: vault, value: "0x" + amt.units.toString(16), data: dataDepositEther(seqAddr) };
     } else {
-      const hex = await rpc("eth_call", [{ to: t.token, data: dataAllowance(account, vault) }, "latest"]);
-      const allowance = BigInt(!hex || hex === "0x" ? 0 : hex);
-      if (allowance < amt.units) {
-        if (allowance > 0n) {
-          // Some tokens (USDT among them) refuse to change one non-zero
-          // allowance into another; it has to go through zero first.
-          btn.textContent = "Reset the allowance in your wallet…";
-          say("dep-status", `${t.symbol} needs its current allowance set to zero before a new one. Confirm that first.`);
-          const h0 = await rpc("eth_sendTransaction", [{ from: account, to: t.token, data: dataApprove(vault, 0n) }]);
-          say("dep-status", `Allowance reset sent (${short(h0)}); waiting for it to be mined.`);
-          await waitApproval(h0);
-        }
-        btn.textContent = `Approve ${t.symbol} in your wallet…`;
-        const h = await rpc("eth_sendTransaction", [{ from: account, to: t.token, data: dataApprove(vault, amt.units) }]);
-        say("dep-status", `Approval sent (${short(h)}); waiting for it to be mined.`);
-        await waitApproval(h);
-      }
+      await ensureAllowance(t.token, vault, amt.units, t.symbol, "dep-status", btn, "press Deposit again");
       txParams = { from: account, to: vault, data: dataDepositToken(t.token, amt.units, seqAddr) };
     }
     btn.textContent = "Confirm the deposit in your wallet…";
@@ -951,7 +943,7 @@ async function trackDeposit(rawHash, { sent = false } = {}) {
     // With a wallet on the right network, follow the transaction itself: a
     // failed, replaced or unrelated transaction is caught at once.
     if (walletReady()) {
-      const r = await waitReceipt(hash, id, (n) => line(escapeHtml(n)));
+      const r = await waitReceipt(hash, alive, (n) => line(escapeHtml(n)));
       if (!alive() || r.kind === "cancelled") return;
       if (r.kind !== "receipt") {
         setSeg(0, "bad");
@@ -1135,14 +1127,33 @@ function describeDeposit(dep, leg, amountText) {
       cls = "bad";
       stage = 1;
       break;
-    case "refunded":
-      html =
-        `Refunded on ${escapeHtml(leg.chain)}: this deposit could not be bridged (${reason}).` +
-        (dep.refundTxHash ? ` Refund ${ethTxLink(dep.refundTxHash)}.` : "");
+    case "queued":
+    case "refund_queued":
+      html = `This deposit cannot be bridged (${reason}). ${queuedText(dep.executeAfter)}`;
       cls = "bad";
       stage = 1;
-      terminal = true;
       break;
+    case "refund_cancelled":
+      html = `This deposit cannot be bridged (${reason}), and its refund was stopped. ${GUARDIAN_TEXT}`;
+      cls = "bad";
+      stage = 1;
+      break;
+    case "refunded": {
+      stage = 1;
+      cls = "bad";
+      terminal = true;
+      if (dep.cctpOut) {
+        const o = cctpOutHtml(dep);
+        html = `This deposit could not be bridged (${reason}), so it is being returned.${o.html}`;
+        terminal = dep.cctpOut.stage === "claimed";
+        break;
+      }
+      html =
+        `Refunded on ${escapeHtml(leg.chain)}: this deposit could not be bridged (${reason}).` +
+        (dep.refundTxHash ? ` Refund ${ethTxLink(dep.refundTxHash)}.` : "") +
+        deferredHtml(dep, "refund");
+      break;
+    }
     case "refund_failed_manual":
       html = `This deposit cannot be bridged (${reason}), and the refund could not be sent automatically. The operator has been alerted. ${safe}`;
       cls = "bad";
@@ -1250,13 +1261,28 @@ function describeRedemption(ev, leg) {
     case "unresolved":
       html = "Confirming the payout transaction. Nothing is lost; it is checked again every minute.";
       break;
+    case "queued":
+      html = queuedText(ev.executeAfter);
+      break;
+    case "release_cancelled":
+      html = GUARDIAN_TEXT;
+      cls = "bad";
+      break;
     case "released":
     case "destroy_pending":
     case "destroying":
     case "destroy_manual":
     case "done":
-      html = `Released on ${escapeHtml(leg.chain)}.`;
-      cls = "ok";
+      if (ev.cctpOut) {
+        const o = cctpOutHtml(ev);
+        html = o.html.trim();
+        cls = o.cls;
+      } else if (ev.deferred?.to) {
+        html = `Released on ${escapeHtml(leg.chain)}.${deferredHtml(ev, "payment")}`;
+      } else {
+        html = `Released on ${escapeHtml(leg.chain)}.`;
+        cls = "ok";
+      }
       break;
     case "dust_ignored":
       html = `Too small to release on ${escapeHtml(leg.chain)}. It is set aside for the operator.`;
@@ -1315,14 +1341,18 @@ function renderRedemptions(boxId, r, leg, seqAddress) {
 // Ethereum redemptions. `origin` records why an address is on screen, so a
 // wallet connecting later does not replace one the user asked for.
 let ethRedeem = null;
-function showEthRedemption(seqAddress, ethAddress, origin = "user") {
-  ethRedeem = { seqAddress, ethAddress, origin };
-  store.set("eth.redeem", { seqAddress, ethAddress });
+function showEthRedemption(seqAddress, ethAddress, origin = "user", domain = 0) {
+  ethRedeem = { seqAddress, ethAddress, origin, domain };
+  store.set("eth.redeem", { seqAddress, ethAddress, domain });
   $("red-result").classList.remove("hide");
   showPayTarget("red", seqAddress, null, "redemption address");
-  $("red-note").textContent = ethAddress
-    ? `Releases go to ${ethAddress} on ${ethName()}. This is the redemption address for that Ethereum address; asking again returns the same one.`
-    : "";
+  const where = cctpChainName(domain);
+  $("red-note").textContent = !ethAddress
+    ? ""
+    : Number(domain)
+      ? `USDC.e sent here is paid to ${ethAddress} on ${where}; any other asset is paid on ${ethName()}. ` +
+        "This is the redemption address for that address and chain; asking again returns the same one."
+      : `Releases go to ${ethAddress} on ${ethName()}. This is the redemption address for that Ethereum address; asking again returns the same one.`;
   $("red-events").innerHTML = `<span class="note">Loading…</span>`;
   poll("ethRedeem", () => refreshEthRedemptions(seqAddress), 8000);
 }
@@ -1332,19 +1362,29 @@ async function refreshEthRedemptions(seqAddress) {
   renderRedemptions("red-events", r, ETH_REDEEM_LEG(), seqAddress);
 }
 
+/** The payout chain picked under "Receive on": 0 is the vault's own chain. */
+const redeemDomain = () => (status?.cctp ? Number($("red-domain").value || 0) : 0);
+
 async function createIntent() {
   const ethAddr = $("ethaddr-input").value.trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(ethAddr)) {
-    say("red-status", "Enter an Ethereum address: 0x followed by 40 hex characters.", "err");
+  const domain = redeemDomain();
+  const solana = domain === 5;
+  if (solana ? !SOL_ADDR.test(ethAddr) : !/^0x[0-9a-fA-F]{40}$/.test(ethAddr)) {
+    say(
+      "red-status",
+      solana ? "Enter a Solana address (base58, 32 to 44 characters)." : "Enter an Ethereum address: 0x followed by 40 hex characters.",
+      "err"
+    );
     return;
   }
   const btn = $("btn-intent");
   btn.disabled = true;
   say("red-status", "Requesting your redemption address…");
   try {
-    const r = await postJson("redeem", { ethAddress: ethAddr });
+    const body = status?.cctp ? { ethAddress: ethAddr, destinationDomain: domain } : { ethAddress: ethAddr };
+    const r = await postJson("redeem", body);
     say("red-status", "");
-    showEthRedemption(r.seqAddress, r.ethAddress ?? ethAddr, "user");
+    showEthRedemption(r.seqAddress, r.ethAddress ?? ethAddr, "user", r.destinationDomain ?? domain);
   } catch (e) {
     say("red-status", e.message, "err");
   } finally {
@@ -1812,6 +1852,601 @@ async function refreshSolRedemptions(seqAddress) {
   renderRedemptions("sol-unwrap-events", r, SOL_REDEEM_LEG(), seqAddress);
 }
 
+// ---------- payouts the vault holds back: queued, stopped, deferred ----------
+const GUARDIAN_TEXT = "Stopped by the bridge's guardian; the operator decides what happens next.";
+
+/** A payout over the vault's rate limit waits in a queue until `executeAfter`. */
+function queuedText(executeAfter) {
+  const t = Date.parse(executeAfter ?? "");
+  if (!Number.isFinite(t)) return "Over the vault's rate limit: paid automatically once the limit allows.";
+  const when = new Date(t).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  const mins = (t - Date.now()) / 60_000;
+  const rel = mins > 0.5 ? `in ${fmtMinutes(mins).replace(/^about /, "")}` : "any moment now";
+  return `Over the vault's rate limit: paid automatically after ${escapeHtml(when)} (${escapeHtml(rel)}).`;
+}
+
+// Claims the page can start, keyed by the data-claim attribute of their
+// button. Lists re-render on every poll, so the buttons only carry a key.
+const claimables = new Map();
+const recordId = (rec) => rec.key ?? (rec.txid ? `${rec.txid}:${rec.vout}` : rec.ethTxHash ?? rec.nonce ?? "record");
+
+/** The token claim() takes for a record: the zero address for ether, else
+ *  the Ethereum token address from its tokenKey ("11155111:0x…"). */
+function claimTokenOf(rec) {
+  const tk = String(rec.tokenKey ?? "");
+  if (tk.endsWith(":eth")) return ZERO_ADDRESS;
+  const t = tk.split(":")[1] ?? "";
+  return /^0x[0-9a-fA-F]{40}$/.test(t) ? t : null;
+}
+
+/** A payout the recipient refused (a contract that rejects plain ether, for
+ *  example): the vault holds it for that address, which can claim it. */
+function deferredHtml(rec, what) {
+  const d = rec.deferred;
+  if (!d?.to) return "";
+  const tokenAddr = claimTokenOf(rec);
+  const isEther = tokenAddr === ZERO_ADDRESS;
+  const a = tokenAddr && !isEther ? assetForToken(ETH_CHAIN(), tokenAddr) : null;
+  const decimals = isEther ? 18 : a ? sourceOn(a, ETH_CHAIN())?.decimals : null;
+  const symbol = isEther ? "ETH" : a?.symbol ?? rec.symbol ?? "tokens";
+  const amountText = decimals != null ? `${formatAtoms(d.amount, decimals)} ${symbol}` : `${d.amount} base units of ${symbol}`;
+  const key = `deferred:${recordId(rec)}`;
+  claimables.set(key, { kind: "deferred", to: d.to, amountText, token: tokenAddr, vault: rec.vault || status.vaultAddress });
+  return (
+    ` The receiving address refused the ${what}, so the vault holds ${escapeHtml(amountText)} for ${escapeHtml(short(d.to))}.` +
+    (tokenAddr ? ` <button type="button" class="copybtn claimbtn" data-claim="${escapeHtml(key)}">Claim</button>` : "")
+  );
+}
+
+// ---------- CCTP: USDC to and from other chains ----------
+const cctpChains = () => status?.cctp?.chains ?? [];
+const cctpChain = (domain) => cctpChains().find((c) => Number(c.domain) === Number(domain)) ?? null;
+function cctpChainName(domain) {
+  if (Number(domain) === 0) return ethName();
+  if (Number(domain) === 5) return cctpChain(5)?.name ?? "Solana";
+  return cctpChain(domain)?.name ?? `CCTP domain ${Number(domain)}`;
+}
+/** Chains a user can burn USDC on from this page: EVM chains other than the vault's own. */
+const cctpInboundChains = () =>
+  cctpChains().filter(
+    (c) => Number(c.chainId) > 0 && ![0, 5].includes(Number(c.domain)) && /^0x[0-9a-fA-F]{40}$/.test(c.usdc ?? "")
+  );
+function chainTxLink(chain, hash, text) {
+  const label = escapeHtml(text ?? short(hash));
+  if (!/^https:\/\//.test(chain?.explorer ?? "") || !/^0x[0-9a-fA-F]{64}$/.test(hash ?? "")) return label;
+  return `<a href="${escapeHtml(chain.explorer.replace(/\/+$/, ""))}/tx/${hash}" target="_blank" rel="noopener">${label}</a>`;
+}
+const usdcAsset = () => assets.find((a) => a.unified && a.symbol === "USDC") ?? null;
+const usdcTicker = () => tickerOf(usdcAsset()) || "USDC.e";
+const usdcPrecision = () => usdcAsset()?.precision ?? 6;
+
+/** A payout that leaves the vault through CCTP: burned on the vault's chain,
+ *  attested by Circle, then minted on the destination chain by whoever sends
+ *  the attested message there (the bridge itself for Solana). */
+function cctpOutHtml(rec) {
+  const o = rec.cctpOut;
+  const name = escapeHtml(cctpChainName(o.domain));
+  const solana = Number(o.domain) === 5;
+  const burn = o.burnTx ? ` ${ethTxLink(o.burnTx, "burn transaction")}` : "";
+  switch (o.stage) {
+    case "attesting":
+      return { html: ` Burned on ${escapeHtml(ethName())} for minting on ${name}; waiting for Circle's attestation.${burn}`, cls: "wait" };
+    case "claimable": {
+      if (solana || !o.message || !o.attestation) {
+        return { html: ` Attested by Circle. The bridge is minting it on ${name}.${burn}`, cls: "wait" };
+      }
+      const key = `cctp:${Number(o.domain)}:${o.burnTx ?? recordId(rec)}`;
+      claimables.set(key, { kind: "cctp", domain: Number(o.domain), message: o.message, attestation: o.attestation });
+      return {
+        html:
+          ` Attested by Circle and ready to mint on ${name}.${burn} ` +
+          `<button type="button" class="copybtn claimbtn" data-claim="${escapeHtml(key)}">Claim on ${name}</button>`,
+        cls: "wait",
+      };
+    }
+    case "claimed":
+      return {
+        html: solana
+          ? ` Minted on ${name}.`
+          : ` Claimed on ${name}.${o.claimTx ? ` ${chainTxLink(cctpChain(o.domain), o.claimTx, "claim transaction")}` : ""}`,
+        cls: "ok",
+      };
+    default:
+      return { html: ` CCTP transfer to ${name}: ${escapeHtml(o.stage)}.`, cls: "wait" };
+  }
+}
+
+/** Ask the wallet to move to `chain`, adding it first when the wallet does
+ *  not know it (error 4902). */
+async function switchChain(chain) {
+  const want = Number(chain.chainId);
+  if (walletChainId === want) return;
+  const hex = "0x" + want.toString(16);
+  try {
+    await rpc("wallet_switchEthereumChain", [{ chainId: hex }]);
+  } catch (e) {
+    const code = e?.code ?? e?.data?.originalError?.code;
+    if (code !== 4902 || !chain.rpc) throw e;
+    const avax = want === 43113;
+    await rpc("wallet_addEthereumChain", [
+      {
+        chainId: hex,
+        chainName: chain.name,
+        rpcUrls: [chain.rpc],
+        blockExplorerUrls: chain.explorer ? [chain.explorer] : [],
+        nativeCurrency: avax ? { name: "Avalanche", symbol: "AVAX", decimals: 18 } : { name: "Ether", symbol: "ETH", decimals: 18 },
+      },
+    ]);
+  }
+  walletChainId = parseInt(await rpc("eth_chainId"), 16);
+  renderWallet();
+  if (walletChainId !== want) throw new Error(`Your wallet is still on another network. Switch it to ${chain.name}.`);
+}
+
+// ---------- the claim dialog ----------
+let claimCur = null;
+let claimBusy = false;
+const claimTarget = (c) =>
+  c.kind === "deferred"
+    ? { chainId: status.ethChainId, name: ethName(), explorer: ETHERSCAN[status.ethChainId] ?? null }
+    : cctpChain(c.domain);
+
+function openClaim(key) {
+  const c = claimables.get(key);
+  if (!c || !status) return;
+  claimCur = c;
+  const target = claimTarget(c);
+  const dlg = $("claim-dialog");
+  if (c.kind === "deferred") {
+    $("claim-title").textContent = `Claim ${c.amountText}`;
+    $("claim-body").textContent =
+      `The vault holds ${c.amountText} for ${c.to}, because that address refused the payment when it was sent. ` +
+      `Only ${c.to} can claim it: connect that account on ${ethName()}, choose where the funds should go, and claim.`;
+    $("claim-payto").value = account ?? c.to;
+  } else {
+    $("claim-title").textContent = `Claim on ${target?.name ?? "the destination chain"}`;
+    $("claim-body").textContent =
+      `The USDC was burned on ${ethName()} and Circle has attested it. Minting it on ${target?.name} takes one ` +
+      `transaction that anyone may send: it pays only the recipient named in the burn. You pay the gas on ${target?.name}.`;
+  }
+  $("claim-payto-field").classList.toggle("hide", c.kind !== "deferred");
+  say("claim-status", "");
+  if (!dlg.open) {
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "");
+  }
+  renderClaim();
+}
+
+function renderClaim() {
+  const dlg = $("claim-dialog");
+  if (!claimCur || !dlg?.open) return;
+  const c = claimCur;
+  const target = claimTarget(c);
+  const go = $("claim-go");
+  let label;
+  let action;
+  if (!window.ethereum) {
+    go.disabled = true;
+    say("claim-status", "No Ethereum wallet found in this browser. Install MetaMask to claim.", "err");
+    return;
+  }
+  if (!account) [label, action] = ["Connect wallet", "connect"];
+  else if (walletChainId !== Number(target?.chainId)) [label, action] = [`Switch to ${target?.name}`, "switch"];
+  else if (c.kind === "deferred" && account.toLowerCase() !== String(c.to).toLowerCase()) {
+    [label, action] = ["Choose the account in your wallet", "pick"];
+    say("claim-status", `Only ${c.to} can claim this. Your wallet is using ${account}.`);
+  } else [label, action] = [c.kind === "deferred" ? "Claim" : `Claim on ${target.name}`, "claim"];
+  go.textContent = label;
+  go.dataset.action = action;
+  const payToOk = c.kind !== "deferred" || /^0x[0-9a-fA-F]{40}$/.test($("claim-payto").value.trim());
+  go.disabled = claimBusy || (action === "claim" && !payToOk);
+}
+
+async function claimGo() {
+  const c = claimCur;
+  if (!c) return;
+  const action = $("claim-go").dataset.action;
+  const target = claimTarget(c);
+  try {
+    if (action === "connect") {
+      const a = await rpc("eth_requestAccounts");
+      account = a[0] ?? null;
+      walletChainId = parseInt(await rpc("eth_chainId"), 16);
+      listenEth();
+      renderWallet();
+      if (c.kind === "deferred" && !$("claim-payto").value.trim()) $("claim-payto").value = account ?? "";
+      return;
+    }
+    if (action === "pick") {
+      await rpc("wallet_requestPermissions", [{ eth_accounts: {} }]);
+      account = (await rpc("eth_accounts"))[0] ?? null;
+      renderWallet();
+      return;
+    }
+    if (action === "switch") {
+      await switchChain(target);
+      return;
+    }
+    claimBusy = true;
+    renderClaim();
+    let to;
+    let data;
+    if (c.kind === "deferred") {
+      to = c.vault;
+      data = dataClaim(c.token, $("claim-payto").value.trim());
+    } else {
+      to = status.cctp.messageTransmitter;
+      data = dataReceiveMessage(c.message, c.attestation);
+    }
+    say("claim-status", "Confirm the claim in your wallet…");
+    const hash = await rpc("eth_sendTransaction", [{ from: account, to, data }]);
+    const link = c.kind === "deferred" ? ethTxLink(hash) : chainTxLink(target, hash);
+    sayHtml("claim-status", `Sent ${link}; waiting for it to be mined.`);
+    const r = await waitReceipt(hash);
+    if (r.kind === "receipt" && r.receipt.status === "0x1") sayHtml("claim-status", `Claimed. Transaction ${link}.`, "ok");
+    else if (r.kind === "receipt") sayHtml("claim-status", `The claim failed on ${escapeHtml(target.name)}. Transaction ${link}.`, "err");
+    else say("claim-status", "The claim was not mined. Check your wallet.", "err");
+  } catch (e) {
+    say("claim-status", walletError(e), "err");
+  } finally {
+    claimBusy = false;
+    renderClaim();
+  }
+}
+
+// ---------- USDC from another chain (CCTP inbound) ----------
+let cctpBusy = false;
+let cctpTrackId = 0;
+
+function setupCctp() {
+  const c = status?.cctp;
+  if (!c) return;
+  const inbound = cctpInboundChains();
+  for (const id of ["cctp-chain", "cctp-track-chain"]) {
+    const sel = $(id);
+    sel.innerHTML = "";
+    for (const ch of inbound) {
+      const o = document.createElement("option");
+      o.value = String(ch.domain);
+      o.textContent = ch.name;
+      sel.appendChild(o);
+    }
+  }
+  $("cctp-intro").innerHTML =
+    `Burn USDC on any chain listed here and receive <strong>${escapeHtml(usdcTicker())}</strong> on Sequentia: ` +
+    `the same asset as USDC bridged from ${escapeHtml(ethName())} or Solana. The burn names the bridge's vault ` +
+    `as the only party allowed to complete it.`;
+
+  // "Receive on" for redemptions: the vault's own chain, then every CCTP destination.
+  const red = $("red-domain");
+  red.innerHTML = "";
+  const own = document.createElement("option");
+  own.value = "0";
+  own.textContent = ethName();
+  red.appendChild(own);
+  for (const ch of cctpChains()) {
+    if (Number(ch.domain) === 0) continue;
+    const o = document.createElement("option");
+    o.value = String(ch.domain);
+    o.textContent = `${ch.name} (USDC.e only)`;
+    red.appendChild(o);
+  }
+  $("red-domain-field").classList.remove("hide");
+  const onDomain = () => {
+    const d = redeemDomain();
+    $("red-domain-note").textContent =
+      d === 0
+        ? `Every asset is paid on ${ethName()}. The other chains take ${usdcTicker()} only.`
+        : d === 5
+          ? `${usdcTicker()} only. Send no other asset to a Solana redemption address: it has no Ethereum address to be paid to.`
+          : `${usdcTicker()} only; any other asset is paid on ${ethName()}.`;
+    $("ethaddr-label").textContent =
+      d === 5 ? "Your Solana address (receives the funds)" : "Your Ethereum address (receives the funds)";
+    $("ethaddr-input").placeholder = d === 5 ? "Solana address" : "0x… address";
+  };
+  red.addEventListener("change", onDomain);
+  onDomain();
+
+  $("cctp-chain").addEventListener("change", () => {
+    if ($("net-choice").value === "cctp") $("net-from").textContent = cctpChain($("cctp-chain").value)?.name ?? "USDC via CCTP";
+    renderCctpWallet();
+    renderCctpPreview();
+  });
+  $("cctp-amount").addEventListener("input", () => {
+    updateCctpButton();
+    renderCctpPreview();
+  });
+  $("cctp-connect").addEventListener("click", () => {
+    if (!window.ethereum) {
+      say("cctp-wallet-line", "No Ethereum wallet found in this browser. Install MetaMask to bridge USDC.", "err");
+      return;
+    }
+    connect();
+  });
+  $("btn-cctp").addEventListener("click", cctpDeposit);
+  $("btn-cctp-track").addEventListener("click", trackCctpFromBox);
+  $("cctp-track-hash").addEventListener("keydown", (e) => e.key === "Enter" && trackCctpFromBox());
+  renderCctpWallet();
+}
+
+function renderCctpWallet() {
+  if (!status?.cctp) return;
+  const chain = cctpChain($("cctp-chain").value);
+  const btn = $("cctp-connect");
+  if (!account) {
+    btn.textContent = "Connect wallet";
+    say("cctp-wallet-line", "");
+  } else {
+    btn.textContent = short(account);
+    if (chain && walletChainId === Number(chain.chainId)) say("cctp-wallet-line", `connected on ${chain.name}`, "ok");
+    else say("cctp-wallet-line", `connected; the page asks your wallet to switch to ${chain?.name ?? "the source chain"} when you bridge`);
+  }
+  updateCctpButton();
+}
+
+function cctpAmount() {
+  const raw = $("cctp-amount").value.trim();
+  if (!raw) return null;
+  try {
+    const units = parseUnits(raw, 6, 6);
+    return { units, atoms: unitsToAtoms(units, 6, usdcPrecision()) };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function updateCctpButton() {
+  const btn = $("btn-cctp");
+  const amt = cctpAmount();
+  btn.disabled = cctpBusy || !cctpChain($("cctp-chain").value) || !amt || Boolean(amt.error) || !seqFields.cctp?.ok();
+  if (!cctpBusy) btn.textContent = "Burn USDC and bridge it";
+}
+
+function renderCctpPreview() {
+  const box = $("cctp-preview");
+  const amt = cctpAmount();
+  const chain = cctpChain($("cctp-chain").value);
+  if (!amt || !chain) {
+    box.classList.add("hide");
+    box.innerHTML = "";
+    return;
+  }
+  box.classList.remove("hide");
+  if (amt.error) {
+    box.innerHTML = `<span class="note">${escapeHtml(amt.error)}</span>`;
+    return;
+  }
+  const name = escapeHtml(chain.name);
+  const a = usdcAsset();
+  const lines = [
+    `<div class="note"><strong>You receive ${formatAtoms(amt.atoms, usdcPrecision())} ${escapeHtml(usdcTicker())}</strong> on Sequentia.</div>`,
+    `<div class="note">No bridge fee. You pay the gas on ${name}.</div>`,
+    `<div class="note">Expected wait: Circle attests a burn once ${name} finalizes it, typically 15–30 minutes on these testnets. The vault then takes the USDC and the bridge mints.</div>`,
+    `<div class="note">Your wallet asks you to let Circle's TokenMessenger spend this USDC, then to confirm the burn.</div>`,
+  ];
+  if (a?.assetId && haltedAssets.has(a.assetId)) {
+    lines.push(
+      `<div class="note"><strong>Minting of ${escapeHtml(usdcTicker())} is paused while the operator investigates.</strong> A deposit made now waits and mints once it resumes.</div>`
+    );
+  }
+  if (seqFields.cctp?.blinded) {
+    lines.push(`<div class="note">Your address is confidential (blinded): the amount you receive will be hidden on chain.</div>`);
+  }
+  box.innerHTML = lines.join("");
+}
+
+async function cctpDeposit() {
+  if (cctpBusy) return;
+  const chain = cctpChain($("cctp-chain").value);
+  const amt = cctpAmount();
+  if (!chain) return;
+  if (!amt || amt.error) {
+    say("cctp-status", amt?.error ?? "Enter an amount.", "err");
+    return;
+  }
+  const f = seqFields.cctp;
+  await f.ensure();
+  if (!f.ok()) {
+    say("cctp-status", "Enter a valid Sequentia address first. Nothing has been sent.", "err");
+    return;
+  }
+  if (!window.ethereum) {
+    say("cctp-status", "No Ethereum wallet found in this browser. Install MetaMask to bridge USDC.", "err");
+    return;
+  }
+  const c = status.cctp;
+  const btn = $("btn-cctp");
+  cctpBusy = true;
+  updateCctpButton();
+  say("cctp-status", "");
+  try {
+    if (!account) {
+      account = (await rpc("eth_requestAccounts"))[0] ?? null;
+      walletChainId = parseInt(await rpc("eth_chainId"), 16);
+      listenEth();
+    }
+    btn.textContent = `Switch to ${chain.name} in your wallet…`;
+    await switchChain(chain);
+    await ensureAllowance(chain.usdc, c.tokenMessenger, amt.units, "USDC", "cctp-status", btn, "press the button again");
+    btn.textContent = "Confirm the burn in your wallet…";
+    const data = dataDepositForBurnWithHook({
+      amount: amt.units,
+      destinationDomain: 0,
+      mintRecipient: c.depositVault,
+      burnToken: chain.usdc,
+      destinationCaller: c.depositVault,
+      maxFee: 0,
+      minFinalityThreshold: 2000,
+      hookText: (c.depositHookPrefix ?? "compages:deposit:") + f.value,
+    });
+    const hash = await rpc("eth_sendTransaction", [{ from: account, to: c.tokenMessenger, data }]);
+    cctpBusy = false;
+    updateCctpButton();
+    trackCctp(chain.domain, hash, { sent: true });
+  } catch (e) {
+    say("cctp-status", walletError(e), "err");
+  } finally {
+    cctpBusy = false;
+    updateCctpButton();
+  }
+}
+
+function cSeg(i, state) {
+  $(`cseg-${i}`).className = "span-seg" + (state ? " " + state : "");
+  $(`clab-${i}`).className = state === "done" ? "done" : "";
+}
+
+function trackCctpFromBox() {
+  const domain = Number($("cctp-track-chain").value);
+  const hash = $("cctp-track-hash").value.trim().toLowerCase();
+  if (!cctpChain(domain)) return;
+  if (!/^0x[0-9a-f]{64}$/.test(hash)) {
+    say("cctp-status", "Enter the burn's transaction hash: 0x followed by 64 hex characters.", "err");
+    return;
+  }
+  trackCctp(domain, hash);
+}
+
+/** Follow a CCTP burn from the source chain to a deposit on Sequentia.
+ *  Starting another track cancels this one. */
+async function trackCctp(domain, rawHash, { sent = false } = {}) {
+  const txHash = rawHash.toLowerCase();
+  const id = ++cctpTrackId;
+  const alive = () => id === cctpTrackId;
+  const chain = cctpChain(domain);
+  store.set("cctp.burn", { domain: Number(domain), txHash });
+  const forget = () => store.get("cctp.burn")?.txHash === txHash && store.set("cctp.burn", null);
+  $("cctp-track-chain").value = String(domain);
+  $("cctp-track-hash").value = txHash;
+  $("cctp-truss").classList.add("on");
+  for (let i = 0; i < 4; i++) cSeg(i, "");
+  cSeg(0, "active");
+  const head = `burn on ${escapeHtml(chain?.name ?? `domain ${domain}`)} ${chainTxLink(chain, txHash, short(txHash))}`;
+  const line = (html, tone) => alive() && sayHtml("cctp-status", `${head}<br><span class="plain">${html}</span>`, tone);
+  try {
+    if (sent) {
+      line("Waiting for the burn to be mined.");
+      const r = await waitReceipt(txHash, alive, (n) => line(escapeHtml(n)));
+      if (!alive() || r.kind === "cancelled") return;
+      if (r.kind !== "receipt") {
+        cSeg(0, "bad");
+        line(
+          r.kind === "replaced"
+            ? "Your wallet replaced this transaction, so it will never be mined. If you sped it up, track the new hash below."
+            : "The burn was not mined. Check your wallet, and track the new hash below if it replaced this one.",
+          "err"
+        );
+        forget();
+        return;
+      }
+      if (r.receipt.status !== "0x1") {
+        cSeg(0, "bad");
+        line(`The burn failed on ${escapeHtml(chain?.name)}, so no USDC left your wallet.`, "err");
+        forget();
+        return;
+      }
+    }
+    cSeg(0, "done");
+    cSeg(1, "active");
+    const started = Date.now();
+    let registered = false;
+    for (;;) {
+      if (!alive()) return;
+      if (!registered) {
+        try {
+          await postJson("cctp/deposit", { sourceDomain: Number(domain), txHash });
+          registered = true;
+        } catch (e) {
+          if (e.status && e.status < 500 && e.status !== 429) {
+            cSeg(1, "bad");
+            line(escapeHtml(e.message), "err");
+            return;
+          }
+          line(`The bridge did not answer (${escapeHtml(e.message)}); retrying.`);
+        }
+      }
+      if (registered) {
+        let r = null;
+        try {
+          r = await api(`cctp/deposit/${Number(domain)}/${txHash}`);
+        } catch (e) {
+          if (e.status === 404) registered = false;
+          else line(`The bridge did not answer (${escapeHtml(e.message)}); retrying.`);
+        }
+        if (!alive()) return;
+        if (r) {
+          const done = renderCctp(r, line, chain, started);
+          if (done === "forget") forget();
+          if (done) return;
+        }
+      }
+      await sleep(10_000);
+    }
+  } catch (e) {
+    line(escapeHtml(walletError(e)), "err");
+  }
+}
+
+/** One poll of a burn's progress. Returns true (or "forget") when nothing
+ *  more will change. */
+function renderCctp(r, line, chain, started) {
+  const name = escapeHtml(chain?.name ?? "its chain");
+  const extra =
+    (r.waiting ? ` It is waiting: ${escapeHtml(publicWaiting(r.waiting))}.` : "") +
+    (r.error ? ` (The bridge reports: ${escapeHtml(r.error)}.)` : "");
+  switch (r.stage) {
+    case "attesting":
+      cSeg(0, "done");
+      cSeg(1, "active");
+      line(
+        `Waiting for Circle's attestation. Circle attests a burn once ${name} finalizes it, typically 15–30 minutes on these testnets. ` +
+          `Watching for ${fmtMinutes((Date.now() - started) / 60_000).replace(/^about /, "")}.${extra}`
+      );
+      return false;
+    case "relaying":
+      cSeg(1, "done");
+      cSeg(2, "active");
+      line(`Attested by Circle. The bridge is relaying it to the vault on ${escapeHtml(ethName())}.${extra}`);
+      return false;
+    case "relayed": {
+      cSeg(1, "done");
+      cSeg(2, "done");
+      const relay = r.relayTx ? ` ${ethTxLink(r.relayTx, "relay transaction")}` : "";
+      const dep = r.deposit;
+      if (!dep) {
+        cSeg(3, "active");
+        line(`Relayed to the vault.${relay} The bridge is recording the deposit.${extra}`);
+        return false;
+      }
+      const a = assetById(dep.assetId) ?? usdcAsset();
+      const amount = dep.sats ? `${formatAtoms(dep.sats, a?.precision ?? 6)} ${tickerOf(a) || usdcTicker()}` : "your deposit";
+      const d = describeDeposit(dep, ETH_DEPOSIT_LEG(), amount);
+      cSeg(3, d.stage >= 3 ? "done" : d.cls === "bad" ? "bad" : "active");
+      line(`Relayed to the vault.${relay} ${d.html}${extra}`, d.cls === "bad" ? "err" : d.cls === "ok" ? "ok" : undefined);
+      return d.terminal;
+    }
+    case "not_found":
+      if (Date.now() - started < 5 * 60_000) {
+        line(`Looking for the burn in this transaction on ${name}.${extra}`);
+        return false;
+      }
+      cSeg(1, "bad");
+      line(`No USDC burn was found in this transaction on ${name}. Check the chain and the hash.`, "err");
+      return "forget";
+    case "not_for_bridge":
+      cSeg(1, "bad");
+      line(
+        "This burn is not addressed to the bridge's vault, so the bridge cannot complete it. Only the party the burn names can.",
+        "err"
+      );
+      return "forget";
+    default:
+      line(`Status: ${escapeHtml(r.stage)}.${extra}`);
+      return false;
+  }
+}
+
 // ---------- custody, reserves, health ----------
 /** Where the funds are held: one line per chain the bridge takes custody on,
  *  each address linked to a block explorer so a reader can check it. */
@@ -2010,6 +2645,12 @@ const LEGS = [
     available: () => true,
   },
   {
+    id: "cctp",
+    label: () => "USDC from another chain",
+    pill: () => cctpChain($("cctp-chain").value)?.name ?? "USDC via CCTP",
+    available: () => cctpInboundChains().length > 0,
+  },
+  {
     id: "btc",
     label: () => `Bitcoin (${(status?.btcChainName ?? "Bitcoin testnet4").replace(/^Bitcoin\s*/i, "") || "testnet4"})`,
     pill: () => status?.btcChainName ?? "Bitcoin testnet4",
@@ -2089,7 +2730,7 @@ function restoreSessions() {
   const red = store.get("eth.redeem");
   if (red?.seqAddress && !ethRedeem) {
     if (red.ethAddress) $("ethaddr-input").value = red.ethAddress;
-    showEthRedemption(red.seqAddress, red.ethAddress ?? null, "restored");
+    showEthRedemption(red.seqAddress, red.ethAddress ?? null, "restored", red.domain ?? 0);
   }
   const bw = store.get("btc.wrap");
   if (bw?.depositAddress) {
@@ -2113,6 +2754,8 @@ function restoreSessions() {
     $("sol-unwrap-addr-input").value = su.solAddress ?? "";
     showSolUnwrap(su);
   }
+  const burn = store.get("cctp.burn");
+  if (burn?.txHash && cctpChain(burn.domain) && /^0x[0-9a-f]{64}$/.test(burn.txHash)) trackCctp(burn.domain, burn.txHash);
 }
 
 // ---------- init ----------
@@ -2141,6 +2784,19 @@ function wireStatic() {
   seqFields.dep = new SeqAddrField("seqaddr-input", onDepChange);
   seqFields.wrap = new SeqAddrField("wrap-seqaddr");
   seqFields.solWrap = new SeqAddrField("sol-wrap-seqaddr");
+  seqFields.cctp = new SeqAddrField("cctp-seqaddr", () => {
+    updateCctpButton();
+    renderCctpPreview();
+  });
+  // Claim buttons live inside lists that re-render on every poll, so one
+  // listener on the document serves them all.
+  document.addEventListener("click", (e) => {
+    const b = e.target.closest?.("[data-claim]");
+    if (b) openClaim(b.dataset.claim);
+  });
+  $("claim-go").addEventListener("click", claimGo);
+  $("claim-close").addEventListener("click", () => $("claim-dialog").close());
+  $("claim-payto").addEventListener("input", renderClaim);
 }
 
 function initialLeg() {
@@ -2164,6 +2820,7 @@ async function init() {
   }
   const seqLabel = String(status.seqChainLabel ?? "Sequentia").replace(/-/g, " ");
   $("net-seq").textContent = seqLabel.charAt(0).toUpperCase() + seqLabel.slice(1);
+  setupCctp();
   buildLegSelect();
   showLeg(initialLeg());
 
