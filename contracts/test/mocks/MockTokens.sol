@@ -44,11 +44,7 @@ contract MockERC20 {
         return _move(msg.sender, to, amount);
     }
 
-    function transferFrom(address from, address to, uint256 amount)
-        public
-        virtual
-        returns (bool)
-    {
+    function transferFrom(address from, address to, uint256 amount) public virtual returns (bool) {
         uint256 allowed = allowance[from][msg.sender];
         require(allowed >= amount, "allowance");
         if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
@@ -113,5 +109,92 @@ contract NoReturnERC20 {
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
         emit Transfer(from, to, amount);
+    }
+}
+
+/// @notice Returns false from transfer() while `failTransfers` is set, the
+///         way some older tokens signal failure instead of reverting.
+contract FalseReturnERC20 is MockERC20 {
+    bool public failTransfers;
+
+    constructor() MockERC20("False Token", "FALSE", 18) {}
+
+    function setFailTransfers(bool fail) external {
+        failTransfers = fail;
+    }
+
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        if (failTransfers) return false;
+        return super.transfer(to, amount);
+    }
+}
+
+/// @notice USDC-shaped token: a blocklist and a global pause, both of which
+///         make transfers revert.
+contract BlocklistPausableERC20 is MockERC20 {
+    mapping(address => bool) public blocklisted;
+    bool public paused;
+
+    constructor() MockERC20("USD Coin", "USDC", 6) {}
+
+    function setBlocklisted(address account, bool blocked) external {
+        blocklisted[account] = blocked;
+    }
+
+    function setPaused(bool p) external {
+        paused = p;
+    }
+
+    function _move(address from, address to, uint256 amount) internal override returns (bool) {
+        require(!paused, "paused");
+        require(!blocklisted[from] && !blocklisted[to], "blocklisted");
+        return super._move(from, to, amount);
+    }
+}
+
+/// @notice Balances are shares scaled by a global index that anyone can
+///         change, like a rebasing staking token.
+contract RebasingERC20 {
+    string public name = "Rebasing Token";
+    string public symbol = "REB";
+    uint8 public decimals = 18;
+    uint256 public index = 1e18;
+    mapping(address => uint256) public shares;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function balanceOf(address account) public view returns (uint256) {
+        return shares[account] * index / 1e18;
+    }
+
+    function rebase(uint256 newIndex) external {
+        index = newIndex;
+    }
+
+    function mint(address to, uint256 amount) external {
+        shares[to] += amount * 1e18 / index;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _move(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(allowance[from][msg.sender] >= amount, "allowance");
+        allowance[from][msg.sender] -= amount;
+        _move(from, to, amount);
+        return true;
+    }
+
+    function _move(address from, address to, uint256 amount) private {
+        uint256 s = amount * 1e18 / index;
+        require(shares[from] >= s, "balance");
+        shares[from] -= s;
+        shares[to] += s;
     }
 }

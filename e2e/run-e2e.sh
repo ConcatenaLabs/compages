@@ -52,6 +52,13 @@ OPERATOR_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 OPERATOR_ADDR=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 USER_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
 USER_ADDR=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+# The vault's other two roles, kept apart from the operator as on a real
+# deployment: the owner sets limits and unpauses, the guardian can only pause.
+OWNER_KEY=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
+OWNER_ADDR=0x90F79bf6EB2c4f870365E785982E1f101E93b906
+GUARDIAN_KEY=0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a
+GUARDIAN_ADDR=0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65
+RELEASE_DELAY=3600
 
 seqcli() { "$ELC" -datadir="$RUN/seq" -chain=elementsregtest -rpcport=$SEQ_RPC -rpcuser=e2e -rpcpassword=e2e "$@"; }
 
@@ -85,7 +92,7 @@ echo "== deploying CompagesVault + MockERC20"
 cd "$REPO/contracts"
 VAULT=$(forge create src/CompagesVault.sol:CompagesVault \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
-  --constructor-args $OPERATOR_ADDR \
+  --constructor-args $OWNER_ADDR $OPERATOR_ADDR $GUARDIAN_ADDR $RELEASE_DELAY \
   | awk '/Deployed to:/ {print $3}')
 MUSD=$(forge create test/mocks/MockTokens.sol:MockERC20 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
@@ -107,6 +114,13 @@ USDC_ETH=$(forge create test/mocks/MockTokens.sol:MockERC20 \
 cast send "$USDC_ETH" "mint(address,uint256)" $USER_ADDR 1000000000 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
 echo "   usdc(eth): $USDC_ETH"
+
+# Release limits, set by the owner. Generous here, so the ordinary checks pay
+# out at once; the queue has checks of its own that lower a limit.
+for T in 0x0000000000000000000000000000000000000000 "$MUSD" "$USDC_ETH"; do
+  cast send "$VAULT" "setReleaseLimit(address,uint256,uint256)" "$T" 1000000000000000000000000 1000000000000000000000 \
+    --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OWNER_KEY >/dev/null
+done
 
 echo "== starting Sequentia elementsregtest node"
 "$ELD" -datadir="$RUN/seq" -chain=elementsregtest \
@@ -259,6 +273,7 @@ kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log";
 echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
+OWNER_KEY=$OWNER_KEY GUARDIAN_KEY=$GUARDIAN_KEY RELEASE_DELAY=$RELEASE_DELAY \
 USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT FAULT_PORT=$FAULT_PORT \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" \

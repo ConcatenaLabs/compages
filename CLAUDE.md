@@ -16,7 +16,7 @@ Node and consensus conventions live in the
 
 | Path | What |
 |---|---|
-| `contracts/` | Foundry project. One contract, `src/CompagesVault.sol`, with `test/CompagesVault.t.sol` and `script/Deploy.s.sol`. |
+| `contracts/` | Foundry project. One contract, `src/CompagesVault.sol` (no dependency beyond `forge-std` for tests), with `script/Deploy.s.sol` (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`) and tests in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). |
 | `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
 | `web/` | `index.html`, `app.js` and `qr.js` (a dependency-free QR encoder), served by the daemon. |
 | `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. |
@@ -25,7 +25,7 @@ Node and consensus conventions live in the
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
 cd daemon && npm test                     # node --test (unit tests)
-cd contracts && forge test                # the vault unit tests
+cd contracts && forge test                # the vault unit, CCTP and invariant tests
 ```
 
 There is no CI. Deployment is pull-only: the server pulls from GitHub. Never edit source on the
@@ -78,7 +78,30 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   backing verdict is given only when both sides were actually measured. A reassuring number nobody
   measured is worse than an honest gap.
 - **Releases and refunds are replay-guarded on chain** by deterministic ids, so nothing can be paid
-  twice.
+  twice. The vault marks an id processed when it pays it OR queues it, and a cancelled id stays
+  spent: `processedRedemptions` true means "the vault has taken this on", not "it was paid" —
+  `queuedRelease(id)` and the events say which.
+- **The vault's roles never merge.** The owner (a Safe or cold key) holds every administrative
+  power; the operator (hot) only releases and refunds, rate-limited per token with the rest queued
+  behind `releaseDelay`; the guardian only pauses and cancels, and can never unpause or move funds.
+  Do not give the operator a way around the bucket or the queue, and do not let a payout the
+  recipient refuses revert: it becomes owed (`ReleaseDeferred`) and is claimed, which is what keeps
+  one bad recipient from blocking a redemption forever.
+- **Owed, queued and cancelled amounts are reserved.** `owedTotal + queuedTotal + cancelledTotal`
+  belongs to users whose Sequentia side is already settled: no immediate payout, `rebalanceOut` or
+  `burnLockedUSDC` may spend it, and nothing may be queued beyond what is left, so for a normal
+  token the balance always covers all three. Queued releases compete first come, first served (an
+  execution holds back only owed and cancelled). A cancelled entry leaves the reservation only
+  through the owner (`reinstateRelease`, or `discardCancelledRelease` no sooner than `releaseDelay`
+  after the cancel), never through a guardian cancel.
+- **An inbound CCTP mint to the vault must never be refused for its hookData.** With the vault as
+  destinationCaller nothing else can complete it, so a revert would burn the user's USDC for good.
+  `compages:deposit:<14..120-byte address>` is a deposit, exactly `compages:rebalance` is liquidity,
+  anything else lands as `CctpUnrecognized` for a refund, and a mint to another recipient is relayed
+  as `CctpForwarded` without moving vault funds. Deposits and unrecognised arrivals revert while
+  deposits are paused (they stay retryable, and nothing new becomes burnable during a supply lock);
+  rebalances and forwards do not. The credited amount is the vault's
+  measured USDC balance change, never the message's own figures.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
   locked Ethereum funds.
 - **Undeliverable deposits are refunded automatically** — an invalid Sequentia address, or an
