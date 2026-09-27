@@ -29,6 +29,9 @@ import { buildTx, ataAddress, TOKEN_PROGRAM } from "./sol.js";
 import { unitsToAtoms } from "./eth.js";
 import {
   depositForBurnWithHookIx,
+  reclaimEventAccountIx,
+  readMessageSent,
+  EVENT_ACCOUNT_WINDOW_SECONDS,
   eventDataKeypair,
   irisMessages,
   parseMessageV2,
@@ -244,6 +247,51 @@ export class Cctp {
     delete rec.error;
     this.bridge.state.save();
     this.bridge.log(`cctp ${rec.id}: ${credited} units now escrowed in vault ${rec.vault}`);
+  }
+
+  /** Take back the rent of each burn's MessageSent account. Circle's
+   *  program keeps the account (and the treasury's rent in it) until five
+   *  days after the burn, then lets the rent payer close it with the
+   *  attested message. Replay-guarded like every Solana transfer: the
+   *  signature is persisted before broadcast, and the account's absence
+   *  afterwards is the proof it was closed. */
+  async reclaim() {
+    if (!this.enabled) return;
+    const sol = this.bridge.sol;
+    const windowMs = (EVENT_ACCOUNT_WINDOW_SECONDS + 3600) * 1000;
+    for (const rec of Object.values(this.records)) {
+      if (rec.stage !== "done" || rec.reclaimed || !rec.burnedAt || !rec.attestation) continue;
+      if (Date.now() - Date.parse(rec.burnedAt) < windowMs) continue;
+      await this.bridge.withRecord(`cctp:${rec.id}`, async () => {
+        const eventKp = eventDataKeypair(sol.masterSeed, rec.eventIndex);
+        if (rec.reclaimTx) {
+          const fate = await this.bridge.solTransferFate(rec.reclaimTx);
+          if (fate === "pending") return;
+          if (fate !== "landed") delete rec.reclaimTx; // failed or expired: try again below
+        }
+        const account = await readMessageSent(sol, eventKp.address);
+        if (!account) {
+          rec.reclaimed = true;
+          rec.reclaimedAt = new Date().toISOString();
+          this.bridge.state.save();
+          this.bridge.log(`cctp ${rec.id}: event account closed; its rent is back in the treasury`);
+          return;
+        }
+        if (rec.reclaimTx) return; // landed but the RPC still shows the account: next tick
+        const bh = await sol.latestBlockhash();
+        const ix = reclaimEventAccountIx({
+          payee: sol.treasury.address,
+          messageSentEventData: eventKp.address,
+          attestation: rec.attestation,
+          destinationMessage: rec.message,
+        });
+        const built = buildTx({ feePayer: sol.treasury, instructions: [ix], recentBlockhash: bh.blockhash });
+        rec.reclaimTx = { signature: built.signature, lastValidBlockHeight: bh.lastValidBlockHeight };
+        this.bridge.state.save(); // persisted BEFORE broadcast
+        await sol.send(built.tx);
+        this.bridge.log(`cctp ${rec.id}: reclaiming the event account's rent (${built.signature})`);
+      });
+    }
   }
 
   /** Atoms of `assetId` burned on one chain and not yet minted on the other.

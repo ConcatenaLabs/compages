@@ -175,6 +175,7 @@ async function main() {
         ["solSweeps", () => bridge.sweepSolIntents()],
         ["solRedemptions", () => bridge.advanceSolRedemptions()],
         ["cctpConsolidate", () => cctp.consolidate()],
+        ["cctpReclaim", () => cctp.reclaim()],
       ],
       cfg.solPollIntervalMs ?? interval
     );

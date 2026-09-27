@@ -286,6 +286,11 @@ burn and the mint the amount is in transit: the reserves page
 (`inTransitAtoms`, with each Solana burn listed) and the supply invariant
 count it as backing, so a move in flight never reads as a shortfall.
 
+Each Solana burn leaves a small account holding Circle's record of the
+message, paid for from the treasury. Circle's program lets the payer close it
+five days after the burn; the daemon does so automatically, with the same
+persist-before-broadcast guard, and the rent returns to the treasury.
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
 Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
