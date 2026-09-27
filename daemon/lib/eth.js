@@ -7,7 +7,9 @@ import { ethers } from "ethers";
 // read by name rather than filed under "something went wrong".
 export const VAULT_ERRORS = [
   "error NotOwner()",
+  "error NotPendingOwner()",
   "error NotOperator()",
+  "error NotGuardianOrOwner()",
   "error NotBurner()",
   "error DepositsArePaused()",
   "error ReleasesArePaused()",
@@ -16,19 +18,59 @@ export const VAULT_ERRORS = [
   "error BurnFailed()",
   "error ZeroAmount()",
   "error ZeroAddress()",
+  "error InvalidRecipient()",
   "error BadSequentiaAddress()",
+  "error TokenIsBlocked()",
+  "error BelowMinDeposit(uint256 minDeposit)",
+  "error DepositCapExceeded(uint256 cap)",
+  "error ValueTooLarge()",
+  "error DelayTooLong()",
   "error AlreadyReleased()",
+  "error NotQueued()",
+  "error NotCancelled()",
+  "error ReleaseNotReady(uint256 executeAfter)",
+  "error InsufficientVaultBalance(address token, uint256 requested, uint256 available)",
+  "error InsufficientGasForPayout()",
+  "error NothingOwed()",
   "error EtherTransferFailed()",
   "error TokenTransferFailed()",
   "error Reentrancy()",
-  "error InsufficientVaultBalance()",
+  "error CctpDisabled()",
+  "error CctpMisconfigured()",
+  "error CctpBadMessage()",
+  "error CctpBadHookData()",
+  "error CctpNothingMinted()",
+  "error CctpBurnFailed()",
+  "error MaxFeeTooHigh()",
 ];
 
+// The union of what the daemon uses across vault versions. Version 3 adds
+// refund(), the release queue, owed payouts and CCTP; calls that only exist
+// there are made only after VERSION() says so (see Eth.vaultVersion).
 export const VAULT_ABI = [
   ...VAULT_ERRORS,
   "event Deposited(uint256 indexed nonce, address indexed token, address indexed from, uint256 amount, string sequentiaAddress)",
+  "event CctpDeposit(uint256 indexed nonce, uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount)",
   "event Released(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
+  "event Refunded(address indexed token, address indexed to, uint256 amount, bytes32 indexed refundId)",
+  "event ReleasedViaCctp(bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
+  "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
+  "event ReleaseQueued(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount, uint256 executeAfter)",
+  "event ReleaseCancelled(bytes32 indexed redemptionId, address indexed by)",
+  "event ReleaseDeferred(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
+  "event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender)",
+  "function VERSION() view returns (uint256)",
   "function release(address token, address to, uint256 amount, bytes32 redemptionId)",
+  "function refund(address token, address to, uint256 amount, bytes32 refundId)",
+  "function releaseViaCctp(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, bytes32 redemptionId, uint256 maxFee)",
+  "function refundViaCctp(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, bytes32 refundId, uint256 maxFee)",
+  "function executeRelease(bytes32 redemptionId)",
+  "function receiveCctp(bytes message, bytes attestation)",
+  "function queuedRelease(bytes32) view returns (address token, address to, uint256 amount, uint256 executeAfter, uint8 state, bool isRefund)",
+  "function owed(address token, address account) view returns (uint256)",
+  "function releasesPaused() view returns (bool)",
+  "function releaseDelay() view returns (uint256)",
+  "function cctpUsdc() view returns (address)",
   "function processedRedemptions(bytes32) view returns (bool)",
   "function operator() view returns (address)",
   "function depositCount() view returns (uint256)",
@@ -97,6 +139,44 @@ export class Eth {
   vaultFor(address) {
     if (!address) return this.vault;
     return this.vaults.get(String(address).toLowerCase()) ?? this.vault;
+  }
+
+  /** The vault's contract version: 3 for a vault with the release queue,
+   *  owed payouts and CCTP (it has VERSION()), 1 for an older one, which
+   *  has none of those. Asked once per vault. */
+  async vaultVersion(vault) {
+    this._versions ??= new Map();
+    const addr = (await vault.getAddress()).toLowerCase();
+    if (!this._versions.has(addr)) {
+      let v = 1;
+      try {
+        v = Number(await vault.VERSION());
+      } catch (e) {
+        if (e.code !== "CALL_EXCEPTION" && e.code !== "BAD_DATA") throw e; // an outage is not an answer
+      }
+      this._versions.set(addr, v);
+    }
+    return this._versions.get(addr);
+  }
+
+  /** Vault events in a receipt that concern payout id `id`, by name. */
+  payoutEvents(vault, receipt, id) {
+    const out = {};
+    const self = String(vault.target).toLowerCase();
+    for (const log of receipt.logs ?? []) {
+      if (String(log.address).toLowerCase() !== self) continue;
+      let ev;
+      try {
+        ev = vault.interface.parseLog(log);
+      } catch {
+        continue;
+      }
+      if (!ev) continue;
+      const evId = ev.args.redemptionId ?? ev.args.refundId;
+      if (evId !== undefined && evId !== id) continue;
+      out[ev.name] = ev.args;
+    }
+    return out;
   }
 
   /** The name of a vault custom error in revert data, or null. */

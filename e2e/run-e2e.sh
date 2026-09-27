@@ -99,6 +99,11 @@ MUSD=$(forge create test/mocks/MockTokens.sol:MockERC20 \
   --constructor-args "Mock USD" "MUSD" 6 \
   | awk '/Deployed to:/ {print $3}')
 [ -n "$VAULT" ] && [ -n "$MUSD" ] || { echo "deploy failed"; exit 1; }
+# An account that refuses plain ether, like a contract without receive() or an
+# EIP-7702 account: a payout to it must become owed and claimable, not stuck.
+REJECTOR=$(forge create test/mocks/MockReceivers.sol:RejectingReceiver \
+  --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  | awk '/Deployed to:/ {print $3}')
 echo "   vault: $VAULT   musd: $MUSD"
 cast send "$MUSD" "mint(address,uint256)" $USER_ADDR 1000000000 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
@@ -273,7 +278,7 @@ kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log";
 echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
-OWNER_KEY=$OWNER_KEY GUARDIAN_KEY=$GUARDIAN_KEY RELEASE_DELAY=$RELEASE_DELAY \
+OWNER_KEY=$OWNER_KEY GUARDIAN_KEY=$GUARDIAN_KEY RELEASE_DELAY=$RELEASE_DELAY REJECTOR=$REJECTOR \
 USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT FAULT_PORT=$FAULT_PORT \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" \

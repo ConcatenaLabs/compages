@@ -287,8 +287,11 @@ so nothing but native USDC ever backs the asset.
 Each move is recorded before anything is sent, and the Solana burn's
 signature is persisted before broadcast, like every other outbound Solana
 transfer. The daemon fetches Circle's attestation and relays the mint on
-Ethereum itself; the message names no destination caller, so anyone else may
-relay it too, and the message's nonce says whether someone did. Between the
+Ethereum itself. When the vault can receive CCTP (`receiveCctp`), the burn
+names the vault as the only relayer and the relay goes through it, so the
+arrival is recorded on the vault as `RebalancedIn`; an older vault simply
+receives the mint. Either way the message's nonce says whether it was
+already relayed. Between the
 burn and the mint the amount is in transit: the reserves page
 (`inTransitAtoms`, with each Solana burn listed) and the supply invariant
 count it as backing, so a move in flight never reads as a shortfall.
@@ -526,16 +529,24 @@ Deposit records move through the statuses `minting`, `mint_retry` and
 outcome the node could not confirm yet; re-checked every tick), `minted`
 (delivered; watched until the delivery is final under Bitcoin anchoring),
 `delivery_reorged` (a delivery later displaced on Sequentia), `refund_pending`,
-`refunding`, `refunded`, `refund_failed_manual`, and `failed_manual` (paused
+`refunding`, `refund_queued` (over the vault's rate limit, waiting out its
+delay), `refunded`, `refund_cancelled` (a queued refund the guardian
+cancelled), `refund_failed_manual`, and `failed_manual` (paused
 for operator review; Solana deposits use `dust_manual` instead of the refund
 states). A deposit of a halted asset waits in `mint_retry` with a `waiting`
 reason. Redemption records move through `awaiting_finality`,
 `awaiting_liquidity`, `halted`, `new`, `releasing`, `release_paused` (the
-vault's releases are paused), `released`, `destroy_pending`, `destroying`, `done`,
+vault's releases are paused), `queued` (over the vault's rate limit; the
+daemon executes it once `executeAfter` passes, in block time),
+`release_cancelled` (a queued release the guardian cancelled; an operator
+decides), `released`, `destroy_pending`, `destroying`, `done`,
 plus the terminal `dust_ignored`, `ignored_unknown_asset`,
 `ignored_wrong_network` (an asset returned to the wrong leg's address),
-`release_failed_manual` (the recipient address does not accept the payout)
-and `destroy_manual`.
+`release_failed_manual` (the vault refuses the recipient address) and
+`destroy_manual`. A payout the recipient refuses (a contract that rejects
+plain ether, a blocklisted address) is still final: the record carries
+`deferred: {to, amount}`, the amount is owed on the vault, and the recipient
+claims it to any address with `claim(token, payTo)`.
 
 Try it against the live instance:
 

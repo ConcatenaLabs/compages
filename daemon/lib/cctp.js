@@ -109,6 +109,10 @@ export class Cctp {
         this.bridge.log(`cctp ${mapping.symbol}: treasury lamports too low to pay for a burn; waiting`);
         continue;
       }
+      // A vault that can receive CCTP itself (version 3) is named as the
+      // only relayer, and relaying through it records the arrival as a
+      // RebalancedIn event; an older vault just receives the mint.
+      const viaVault = (await this.bridge.eth.vaultVersion(this.bridge.eth.vaultFor(eth.vault))) >= 3;
       const s = this.bridge.state.data;
       const index = (s.cctpEventIndex = (s.cctpEventIndex ?? 0) + 1);
       const id = `cctp-${mapping.symbol}-${index}`;
@@ -126,6 +130,7 @@ export class Cctp {
         tokenProgram: src.tokenProgram ?? TOKEN_PROGRAM,
         sourceAta: ata,
         vault: eth.vault,
+        viaVault,
         amount: movable.toString(),
         eventIndex: index,
         stage: "burning",
@@ -150,7 +155,7 @@ export class Cctp {
       amount: BigInt(rec.amount),
       destinationDomain: DOMAIN.ethereum,
       mintRecipient: rec.vault,
-      destinationCaller: null,
+      destinationCaller: rec.viaVault ? rec.vault : null,
       maxFee: 0n,
       minFinalityThreshold: FINALITY.standard,
       hookData: "compages:rebalance",
@@ -227,7 +232,10 @@ export class Cctp {
         if (st === "pending") return;
         delete rec.ethTx; // reverted, dropped or displaced; the nonce check above said it did not land
       }
-      const receipt = await bridge.eth.sendAndWait(this.transmitter, "receiveMessage", [rec.message, rec.attestation], (sent) => {
+      const [target, method] = rec.viaVault
+        ? [bridge.eth.vaultFor(rec.vault), "receiveCctp"]
+        : [this.transmitter, "receiveMessage"];
+      const receipt = await bridge.eth.sendAndWait(target, method, [rec.message, rec.attestation], (sent) => {
         rec.ethTx = sent;
         bridge.state.save();
       });

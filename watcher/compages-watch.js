@@ -48,16 +48,30 @@ const alerts = new Alerts({ ...cfg, alertUrl: cfg.alertUrl, alertCooldownMinutes
 const VAULT_EVENTS = new ethers.Interface([
   "event Deposited(uint256 indexed nonce, address indexed token, address indexed from, uint256 amount, string sequentiaAddress)",
   "event Released(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
-  "event Refunded(address indexed token, address indexed to, uint256 amount, bytes32 refundId)",
+  "event Refunded(address indexed token, address indexed to, uint256 amount, bytes32 indexed refundId)",
   "event ReleaseDeferred(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
-  "event Claimed(address indexed token, address indexed recipient, address indexed payTo, uint256 amount)",
+  "event Claimed(address indexed token, address indexed account, address indexed payTo, uint256 amount)",
   "event Rebalanced(address indexed token, address indexed to, uint256 amount, string destination)",
   "event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender)",
   "event LockedStablecoinBurned(address indexed token, uint256 amount)",
   "event ReleasedViaCctp(bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
   "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
 ]);
-const VAULT_VIEWS = ["function depositCount() view returns (uint256)"];
+const VAULT_VIEWS = ["function depositCount() view returns (uint256)", "function cctpUsdc() view returns (address)"];
+
+// The USDC a vault burns and mints through CCTP: its CCTP events name no
+// token, so the vault's own setting says which one moved.
+const usdcOfVault = new Map();
+async function cctpUsdcOf(address) {
+  if (!usdcOfVault.has(address)) {
+    let usdc = null;
+    try {
+      usdc = String(await new ethers.Contract(address, VAULT_VIEWS, provider).cctpUsdc()).toLowerCase();
+    } catch {}
+    usdcOfVault.set(address, usdc);
+  }
+  return usdcOfVault.get(address);
+}
 const ERC20 = ["function balanceOf(address) view returns (uint256)"];
 
 // Two Ethereum providers on purpose. Logs come from `ethLogsRpcUrl` (few
@@ -111,7 +125,7 @@ async function scanVault(v, safeHead) {
       }
       if (!ev) continue;
       const a = ev.args;
-      const token = a.token ?? cfg.cctpUsdc ?? ethers.ZeroAddress;
+      const token = a.token ?? (await cctpUsdcOf(v.address)) ?? ethers.ZeroAddress;
       const note = applyEvent(st.books, ev.name, {
         token: String(token),
         amount: BigInt(a.amount),
