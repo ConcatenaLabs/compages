@@ -12,6 +12,10 @@
     {
       "address": "0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C",
       "deployBlock": 11472082
+    },
+    {
+      "address": "0x7B702D6A2E2351F0c4E549642e65AbABC0324384",
+      "deployBlock": 11795555
     }
   ],
   "esploraUrl": "http://127.0.0.1:3003",
@@ -24,7 +28,10 @@
   "alertUrl": "",
   "breachMinutes": 10,
   "daemonDownMinutes": 10,
-  "largePayout": {},
+  "largePayout": {
+    "0x0000000000000000000000000000000000000000": "100000000000000000",
+    "0x1c7d4b196cb0c7b01d743fbc6116a902379c7238": "100000000"
+  },
   "announceEveryPayout": false,
   "intervalMs": 60000,
   "statusPort": 9951,
