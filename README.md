@@ -776,7 +776,7 @@ Configuration reference (`daemon/config.example.json`):
 | `apiHost`, `apiPort` | Where the API + web app listen |
 | `pollIntervalMs`, `solPollIntervalMs` | Interval of the main loop and of the Solana leg's own loop |
 | `adminToken` | Enables `/api/admin/*` and `admin.js` for anyone presenting it. Unset, the admin API does not exist |
-| `alertUrl`, `alertToken`, `alertCooldownMinutes` | Where alerts are POSTed (an ntfy topic URL, or anything that takes a plain-text POST), an optional bearer token, and how often an unchanged alert repeats (default 360). Unset, alerts go to the log only |
+| `alertUrl`, `alertToken`, `alertCooldownMinutes` | Where alerts are POSTed (an ntfy topic URL, or anything that takes a plain-text POST), an optional bearer token, and how often an unchanged alert repeats (default 360). An alert the endpoint did not accept is retried after five minutes. Unset, alerts go to the log only |
 | `porHistoryDir` | Directory the reserve snapshot tool writes to (its `snapshotDir`); served read-only at `/api/por/history`. Unset, those paths answer 404 |
 | `trustProxy`, `intentLimitPerHour`, `readLimitPerHour` | Take the client address from `X-Forwarded-For` (only behind a proxy you run), how many intents one client may create per hour (default 30), and how many of the heavier reads it may make per hour (default 1200) |
 | `solMaxWatchedIntents`, `maxNewAssetsPerDay` | Caps on Solana deposit addresses watched at once (default 1000) and on newly bridged tokens issued per day (default 20) |

@@ -117,3 +117,31 @@ test("a delivery failure is logged, never thrown", async (t) => {
   assert.equal(posts.length, 1);
   assert.ok(lines.some((l) => l === "alert delivery failed: connection refused"));
 });
+
+test("an alert that was not delivered is retried after five minutes, not after the cooldown", async (t) => {
+  let down = true;
+  const { alerts, posts, tick } = setup(t, undefined, async () => {
+    if (down) throw new Error("connection refused");
+    return new Response("ok");
+  });
+  await alerts.raise("k", "T", "m");
+  tick(4 * MIN);
+  await alerts.raise("k", "T", "m");
+  assert.equal(posts.length, 1, "not hammered while the channel is down");
+  tick(1 * MIN);
+  down = false;
+  await alerts.raise("k", "T", "m");
+  assert.equal(posts.length, 2, "retried after five minutes");
+  tick(5 * MIN);
+  await alerts.raise("k", "T", "m");
+  assert.equal(posts.length, 2, "once delivered, the full cooldown applies");
+});
+
+test("an HTTP error from the alert endpoint counts as not delivered", async (t) => {
+  const { alerts, posts, lines, tick } = setup(t, undefined, async () => new Response("no", { status: 503 }));
+  await alerts.raise("k", "T", "m");
+  assert.ok(lines.includes("alert delivery failed: HTTP 503"));
+  tick(5 * MIN);
+  await alerts.raise("k", "T", "m");
+  assert.equal(posts.length, 2);
+});
