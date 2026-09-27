@@ -203,7 +203,9 @@ beside the Safe's own `ExecutionSuccess`.
 Every owner-only call (`setReleaseLimit`, `unpauseReleases`, `setGuardian`,
 `rebalanceOut`, and the rest in the README's roles table) is now a Safe
 transaction to the vault: build it in the web app's Transaction Builder, or
-encode it with `cast calldata` for signers using Foundry. The guardian's
+encode it with `cast calldata` for signers using Foundry. The OFT receiver
+(`src/CompagesOftReceiver.sol`) reads its owner from the vault, so its owner
+calls move to the Safe with the same step. The guardian's
 pauses and cancels, and the operator's releases and refunds, work exactly as
 before and need no signatures.
 
