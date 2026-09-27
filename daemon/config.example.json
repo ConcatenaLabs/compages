@@ -75,6 +75,7 @@
 
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
+  "porHistoryDir": "/var/lib/compages-reserves",
   "pollIntervalMs": 15000,
   "stateFile": "state/compages-state.json"
 }

@@ -1,0 +1,24 @@
+{
+  "snapshotDir": "/var/lib/compages-reserves",
+  "attestationKeyFile": "attestation.key",
+  "intervalBlocks": 1440,
+  "minDepth": 10,
+  "seqRpcUrl": "http://user:password@127.0.0.1:7041",
+  "auditScript": "/root/Sequentia/contrib/asset-supply-audit/audit.py",
+  "auditCheckpoint": "state/audit-checkpoint.json",
+  "python": "python3",
+  "auditTimeoutMinutes": 360,
+  "daemonUrl": "http://127.0.0.1:9950",
+  "ethChainId": 11155111,
+  "ethChainName": "Sepolia",
+  "ethRpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "vaults": [
+    { "address": "0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41" },
+    { "address": "0x15B3c97eD82C62b7828A775456Bd75e67A8eC42C" },
+    { "address": "0x7B702D6A2E2351F0c4E549642e65AbABC0324384" }
+  ],
+  "solRpcUrl": "https://api.devnet.solana.com",
+  "solChainLabel": "solana-devnet",
+  "solTreasury": "76ZPjfcZGjidKPm9eqmCADKvkYzsEfTwv1wroANJZuhv",
+  "solGenesisHash": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG"
+}

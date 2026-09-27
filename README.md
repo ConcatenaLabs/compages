@@ -583,7 +583,7 @@ The daemon serves the static web app and a JSON API from the same port
 `https://sequentiatestnet.com/bridge/`. CORS is permissive; the API holds no
 secrets, and the only public mutating calls create deposit or redemption
 intents, rate-limited per client (`intentLimitPerHour`); none moves funds.
-The heavier reads (`por`, `seqaddress`, `token`, `health`) have their own
+The heavier reads (`por`, `por/history`, `seqaddress`, `token`, `health`) have their own
 per-client limit (`readLimitPerHour`), and IPv6 clients are counted per /64.
 Error text in responses never carries an RPC URL. Redemption records report
 their progress toward finality as numbers (`finalityProgress`:
@@ -594,6 +594,8 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
 | `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`), and whether the asset is `supervised` (freezable by its issuer and never blinded) |
 | `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero |
+| `GET /api/por/history` | The index of signed reserve snapshots (see "Signed reserve snapshots"): every snapshot's height, payload hash and link. 404 before the first snapshot, and when `porHistoryDir` is not set |
+| `GET /api/por/history/<height>` | One signed reserve snapshot, byte for byte as it was signed; the height is a plain decimal number |
 | `GET /api/token/<address\|eth>` | Metadata for a token and whether it is already bridged (used by the front-end's token lookup) |
 | `POST /api/redeem` `{"ethAddress": "0x..."}` | Create a redemption intent; returns the Sequentia address to send bridged assets to |
 | `GET /api/redeem/<seqAddress>` | A redemption address's bound Ethereum address and the status of every redemption seen on it |
@@ -728,6 +730,7 @@ Configuration reference (`daemon/config.example.json`):
 | `pollIntervalMs`, `solPollIntervalMs` | Interval of the main loop and of the Solana leg's own loop |
 | `adminToken` | Enables `/api/admin/*` and `admin.js` for anyone presenting it. Unset, the admin API does not exist |
 | `alertUrl`, `alertToken`, `alertCooldownMinutes` | Where alerts are POSTed (an ntfy topic URL, or anything that takes a plain-text POST), an optional bearer token, and how often an unchanged alert repeats (default 360). Unset, alerts go to the log only |
+| `porHistoryDir` | Directory the reserve snapshot tool writes to (its `snapshotDir`); served read-only at `/api/por/history`. Unset, those paths answer 404 |
 | `trustProxy`, `intentLimitPerHour`, `readLimitPerHour` | Take the client address from `X-Forwarded-For` (only behind a proxy you run), how many intents one client may create per hour (default 30), and how many of the heavier reads it may make per hour (default 1200) |
 | `solMaxWatchedIntents`, `maxNewAssetsPerDay` | Caps on Solana deposit addresses watched at once (default 1000) and on newly bridged tokens issued per day (default 20) |
 | `retryHours`, `unresolvedHours` | How long a safe retry, or an unconfirmable transaction, keeps being tried before it becomes an operator case (default 24 each) |
@@ -849,14 +852,250 @@ A systemd unit for it looks like the daemon's, with
 `WorkingDirectory=<checkout>/watcher` and `ExecStart=/usr/bin/node
 compages-watch.js config.json`.
 
+## Signed reserve snapshots
+
+`GET /api/por` reports what the chains hold at the moment it is asked, which
+says nothing about yesterday and could be answered differently to different
+people. So the bridge also keeps a public history: once per interval (a day by
+default), a snapshot of every bridged asset's circulating supply against its
+escrow, each figure pinned to a block anyone can read again, signed by the
+bridge's attestation key and linked by hash to the snapshot before it.
+`reserves/` holds the tool that takes the snapshots (`snapshot.mjs`) and the
+one that checks them (`verify.mjs`).
+
+The live bridge signs with the attestation address
+**`ATTESTER_ADDRESS_NOT_SET`** (placeholder: replaced by the address the
+operator's key prints when it is generated, see "Taking snapshots"). Its
+history is served at `https://sequentiatestnet.com/bridge/api/por/history`
+and copied, verified, into the public repository
+[ConcatenaLabs/compages-reserves](https://github.com/ConcatenaLabs/compages-reserves),
+which keeps it available whatever happens to the operator's host.
+
+### What a snapshot records
+
+A snapshot describes one Sequentia height H:
+
+- **Sequentia.** H, its block hash, time and the genesis hash. For every
+  bridged asset, the circulating supply at H as the node repository's supply
+  auditor
+  ([`contrib/asset-supply-audit/audit.py`](https://github.com/ConcatenaLabs/Sequentia/tree/master/contrib/asset-supply-audit))
+  reconstructs it from blocks 0 to H: issued, reissued and burned atoms, the
+  circulating total, and whether it is exact. Also recorded: the auditor's
+  exit status (0 when every figure is exact, 2 when a blinded issuance or burn
+  makes one only a bound), its arguments, the commit it came from and the
+  sha256 of the file that ran.
+- **Ethereum.** Block B, its hash and time, and for every configured vault and
+  every token the bridge escrows there: the balance at B, a version-3 vault's
+  reservations at B (`owedTotal`, `queuedTotal`, `cancelledTotal`), and the
+  backing they leave (balance less reservations, never below zero). A vault
+  with no code at B backs nothing.
+- **Solana.** The treasury and every deposit address the bridge has handed
+  out (the daemon's `/api/sol/intents`), and for each mint the balance of
+  each address's associated token accounts under both token programs (its
+  lamports, for SOL), read at `finalized` commitment, with the slots the reads
+  were answered at and the cluster's genesis hash. USDC that a CCTP
+  consolidation has burned on Solana and not yet minted into the vault still
+  backs the asset: such a burn is counted when it is final, succeeded, moved
+  exactly that amount out of the treasury, and landed no later than the
+  balances were read, and is listed either way.
+- **Per asset.** The escrow total in the asset's atoms (`null` when any source
+  could not be read, never zero), the in-transit total, and `backed`: true or
+  false when the supply is exact and every source was measured, `null`
+  otherwise.
+- **Provenance.** The tool's name, version, repository and commit, the
+  attester's address, when the snapshot was taken, and `previous`: the height
+  and payload hash of the snapshot before it (`null` for the first).
+
+SBTC is not in the snapshots: its reserve is held by the sbtc-bridge custody
+service rather than in a vault or treasury of this bridge, and `/api/por`
+reports it live.
+
+### How H, B and the Solana slot are chosen
+
+- **H** is the latest multiple of `intervalBlocks` (default 1440, a day of
+  60-second blocks) that is at least `minDepth` blocks (default 10) below the
+  tip. It does not depend on when the tool runs, so anyone can recompute it,
+  and a run for an H that already has a snapshot does nothing.
+- **B** is the last Ethereum block whose timestamp is at or before block H's
+  time. The tool waits until Ethereum has finalized a block after that time,
+  so B is final and exactly determined (block B+1 is after H). Both sides of
+  the comparison are then measured at the same moment. That matters: a
+  deposit is escrowed before it is minted and a redemption is burned before
+  it is released, so at one moment escrow may exceed supply, and a shortfall
+  is a real one. Measured at different moments, a deposit made after H would
+  cover a shortfall at H.
+- **Solana** has no way to read a balance at a past slot: its RPC answers for
+  the current state only. The Solana balances are therefore read when the
+  snapshot is taken, shortly after H, and the snapshot records the slots and
+  the time and says so (`pastSlotQueryable: false`). They can include deposits
+  made after H, and a CCTP consolidation that completes between B and the
+  read is counted on neither side, which makes an asset read short, never
+  long.
+
+### The file and the signature
+
+`<H>.json` is canonical JSON (object keys sorted at every depth, no
+whitespace, integers only, every amount a decimal string) followed by a
+newline:
+
+```
+{"format":"compages-reserves-snapshot","hash":"<sha256 of the payload>","payload":{...},
+ "signature":{"address":"0x...","message":"...","scheme":"eip191-personal-sign","signature":"0x..."},"version":1}
+```
+
+`hash` is the sha256 of the payload's canonical JSON, which `jq -cjS
+.payload` reproduces byte for byte. The attestation key signs, with EIP-191
+`personal_sign`, the message
+
+```
+Compages proof-of-reserves snapshot
+Sequentia height: <H>
+Payload sha256: <hash>
+```
+
+and `payload.attester` names the key. Because each payload carries its
+predecessor's hash, a snapshot that is removed, reordered or rewritten (even
+re-signed) breaks the link of the one after it. A snapshot file is written
+once and never replaced: the tool links a complete temporary file into place,
+which fails if the name exists, and it refuses to extend a history that does
+not verify. A height the tool never ran for (the host was down all day)
+stays a visible gap: the next snapshot links to the last one that exists.
+
+`index.json` lists every snapshot (`height`, `hash`, `previous`, `createdAt`,
+`file`) and the `head`. It is rebuilt from the snapshot files on every run and
+is not signed; each entry can be checked against the file it names.
+
+### Verifying
+
+With the verify tool (Node.js 20+):
+
+```
+git clone https://github.com/ConcatenaLabs/compages.git
+cd compages/reserves && npm install
+node verify.mjs https://sequentiatestnet.com/bridge --attester <address>
+```
+
+It fetches the index and every snapshot, and checks each signature against
+the pinned address, each payload hash, the whole hash chain, the index, and
+that every derived figure (backing, totals, atoms, the verdict) follows from
+the raw figures. The target can also be a directory of snapshots, such as a
+clone of the mirror, or a single file. Without `--attester` a snapshot is
+checked against the attester it names, which proves it is intact but not who
+made it.
+
+`--rederive` re-reads the latest snapshot's figures (or `--height H`'s) from
+endpoints you choose:
+
+```
+node verify.mjs https://sequentiatestnet.com/bridge --attester <address> --rederive \
+  --eth-rpc <Sepolia RPC that still has the state at B> \
+  --seq-rpc http://user:pass@127.0.0.1:<port> \
+  --audit-script <Sequentia checkout>/contrib/asset-supply-audit/audit.py \
+  --sol-rpc https://api.devnet.solana.com
+```
+
+`--eth-rpc` checks B's hash, that B is the last block at or before H's time,
+and every vault figure at B (an old snapshot needs an archive node).
+`--seq-rpc` checks H's hash and the genesis hash, and with `--audit-script`
+reruns the auditor to H and compares every supply figure. `--sol-rpc` checks
+the cluster and every CCTP burn; the Solana balances themselves cannot be
+re-read at a past slot.
+
+Without any of this repository's code, one snapshot checks with `jq`,
+`sha256sum` and ethers:
+
+```
+curl -s https://sequentiatestnet.com/bridge/api/por/history/<H> > snap.json
+jq -cjS .payload snap.json | sha256sum   # equals: jq -r .hash snap.json
+node -e 'const {verifyMessage} = require("ethers"); const s = require("./snap.json");
+  console.log(verifyMessage(s.signature.message, s.signature.signature))'   # the attestation address
+```
+
+and the message must read exactly as above, with that height and hash.
+
+### Taking snapshots
+
+On the operator's host, beside the daemon:
+
+```
+cd reserves
+npm install
+node keygen.mjs attestation.key          # prints the attestation address
+cp config.example.json config.json       # then edit, see below
+node snapshot.mjs config.json --dry-run  # prints what it would sign
+node snapshot.mjs config.json
+```
+
+`keygen.mjs` writes a fresh key (mode 0600) and refuses to replace an
+existing one. Back the file up offline and never commit it: whoever holds it
+can sign in the bridge's name. The address it prints is the one published
+above and pinned in the mirror (`ATTESTER` in its workflow).
+
+| Key | Meaning |
+|---|---|
+| `snapshotDir` | Where the snapshots and `index.json` are written; the daemon's `porHistoryDir` points at the same directory |
+| `attestationKeyFile` | The attestation key, as `keygen.mjs` writes it (never commit it) |
+| `intervalBlocks`, `minDepth` | Snapshot every this many Sequentia blocks (default 1440), once the height is this many blocks deep (default 10) |
+| `seqRpcUrl` | The Sequentia node, `http://user:pass@host:port`. The auditor receives the credentials in a private temporary cookie file, never on its command line |
+| `auditScript` | Path to `contrib/asset-supply-audit/audit.py` in a checkout of the node repository (`python`, default `python3`, runs it) |
+| `auditCheckpoint` | The auditor's checkpoint file (default: none, a full scan every time). The first run scans from genesis, at a few hundred blocks a second against a local node; later runs resume and read one interval. The checkpoint is discarded, and the chain rescanned, when the block it ends at is no longer on the chain, when the set of assets changes, or when the last run was interrupted |
+| `auditTimeoutMinutes` | How long one audit may run (default 360) |
+| `daemonUrl` | The daemon's API: the asset list, the Solana deposit addresses, and the CCTP burns in transit |
+| `ethChainId`, `ethChainName`, `ethRpcUrl` | The Ethereum chain (the chain id is checked against the RPC). The RPC must still have the state at B, which is about as old as H; a full node that keeps a day or more of recent state serves a daily snapshot |
+| `vaults` | Every vault that holds escrow, each `{address}` |
+| `solRpcUrl`, `solChainLabel`, `solTreasury`, `solGenesisHash` | The Solana RPC, the chain label the bridge uses for it, and the treasury and cluster genesis hash, both checked before anything is read |
+| `toolSource`, `auditSource` | Repository URLs recorded in each snapshot (default the ConcatenaLabs repositories) |
+
+`snapshot.mjs` exits 0 when it wrote a snapshot or had nothing to do yet, and
+1 on any failure, in which case it wrote nothing. Run it from a timer; the
+repository ships no unit file, and a minimal pair looks like this (adjust
+paths):
+
+```ini
+# /etc/systemd/system/compages-reserves.service
+[Unit]
+Description=Compages signed reserve snapshot
+After=network-online.target compagesd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/compages/reserves
+ExecStart=/usr/bin/node snapshot.mjs config.json
+```
+
+```ini
+# /etc/systemd/system/compages-reserves.timer
+[Unit]
+Description=Take the Compages reserve snapshot when one is due
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```
+systemctl daemon-reload
+systemctl enable --now compages-reserves.timer
+```
+
+A run every ten minutes costs nothing when no snapshot is due, and takes each
+snapshot within minutes of its height becoming eligible, which keeps the
+Solana read close to H. A failed run shows as a failed unit
+(`systemctl --failed`) and the next run tries again.
+
 ## Repository layout
 
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule), and `deployments/sepolia.json`, the deployed vaults |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/porhistory.js` (serves the reserve snapshot history), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
+| `reserves/` | The signed reserve snapshots (see "Signed reserve snapshots"): `snapshot.mjs` takes one, `verify.mjs` checks them, `keygen.mjs` creates the attestation key; `lib/format.mjs` is the format itself (canonical JSON, hashing, signature and chain checks), with unit tests and an end-to-end test against stand-in nodes |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
 | `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle") |
 
@@ -888,6 +1127,21 @@ needed):
 cd daemon
 npm test
 ```
+
+Reserve snapshot tests (canonical JSON and its agreement with `jq`, signing
+and verification, the hash chain and every way to break it, write-once
+storage, the auditor's checkpoint handling, and the whole snapshot and verify
+cycle against stand-in Sequentia, Ethereum and Solana nodes and daemon):
+
+```
+cd reserves
+npm test
+```
+
+With `AUDIT_SCRIPT` pointing at the node repository's
+`contrib/asset-supply-audit/audit.py`, they also run the real auditor against
+a stand-in chain, through a checkpoint resume, a reorg and a blinded
+reissuance.
 
 Full end-to-end test:
 
