@@ -11,3 +11,4 @@ contracts/cache/
 contracts/broadcast/
 watcher/config.json
 watcher/state/
+watcher/*.key
