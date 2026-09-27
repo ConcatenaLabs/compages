@@ -376,6 +376,10 @@ Circle supports, not only Ethereum and Solana:
 `CompagesVault` (`contracts/src/CompagesVault.sol`) holds the Ethereum-side
 escrow. It is deliberately not upgradeable; a new version is a new
 deployment. Its `VERSION` constant says which one an address runs.
+`contracts/deployments/sepolia.json` records each Sepolia vault's address,
+deploy block and transaction, source commit, compiler settings and constructor
+arguments; every one is source-verified on Sourcify and Blockscout, and
+rebuilding its source commit reproduces the deployed bytecode exactly.
 
 **Roles.** Three keys, set at deployment:
 
@@ -849,7 +853,7 @@ compages-watch.js config.json`.
 
 | Path | What it is |
 |---|---|
-| `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule) |
+| `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule), and `deployments/sepolia.json`, the deployed vaults |
 | `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
