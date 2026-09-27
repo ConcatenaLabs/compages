@@ -3,7 +3,29 @@
 
 import { ethers } from "ethers";
 
+// Every custom error any deployed vault version can raise, so a revert is
+// read by name rather than filed under "something went wrong".
+export const VAULT_ERRORS = [
+  "error NotOwner()",
+  "error NotOperator()",
+  "error NotBurner()",
+  "error DepositsArePaused()",
+  "error ReleasesArePaused()",
+  "error SupplyNotLocked()",
+  "error NoStablecoinConfigured()",
+  "error BurnFailed()",
+  "error ZeroAmount()",
+  "error ZeroAddress()",
+  "error BadSequentiaAddress()",
+  "error AlreadyReleased()",
+  "error EtherTransferFailed()",
+  "error TokenTransferFailed()",
+  "error Reentrancy()",
+  "error InsufficientVaultBalance()",
+];
+
 export const VAULT_ABI = [
+  ...VAULT_ERRORS,
   "event Deposited(uint256 indexed nonce, address indexed token, address indexed from, uint256 amount, string sequentiaAddress)",
   "event Released(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
   "function release(address token, address to, uint256 amount, bytes32 redemptionId)",
@@ -29,7 +51,11 @@ const ERC20_BYTES32_ABI = [
 export class Eth {
   constructor(cfg, operatorKey) {
     this.cfg = cfg;
-    this.provider = new ethers.JsonRpcProvider(cfg.ethRpcUrl, cfg.ethChainId, {
+    // Bounded like every other outbound call: a provider that stops
+    // answering must fail the tick, not hang it.
+    const req = new ethers.FetchRequest(cfg.ethRpcUrl);
+    req.timeout = cfg.ethRpcTimeoutMs ?? 30_000;
+    this.provider = new ethers.JsonRpcProvider(req, cfg.ethChainId, {
       staticNetwork: true,
     });
     this.wallet = new ethers.Wallet(operatorKey, this.provider);
@@ -59,6 +85,113 @@ export class Eth {
   vaultFor(address) {
     if (!address) return this.vault;
     return this.vaults.get(String(address).toLowerCase()) ?? this.vault;
+  }
+
+  /** The name of a vault custom error in revert data, or null. */
+  revertName(data) {
+    if (typeof data !== "string" || data.length < 10) return null;
+    try {
+      return this.vault.interface.parseError(data)?.name ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Send an operator transaction and wait a bounded time for it to mine.
+   *
+   *  `record(sent)` is called with { hash, nonce, sentAt, maxFeePerGas,
+   *  maxPriorityFeePerGas, to, data, value } as soon as the transaction is
+   *  broadcast, so a caller can persist it before waiting. Returns the
+   *  receipt, or null if it did not mine within `timeoutMs` (it may still:
+   *  the caller re-examines it with sentTxState and, if it is stuck, replaces
+   *  it at the same nonce with replaceStuck). A revert found while estimating
+   *  gas throws before anything is sent. */
+  async sendAndWait(contract, method, args, record, timeoutMs = this.cfg.ethTxWaitMs ?? 180_000) {
+    const populated = await contract[method].populateTransaction(...args);
+    const gasLimit = ((await contract[method].estimateGas(...args)) * 12n) / 10n;
+    const fee = await this.provider.getFeeData();
+    const tx = await this.wallet.sendTransaction({
+      ...populated,
+      gasLimit,
+      ...(fee.maxFeePerGas ? { maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas } : {}),
+    });
+    const sent = {
+      hash: tx.hash,
+      nonce: tx.nonce,
+      sentAt: new Date().toISOString(),
+      to: tx.to,
+      data: tx.data,
+      value: tx.value.toString(),
+      gasLimit: tx.gasLimit.toString(),
+      maxFeePerGas: tx.maxFeePerGas?.toString() ?? null,
+      maxPriorityFeePerGas: tx.maxPriorityFeePerGas?.toString() ?? null,
+    };
+    await record(sent);
+    return this.waitMined(sent.hash, timeoutMs);
+  }
+
+  /** A receipt, or null when nothing mined within `timeoutMs`. */
+  async waitMined(hash, timeoutMs) {
+    try {
+      return await this.provider.waitForTransaction(hash, 1, timeoutMs);
+    } catch (e) {
+      if (e.code === "TIMEOUT") return null;
+      throw e;
+    }
+  }
+
+  /** Where a transaction we sent stands: "mined" (receipt status 1),
+   *  "reverted" (mined, status 0), "pending" (known, not mined), or "dropped"
+   *  (the node no longer knows it, and its nonce has been used by nothing,
+   *  so it can never mine as sent). "replaced" means another transaction of
+   *  ours took that nonce. */
+  async sentTxState(sent) {
+    const receipt = await this.provider.getTransactionReceipt(sent.hash);
+    if (receipt) return receipt.status === 1 ? "mined" : "reverted";
+    const tx = await this.provider.getTransaction(sent.hash);
+    if (tx) return "pending";
+    const mined = await this.provider.getTransactionCount(this.wallet.address, "latest");
+    return mined > sent.nonce ? "replaced" : "dropped";
+  }
+
+  /** Re-send the same call at the same nonce with fees raised by at least
+   *  the 10% the mempool demands (30% here), so a release stuck behind a gas
+   *  spike cannot hold up every later operator transaction. Returns the new
+   *  `sent` record; the old hash stops being the one to watch. */
+  async replaceStuck(sent) {
+    const fee = await this.provider.getFeeData();
+    const bump = (v, floor) => {
+      const raised = (BigInt(v ?? 0) * 13n) / 10n;
+      const f = BigInt(floor ?? 0);
+      return raised > f ? raised : f;
+    };
+    const maxFeePerGas = bump(sent.maxFeePerGas, fee.maxFeePerGas);
+    const maxPriorityFeePerGas = bump(sent.maxPriorityFeePerGas, fee.maxPriorityFeePerGas);
+    const tx = await this.wallet.sendTransaction({
+      to: sent.to,
+      data: sent.data,
+      value: BigInt(sent.value ?? 0),
+      nonce: sent.nonce,
+      gasLimit: BigInt(sent.gasLimit),
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+    });
+    return {
+      ...sent,
+      hash: tx.hash,
+      sentAt: new Date().toISOString(),
+      maxFeePerGas: maxFeePerGas.toString(),
+      maxPriorityFeePerGas: maxPriorityFeePerGas.toString(),
+      replaces: [...(sent.replaces ?? []), sent.hash],
+    };
+  }
+
+  /** What one vault holds of `token` (ZeroAddress or "eth" for ether). */
+  async vaultHolding(vault, token) {
+    const addr = await vault.getAddress();
+    if (token === "eth" || token === ethers.ZeroAddress) return BigInt(await this.provider.getBalance(addr));
+    const erc20 = new ethers.Contract(ethers.getAddress(token), ERC20_BALANCE_ABI, this.provider);
+    return BigInt(await erc20.balanceOf(addr));
   }
 
   /** How much of `token` is actually escrowed, in that token's base units:

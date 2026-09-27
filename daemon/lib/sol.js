@@ -372,6 +372,9 @@ export class Sol {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      // Bounded, like every other outbound call: a hung cluster RPC must fail
+      // this tick's Solana phase, not freeze the loop every leg shares.
+      signal: AbortSignal.timeout(this.cfg?.solRpcTimeoutMs ?? 30_000),
     });
     const text = await res.text();
     let json;

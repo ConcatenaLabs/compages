@@ -290,15 +290,31 @@ operator. Registration is best-effort and retried; it never blocks a mint.
   policy asset, so when `seqFeeAsset` is set the redeem-side burn is built as
   a raw transaction (a `burn` output for the bridged asset plus a fee output
   in `seqFeeAsset`), blinded, signed and broadcast by the daemon
-  (`daemon/lib/bridge.js`, `destroyAsset`).
-- **Mempool verification**: the daemon verifies every mint, send and burn
-  transaction actually reached the mempool before counting it, and rolls the
-  wallet back (`abandontransaction`) if it did not.
+  (`daemon/lib/bridge.js`, `buildBurn`).
+- **Broadcast verification**: a txid returned by the wallet is never taken as
+  proof of broadcast. After every mint, send and burn the daemon establishes
+  one of three answers: the transaction is in the mempool or a block; it is
+  provably absent (the wallet accepted `abandontransaction`, which it refuses
+  for anything in the mempool or a block), which makes a retry safe; or the
+  node could not say. In that last case the record waits as `unresolved` and
+  is asked again every tick, because retrying a transaction whose fate is
+  unknown is exactly how a bridge mints or pays twice.
 - **Crash safety**: every irreversible step is bracketed by a persisted
-  marker in the state file. If the daemon dies between a chain write and its
-  acknowledgment, the record halts in a `*_manual` status for operator review
-  instead of double-paying; on-chain `processedRedemptions` is consulted on
-  restart to reconcile releases that landed before a crash.
+  marker in the state file, and the transaction id is recorded before its
+  outcome is checked, so after a crash the chain answers whether it landed.
+  Burns go further: the signed burn is persisted before broadcast and
+  re-broadcast as-is after an interruption, which can never burn twice. On
+  Ethereum the vault's `processedRedemptions` is the authority on whether a
+  payout landed. Only a step interrupted before its transaction id was
+  recorded, or one the node cannot settle for `unresolvedHours`, becomes a
+  `*_manual` case for the operator.
+- **Bounded waits**: every call to a node, an RPC provider or a service has a
+  timeout, and an Ethereum payout that sits unmined for `ethStuckMinutes` is
+  replaced at the same nonce with higher fees, so one stuck call cannot stall
+  every leg of the bridge.
+- **Durable state**: each save is flushed to disk (file and directory) before
+  the daemon acts on it, and a copy per day for the last 14 days is kept in
+  `snapshots/` beside the state file.
 
 ## HTTP API
 
@@ -324,14 +340,18 @@ none moves funds.
 | `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
 | `GET /api/sol/redeem/<seqAddress>` | A Solana unwrap address's bound Solana destination and the status of every redemption seen on it |
 
-Deposit records move through the statuses `minting`, `mint_retry`,
-`send_retry`, `minted` (delivered), `refund_pending`, `refunded`, and
-`failed_manual` (paused for operator review; Solana deposits use `dust_manual`
-instead of the refund states). Redemption records move through
-`awaiting_finality`, `new`, `releasing`, `released`, `destroy_pending`, `done`,
+Deposit records move through the statuses `minting`, `mint_retry` and
+`send_retry` (a safe retry, with backoff), `unresolved` (a chain write whose
+outcome the node could not confirm yet; re-checked every tick), `minted`
+(delivered), `refund_pending`, `refunding`, `refunded`, and `failed_manual`
+(paused for operator review; Solana deposits use `dust_manual` instead of the
+refund states). Redemption records move through `awaiting_finality`,
+`awaiting_liquidity`, `new`, `releasing`, `release_paused` (the vault's
+releases are paused), `released`, `destroy_pending`, `destroying`, `done`,
 plus the terminal `dust_ignored`, `ignored_unknown_asset`,
-`ignored_wrong_network` (an asset returned to the wrong leg's address) and
-`release_failed_manual`.
+`ignored_wrong_network` (an asset returned to the wrong leg's address),
+`release_failed_manual` (the recipient address does not accept the payout)
+and `destroy_manual`.
 
 Try it against the live instance:
 
@@ -468,7 +488,12 @@ destruction, automatic refund of an undeliverable deposit, the Solana leg
 (wrap, reissue, sweep, unwrap, and the cross-leg wrong-network guards),
 fee-asset independence (the bridge wallet never touches the policy asset),
 the unified-asset ceremony (USDC from Ethereum and from Solana landing on one
-`USDC.e`), and registry metadata binding. Requires foundry, node >= 20 and a
+`USDC.e`), registry metadata binding, and fault injection: the daemon reaches
+the node through `e2e/fault-proxy.mjs`, which makes the node go silent right
+after a reissuance or a delivery is broadcast, drops the answer to a burn the
+node accepted, and the suite kills and restarts the daemon mid-mint. After
+each, the user must hold exactly what they deposited and the supply the chain
+reports must equal the daemon's ledger. Requires foundry, node >= 20 and a
 build of the Sequentia node (`sequentiad`/`sequentia-cli`; set `SEQ_REPO` to
 your checkout of the
 [Sequentia repo](https://github.com/ConcatenaLabs/Sequentia),

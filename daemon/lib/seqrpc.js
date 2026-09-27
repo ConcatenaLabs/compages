@@ -6,8 +6,13 @@ export class SeqRpc {
    * @param {string} url  http://user:pass@host:port  (wallet appended per call set)
    * @param {string} [wallet]  wallet name to route calls to
    */
-  constructor(url, wallet) {
+  constructor(url, wallet, { timeoutMs = 120_000 } = {}) {
     const u = new URL(url);
+    // Every call is bounded. A node that stops answering must surface as an
+    // error in the tick that asked, never as a promise that never settles:
+    // the main loop runs one pass at a time, so one hung call would stall
+    // every leg of the bridge with nothing in the log.
+    this.timeoutMs = timeoutMs;
     this.auth = u.username
       ? "Basic " + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString("base64")
       : null;
@@ -27,6 +32,7 @@ export class SeqRpc {
         ...(this.auth ? { authorization: this.auth } : {}),
       },
       body,
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     const text = await res.text();
     let json;

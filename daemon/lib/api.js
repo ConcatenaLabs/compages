@@ -109,6 +109,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     const res = await fetch(cfg.sbtcBridgeUrl.replace(/\/+$/, "") + bridgePath, {
       method,
       headers,
+      signal: AbortSignal.timeout(15_000),
       ...(method === "GET" ? {} : { body: JSON.stringify(body) }),
     });
     return res.json().catch(() => ({ ok: false, error: "bad bridge response" }));
@@ -127,7 +128,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     if (!cfg.esploraUrl) {
       throw new Error("no indexer is configured, so this asset's supply cannot be read");
     }
-    const res = await fetch(`${cfg.esploraUrl.replace(/\/+$/, "")}/asset/${assetId}`);
+    const res = await fetch(`${cfg.esploraUrl.replace(/\/+$/, "")}/asset/${assetId}`, {
+      signal: AbortSignal.timeout(15_000),
+    });
     if (!res.ok) throw new Error(`the indexer returned ${res.status} for this asset`);
     const a = await res.json();
     const stats = a.chain_stats ?? {};
@@ -171,9 +174,19 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   // generator. The cache alone was not what fixed the Solana 429 though: that
   // endpoint throttles getTokenAccountsByOwner so hard it refuses a single cold
   // call, so the fix was to stop making that call at all (see Sol.escrowBalance).
+  //
+  // The cache is dropped whenever this daemon itself moves escrow (a deposit
+  // credited, a payout made): a cached pre-release balance set beside a fresh
+  // post-burn supply would overstate backing, the one direction a proof of
+  // reserves must never err in.
   const cache = new Map();
-  const ESCROW_TTL_MS = 60_000;
+  const ESCROW_TTL_MS = cfg.porCacheMs ?? 60_000;
+  let cacheEpoch = 0;
   async function cached(key, fn) {
+    if ((bridge.escrowEpoch ?? 0) !== cacheEpoch) {
+      cache.clear();
+      cacheEpoch = bridge.escrowEpoch ?? 0;
+    }
     const now = Date.now();
     const hit = cache.get(key);
     if (hit?.ok && now - hit.at < ESCROW_TTL_MS) return hit;
@@ -403,9 +416,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         // locked on the source chain.
         //
         // It appears in none of the mappings above only because its reserve is
-        // held differently -- BTC in the peg multisig on Bitcoin, rather than a
-        // token in a vault contract this daemon watches -- so it is measured
-        // through the peg service instead of by reading a vault. That is a
+        // held differently -- BTC in the peg service's reserve on Bitcoin,
+        // rather than a token in a vault contract this daemon watches -- so it
+        // is measured through the peg service instead of by reading a vault. That is a
         // difference in mechanism, not in who is answerable for it, and a
         // reserves page that omits a reserve it could have checked is worse
         // than no page at all.
@@ -416,7 +429,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             ticker: "SBTC",
             precision: 8,
             unified: false,
-            custody: "BTC in the peg multisig, via the SBTC peg service",
+            // How the reserve is held is the peg service's to state; never
+            // assume a threshold of signers it did not name.
+            custody: null,
             sources: [],
             escrowTracked: false,
             escrowSource: null,
@@ -431,6 +446,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             const st = await sbtcBridge("/status", null, "GET");
             if (!st?.ok) throw new Error(st?.error || "the Bitcoin bridge did not answer");
             row.assetId = st.sbtc_asset ?? null;
+            row.custody = st.reserve_custody ?? null;
             // reserve_btc is whole BTC from a Bitcoin wallet, not base units.
             if (st.reserve_btc !== null && st.reserve_btc !== undefined) {
               row.sources = [{

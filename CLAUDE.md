@@ -19,7 +19,7 @@ Node and consensus conventions live in the
 | `contracts/` | Foundry project. One contract, `src/CompagesVault.sol`, with `test/CompagesVault.t.sol` and `script/Deploy.s.sol`. |
 | `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,seqrpc,state}.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format; keep it dependency-free). It also serves the web front-end. |
 | `web/` | `index.html` + `app.js`, served by the daemon. |
-| `e2e/` | `run-e2e.sh`, `driver.mjs`, and `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions). |
+| `e2e/` | `run-e2e.sh`, `driver.mjs`, `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions), and `fault-proxy.mjs` (sits between the daemon and the node and fails chosen calls on command). |
 
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
@@ -86,6 +86,12 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   was a specific fix; Sequentia has an open fee market and no privileged unit.
 - Chain ids, RPC endpoints, the vault address and confirmation depths are all configuration, and
   asset mappings are keyed per chain id. Keep it that way.
+- **Never retry a chain write whose outcome is unknown.** A txid from the wallet is not proof of
+  broadcast, and failing to see a transaction is not proof of absence: a node outage looks the
+  same. `confirmBroadcast` answers visible, absent (the wallet ACCEPTED `abandontransaction`) or
+  unknown, and only "absent" permits a retry. "Unknown" parks the record as `unresolved` and asks
+  again next tick. Record the txid before asking. The fault-injection checks in the e2e suite
+  exist to keep this true.
 - **Solana transfers are replay-guarded by precomputed signatures.** A Solana transaction's id is
   its fee payer's signature, known before broadcast; the daemon persists it (with the blockhash's
   `lastValidBlockHeight`) BEFORE sending, and after a crash the chain itself answers whether the

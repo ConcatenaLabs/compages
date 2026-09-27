@@ -291,6 +291,21 @@ const methods = {
             }))
         : [],
   }),
+  // The daemon reads escrow with this rather than getTokenAccountsByOwner,
+  // which the public devnet throttles. Same error shape as the real cluster
+  // for an account that does not exist.
+  getTokenAccountBalance: ([addr]) => {
+    const ta = tokenAccounts.get(addr);
+    if (!ta) throw rpcErr(-32602, "Invalid param: could not find account");
+    return {
+      context: { slot: height },
+      value: {
+        amount: ta.amount.toString(),
+        decimals: mints.get(ta.mint)?.decimals ?? 0,
+        uiAmountString: null,
+      },
+    };
+  },
   getAccountInfo: ([addr]) => {
     if (mints.has(addr)) {
       return {
