@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { tokenKeyOf, sourcesOf, SEQ_MAX_SATS } from "./bridge.js";
 import { unitsToAtoms } from "./eth.js";
+import { porHistory } from "./porhistory.js";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -524,13 +525,21 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(200, Object.values(state.data.mappings).map(publicMapping));
       }
 
+      // The signed, append-only reserve history (reserves/snapshot.mjs writes
+      // it). Files are served as they are on disk: they are signed bytes.
+      if (req.method === "GET" && parts[1] === "por" && parts[2] === "history") {
+        const r = await porHistory(cfg.porHistoryDir ? path.resolve(cfg.porHistoryDir) : null, parts.slice(3));
+        res.writeHead(r.status, r.headers);
+        return res.end(r.body);
+      }
+
       // Proof of reserves. A bridged asset's whole claim is that every unit in
       // circulation is backed one-for-one by a unit escrowed on its source
       // chain, so the bridge publishes both sides and their difference rather
       // than asking anyone to take it on trust. Circulating supply is read
       // from the Sequentia chain itself, not from the daemon's own ledger, so
       // a bug in this daemon shows up here as a discrepancy instead of hiding.
-      if (req.method === "GET" && parts[1] === "por") {
+      if (req.method === "GET" && parts[1] === "por" && parts.length === 2) {
         const only = url.searchParams.get("asset");
         const out = [];
         for (const m of Object.values(state.data.mappings)) {

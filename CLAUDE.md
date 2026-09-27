@@ -17,15 +17,17 @@ Node and consensus conventions live in the
 | Path | What |
 |---|---|
 | `contracts/` | Foundry project. Two contracts, `src/CompagesVault.sol` and `src/CompagesOftReceiver.sol` (takes LayerZero OFT arrivals, USDT0, into the vault as an ordinary depositor), with no dependency beyond `forge-std` for tests. `script/Deploy.s.sol` deploys the vault (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`); `deployments/sepolia.json` holds the immutable facts of every deployed vault: address, deploy tx, source commit, compiler settings, constructor args, verification links (add a vault there when you deploy one, never its role holders); tests are in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesOftReceiver.t.sol` (the OFT receiver, against `mocks/MockLayerZero.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). `test/fork/HandoverRehearsal.t.sol` rehearses the Circle hand-off against the live Sepolia vault; it is skipped unless `REHEARSAL_RPC_URL` is set, which `contrib/handover-rehearsal.sh` does. `script/SafeOwner.s.sol` moves the owner role to a Safe v1.4.1 in separately run steps (deploy, transferOwnership, print the Safe tx, execute), and `test/fork/SafeOwnerRehearsal.t.sol` drives those same steps on a fork under the same `REHEARSAL_RPC_URL` gate (`contrib/safe-owner-rehearsal.sh`). |
-| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
+| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state,porhistory}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
 | `web/` | `index.html`, `app.js` and `qr.js` (a dependency-free QR encoder), served by the daemon. |
 | `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. |
+| `reserves/` | Signed proof-of-reserves snapshots: `snapshot.mjs` (run from a timer on the operator host), `verify.mjs` (for anyone), `keygen.mjs`, and `lib/format.mjs`, the format itself. Its own package like the watcher, reading the chains itself; it may import pure helpers from `daemon/lib` and asks the daemon only for the asset list, the Solana deposit addresses and the CCTP burns in transit. `lib/format.mjs` depends on nothing but `ethers` and is copied verbatim into the `compages-reserves` mirror: change the format there too, in the same sitting. |
 | `contrib/` | `handover-rehearsal.sh`: runs the hand-off rehearsal on a Sepolia fork. `safe-owner.md`: the runbook for moving the vault owner to a Safe; `safe-owner-rehearsal.sh` rehearses it on a fork. |
 | `e2e/` | `run-e2e.sh`, `driver.mjs`, `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions), and `fault-proxy.mjs` (sits between the daemon and the node and fails chosen calls on command). |
 
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
 cd daemon && npm test                     # node --test (unit tests)
+cd reserves && npm test                   # snapshot format, chain, storage, end to end
 cd contracts && forge test                # the vault unit, CCTP, OFT receiver and invariant tests
 ```
 
@@ -78,6 +80,11 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
 - **Proof of reserves reports only what it measured.** Untracked escrow is null, not zero, and a
   backing verdict is given only when both sides were actually measured. A reassuring number nobody
   measured is worse than an honest gap.
+- **A reserve snapshot is never rewritten.** Once `<H>.json` exists it is history: the store links
+  a finished file into place and fails if the name exists, and the tool refuses to extend a history
+  that does not verify. Escrow is read at the Ethereum block matching H's time, never at Ethereum's
+  latest block, so a deposit made after H cannot cover a shortfall at H. Never add a field that
+  canonical JSON cannot hold (floats, BigInt): amounts are decimal strings.
 - **Releases and refunds are replay-guarded on chain** by deterministic ids, so nothing can be paid
   twice. The vault marks an id processed when it pays it OR queues it, and a cancelled id stays
   spent: `processedRedemptions` true means "the vault has taken this on", not "it was paid" —

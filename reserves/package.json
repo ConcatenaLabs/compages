@@ -1,0 +1,15 @@
+{
+  "name": "compages-reserves",
+  "version": "1.0.0",
+  "description": "Signed proof-of-reserves snapshots of the Compages bridge, with a hash-chained history, and the tool that verifies them",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "snapshot": "node snapshot.mjs",
+    "verify": "node verify.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
