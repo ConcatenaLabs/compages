@@ -867,6 +867,17 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(404, { error: "not found" });
       }
 
+      // Where a user's bitcoin is: every transfer to a peg-in deposit address
+      // or an SBTC return address, as the peg service reports it.
+      if (req.method === "GET" && parts[1] === "btc" && (parts[2] === "wrap" || parts[2] === "unwrap") && parts[3]) {
+        if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
+        if (!/^[A-Za-z0-9]{20,120}$/.test(parts[3])) return send(400, { error: "invalid address" });
+        const r = await sbtcBridge(`/${parts[2] === "wrap" ? "pegin" : "pegout"}/${parts[3]}`, null, "GET");
+        if (!r.ok) return send(r.error === "unknown address" ? 404 : 502, { error: r.error || "bridge error" });
+        const { ok, ...rest } = r;
+        return send(200, { ...rest, btcChainName: cfg.btcChainName ?? "Bitcoin testnet4" });
+      }
+
       if (req.method === "POST" && parts[1] === "btc" && parts[2] === "unwrap") {
         if (!cfg.sbtcBridgeUrl) return send(503, { error: "the Bitcoin bridge is not configured" });
         const body = parseJson(await readBody(req));

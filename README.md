@@ -339,6 +339,7 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/deposit/tx/<ethTxHash>` | Look up deposits by their Ethereum transaction hash (used to track and resume deposits) |
 | `POST /api/btc/wrap` `{"seqAddress": "..."}` | Bitcoin deposit address for a BTC → SBTC wrap (proxied to the sbtc-bridge) |
 | `POST /api/btc/unwrap` `{"btcAddress": "..."}` | Sequentia return address for an SBTC → BTC unwrap (proxied to the sbtc-bridge) |
+| `GET /api/btc/wrap/<depositAddress>`, `GET /api/btc/unwrap/<sbtcAddress>` | Every transfer sent to a BTC deposit address or an SBTC return address: amount, confirmations, stage, and the credit or release txid (proxied to the sbtc-bridge) |
 | `POST /api/sol/wrap` `{"seqAddress": "..."}` | Solana deposit address for a SOL → SOL.s wrap (the Sequentia address is validated up front) |
 | `GET /api/sol/wrap/<solAddress>` | A wrap intent's bound Sequentia address and the status of every deposit seen on it |
 | `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
