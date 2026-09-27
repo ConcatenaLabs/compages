@@ -550,6 +550,11 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           // released, so escrow may legitimately EXCEED circulation briefly;
           // the reverse would mean unbacked units exist. A verdict is only
           // given when both sides of the comparison were actually measured.
+          // A CCTP transfer between two of this asset's escrows is burned on
+          // one chain before Circle mints it on the other; it still backs the
+          // asset. Listed with the burns, so each can be checked on chain.
+          const transit = bridge.cctp?.inTransit(m.assetId) ?? { atoms: 0n, burns: [] };
+          if (escrowedAtoms !== null) escrowedAtoms += transit.atoms;
           const comparable = escrowedAtoms !== null && chainSupply !== null;
           out.push({
             assetId: m.assetId,
@@ -561,6 +566,8 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             escrowTracked,
             escrowSource: escrowTracked ? "chain" : null,
             escrowedAtoms: escrowedAtoms === null ? null : escrowedAtoms.toString(),
+            inTransitAtoms: transit.atoms.toString(),
+            inTransit: transit.burns,
             ledgerCirculatingAtoms: ledger.toString(),
             chainCirculatingAtoms: chainSupply,
             chainSupplyError: chainError,

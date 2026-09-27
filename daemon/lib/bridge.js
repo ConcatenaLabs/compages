@@ -2812,7 +2812,12 @@ export class Bridge {
             inFlight += BigInt(r.sats);
           }
         }
+        // Burned on one chain by CCTP and not yet minted on the other: still
+        // backing, just in transit.
+        const transit = this.cctp?.inTransit(m.assetId).atoms ?? 0n;
+        escrow += transit;
         row.escrow = escrow.toString();
+        row.inTransit = transit.toString();
         row.inFlight = inFlight.toString();
         if (supply - inFlight - pending > escrow) {
           breach(m.assetId, "escrow", `circulating ${supply - inFlight} exceeds escrow ${escrow}`);
@@ -2937,6 +2942,18 @@ export class Bridge {
       }
     }
 
+    for (const r of Object.values(s.cctpTransfers ?? {})) {
+      if (r.stage === "done") continue;
+      const ageH = (now - Date.parse(r.createdAt)) / 3_600_000;
+      if (ageH > (this.cfg.cctp?.stuckHours ?? 2)) {
+        problems.push({
+          key: `cctp:${r.id}`,
+          severity: "warning",
+          title: `CCTP transfer ${r.id} has been ${r.stage} for ${Math.floor(ageH)} h`,
+          detail: r.error ?? `Solana burn ${r.burn?.signature ?? "not sent"}`,
+        });
+      }
+    }
     for (const [assetId, h] of Object.entries(s.halted ?? {})) {
       problems.push({
         key: `halt:${assetId}`,
