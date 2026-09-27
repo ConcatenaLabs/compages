@@ -302,6 +302,27 @@ export class Bridge {
       }
       let mapping = s.mappings[mappingKey];
 
+      // A ceremony whose broadcast could not be confirmed either way last time
+      // is resolved before anything else: issuing again while the first one
+      // might still land would create a second, rival asset.
+      const pending = s.pendingUnified?.[mappingKey];
+      if (!mapping && pending) {
+        const fate = await this.resolveBroadcast(pending.issued.txid);
+        if (fate === "unknown") {
+          throw new Error(
+            `unified ${def.symbol}: issuance ${pending.issued.txid} is neither provably broadcast nor provably absent; ` +
+              `refusing to issue again until the node can say which`
+          );
+        }
+        delete s.pendingUnified[mappingKey];
+        if (fate === "visible") {
+          mapping = this.unifiedMappingFrom(mappingKey, def, pending);
+          s.mappings[mappingKey] = mapping;
+          this.log(`unified ${def.symbol}: earlier issuance ${pending.issued.txid} confirmed visible; adopted`);
+        }
+        this.state.save();
+      }
+
       if (!mapping) {
         const precision = def.precision ?? 8;
         const contract = await this.buildAssetContract(
@@ -338,35 +359,24 @@ export class Bridge {
               }
             : {}),
         });
-        if (!(await this.waitWalletTxVisible(issued.txid))) {
-          await this.seq.call("abandontransaction", { txid: issued.txid }).catch(() => {});
+        const ceremony = { issued, precision, contract, contractHash: ch, supervision };
+        s.pendingUnified ??= {};
+        s.pendingUnified[mappingKey] = ceremony;
+        this.state.save();
+        const fate = await this.confirmBroadcast(issued.txid);
+        if (fate === "absent") {
+          delete s.pendingUnified[mappingKey];
+          this.state.save();
           throw new Error(`unified ${def.symbol}: issuance tx never reached the mempool`);
         }
-        mapping = {
-          tokenKey: mappingKey,
-          unified: true,
-          symbol: def.symbol,
-          name: def.name,
-          precision,
-          assetId: issued.asset,
-          reissuanceToken: issued.token,
-          entropy: issued.entropy,
-          issueTxid: issued.txid,
-          mintedSats: "0",
-          sources: {},
-          contract,
-          contractHash: ch,
-          registered: false,
-          createdAt: new Date().toISOString(),
-          supervision: supervision
-            ? {
-                supervised: true,
-                operationalkey: supervision.operationalkey,
-                recoverykey: supervision.recoverykey,
-                pauseAllowed: supervision.pause,
-              }
-            : { supervised: false },
-        };
+        if (fate === "unknown") {
+          throw new Error(
+            `unified ${def.symbol}: could not establish whether issuance ${issued.txid} was broadcast; ` +
+              `it is recorded and will be resolved on the next start`
+          );
+        }
+        delete s.pendingUnified[mappingKey];
+        mapping = this.unifiedMappingFrom(mappingKey, def, ceremony);
         s.mappings[mappingKey] = mapping;
         this.state.save();
         this.log(
@@ -416,6 +426,35 @@ export class Bridge {
     }
   }
 
+  /** The mapping record for a unified asset whose issuance is visible. */
+  unifiedMappingFrom(mappingKey, def, { issued, precision, contract, contractHash: ch, supervision }) {
+    return {
+      tokenKey: mappingKey,
+      unified: true,
+      symbol: def.symbol,
+      name: def.name,
+      precision,
+      assetId: issued.asset,
+      reissuanceToken: issued.token,
+      entropy: issued.entropy,
+      issueTxid: issued.txid,
+      mintedSats: "0",
+      sources: {},
+      contract,
+      contractHash: ch,
+      registered: false,
+      createdAt: new Date().toISOString(),
+      supervision: supervision
+        ? {
+            supervised: true,
+            operationalkey: supervision.operationalkey,
+            recoverykey: supervision.recoverykey,
+            pauseAllowed: supervision.pause,
+          }
+        : { supervised: false },
+    };
+  }
+
   /** Record that `units` more of a source's token now sit in that chain's
    *  escrow. The sum of these across sources is what circulating supply must
    *  equal; see /api/por.
@@ -428,6 +467,7 @@ export class Bridge {
    *  backing that the source chain does not actually hold, which is the one
    *  direction a proof of reserves must never err in. */
   creditEscrow(mapping, tokenKey, units, dep = null) {
+    this.escrowEpoch = (this.escrowEpoch ?? 0) + 1;
     if (dep) {
       dep.steps ??= {};
       if (dep.steps.escrowCredited) return;
@@ -491,8 +531,14 @@ export class Bridge {
     return burned;
   }
 
-  /** Record that `units` left a source's escrow on release. */
-  debitEscrow(mapping, tokenKey, units) {
+  /** Record that `units` left a source's escrow on release. `rec` is debited
+   *  at most once, however many paths learn that its payout landed. */
+  debitEscrow(mapping, tokenKey, units, rec = null) {
+    this.escrowEpoch = (this.escrowEpoch ?? 0) + 1;
+    if (rec) {
+      if (rec.escrowDebited) return;
+      rec.escrowDebited = true;
+    }
     const src = mapping.sources?.[tokenKey];
     if (!src) return;
     const now = BigInt(src.escrowedUnits ?? "0") - BigInt(units);
@@ -565,16 +611,7 @@ export class Bridge {
     try {
       await this.mintDeposit(dep);
     } catch (e) {
-      this.log(`deposit #${nonce}: mint failed: ${e.message}`);
-      if (dep.status === "minting" && !dep.steps.pendingIssue && !dep.steps.pendingMint && !dep.steps.pendingSend) {
-        // Nothing irreversible happened yet; retry on the next scan pass.
-        dep.status = "mint_retry";
-        dep.error = e.message;
-      } else if (dep.status === "minting") {
-        dep.status = "failed_manual";
-        dep.error = e.message;
-      }
-      this.state.save();
+      if (dep.status === "minting") this.mintFailed(dep, e);
     }
   }
 
@@ -604,8 +641,9 @@ export class Bridge {
       this.state.save();
       return;
     }
-    const already = mapping ? BigInt(mapping.mintedSats) : 0n;
-    if (already + sats > SEQ_MAX_SATS) {
+    const minted = Boolean(dep.steps.issueTxid || dep.steps.mintTxid);
+    const already = mapping && !minted ? BigInt(mapping.mintedSats) : 0n;
+    if (!minted && already + sats > SEQ_MAX_SATS) {
       dep.status = "refund_pending";
       dep.refundReason = "would exceed the Sequentia per-asset amount cap";
       this.state.save();
@@ -635,8 +673,12 @@ export class Bridge {
    *  mapping (with its registry contract) on first use. Shared by every leg;
    *  `origin` describes where the deposit came from: { chainId, token, meta:
    *  {symbol, name, decimals}, chainName, tickerSuffix }. Returns the mapping,
-   *  or null when the mint was deferred for a later retry (dep status/markers
-   *  already updated via deferMint). */
+   *  or null when the mint was deferred or is unresolved (dep status and
+   *  markers already recorded).
+   *
+   *  Idempotent per deposit: once a deposit's mint is recorded, calling this
+   *  again returns the mapping without minting, so a deposit re-driven after a
+   *  crash or a failed delivery can never be minted twice. */
   async ensureMintedMapping(dep, tokenKey, sats, origin) {
     const s = this.state.data;
     const tag = dep.tag ?? `deposit #${dep.nonce}`;
@@ -644,6 +686,8 @@ export class Bridge {
     // and only thing standing between a second source chain and a duplicate,
     // liquidity-splitting asset.
     const mappingKey = this.mappingKeyFor(tokenKey);
+    if (dep.steps.issueTxid || dep.steps.mintTxid) return s.mappings[mappingKey];
+
     let mapping = s.mappings[mappingKey];
     if (!mapping) {
       // Build the registry contract up front and issue the asset committed to
@@ -669,37 +713,33 @@ export class Bridge {
         }
         throw e;
       }
-      if (!(await this.waitWalletTxVisible(issued.txid))) {
-        await this.seq.call("abandontransaction", { txid: issued.txid }).catch(() => {});
+      // Everything needed to finish the step is recorded BEFORE asking whether
+      // it landed, so an unanswered question can be asked again later instead
+      // of being guessed at.
+      dep.steps.issueCandidate = {
+        txid: issued.txid,
+        asset: issued.asset,
+        token: issued.token,
+        entropy: issued.entropy,
+        sats: sats.toString(),
+        mappingKey,
+        tokenKey,
+        origin: { chainId: origin.chainId, token: origin.token, meta: origin.meta },
+        contract,
+        contractHash: ch,
+      };
+      this.state.save();
+      const fate = await this.confirmBroadcast(issued.txid);
+      if (fate === "absent") {
+        delete dep.steps.issueCandidate;
         this.deferMint(dep, "pendingIssue", new Error("issuance tx never reached the mempool"));
         return null;
       }
-      mapping = {
-        tokenKey,
-        chainId: origin.chainId,
-        token: origin.token,
-        symbol: origin.meta.symbol,
-        name: origin.meta.name,
-        decimals: origin.meta.decimals,
-        assetId: issued.asset,
-        reissuanceToken: issued.token,
-        entropy: issued.entropy,
-        issueTxid: issued.txid,
-        firstDepositNonce: dep.nonce ?? dep.sig ?? null,
-        mintedSats: sats.toString(),
-        contract,
-        contractHash: ch,
-        registered: false,
-        createdAt: new Date().toISOString(),
-      };
-      s.mappings[mappingKey] = mapping;
-      delete dep.steps.pendingIssue;
-      dep.steps.issueTxid = issued.txid;
-      this.state.save();
-      this.log(
-        `${tag}: issued NEW Sequentia asset ${issued.asset} for ${origin.meta.symbol} as ${contract.ticker} (${tokenKey})`
-      );
-      // Best-effort: label it in the asset registry. Never blocks the mint.
+      if (fate === "unknown") {
+        this.markUnresolved(dep, `could not establish whether issuance ${issued.txid} was broadcast`);
+        return null;
+      }
+      mapping = this.finishIssue(dep);
       await this.registerAsset(mapping).catch((e) =>
         this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
       );
@@ -720,22 +760,135 @@ export class Bridge {
         }
         throw e;
       }
-      if (!(await this.waitWalletTxVisible(re.txid))) {
-        // The wallet can hand out a txid for a transaction the chain rejects
-        // without surfacing an error. Roll the wallet back and retry clean.
-        await this.seq.call("abandontransaction", { txid: re.txid }).catch(() => {});
+      dep.steps.mintCandidate = { txid: re.txid, sats: sats.toString(), mappingKey };
+      this.state.save();
+      const fate = await this.confirmBroadcast(re.txid);
+      if (fate === "absent") {
+        delete dep.steps.mintCandidate;
         this.deferMint(dep, "pendingMint", new Error("reissuance tx never reached the mempool"));
         return null;
       }
-      mapping.mintedSats = (BigInt(mapping.mintedSats) + sats).toString();
-      delete dep.steps.pendingMint;
-      dep.steps.mintTxid = re.txid;
-      this.state.save();
-      this.log(
-        `${tag}: reissued ${satsToAmount(sats)} of existing asset ${mapping.assetId} (${mapping.symbol})`
-      );
+      if (fate === "unknown") {
+        this.markUnresolved(dep, `could not establish whether reissuance ${re.txid} was broadcast`);
+        return null;
+      }
+      mapping = this.finishReissue(dep);
     }
     return mapping;
+  }
+
+  /** Record a confirmed first issuance: create the mapping, clear the marker. */
+  finishIssue(dep) {
+    const s = this.state.data;
+    const c = dep.steps.issueCandidate;
+    const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    const mapping = {
+      tokenKey: c.tokenKey,
+      chainId: c.origin.chainId,
+      token: c.origin.token,
+      symbol: c.origin.meta.symbol,
+      name: c.origin.meta.name,
+      decimals: c.origin.meta.decimals,
+      assetId: c.asset,
+      reissuanceToken: c.token,
+      entropy: c.entropy,
+      issueTxid: c.txid,
+      firstDepositNonce: dep.nonce ?? dep.sig ?? null,
+      mintedSats: c.sats,
+      contract: c.contract,
+      contractHash: c.contractHash,
+      registered: false,
+      createdAt: new Date().toISOString(),
+    };
+    s.mappings[c.mappingKey] = mapping;
+    delete dep.steps.pendingIssue;
+    delete dep.steps.issueCandidate;
+    dep.steps.issueTxid = c.txid;
+    this.state.save();
+    this.log(
+      `${tag}: issued NEW Sequentia asset ${c.asset} for ${c.origin.meta.symbol} as ${c.contract.ticker} (${c.tokenKey})`
+    );
+    return mapping;
+  }
+
+  /** Record a confirmed reissuance: count the supply, clear the marker. */
+  finishReissue(dep) {
+    const s = this.state.data;
+    const c = dep.steps.mintCandidate;
+    const mapping = s.mappings[c.mappingKey];
+    mapping.mintedSats = (BigInt(mapping.mintedSats) + BigInt(c.sats)).toString();
+    delete dep.steps.pendingMint;
+    delete dep.steps.mintCandidate;
+    dep.steps.mintTxid = c.txid;
+    this.state.save();
+    this.log(
+      `${dep.tag ?? `deposit #${dep.nonce}`}: reissued ${satsToAmount(c.sats)} of existing asset ${mapping.assetId} (${mapping.symbol})`
+    );
+    return mapping;
+  }
+
+  /** Park a deposit whose last chain write could not be confirmed either way.
+   *  It is re-examined every tick (resolveUnresolved) and only becomes a
+   *  manual case if the node cannot answer for `unresolvedHours`. */
+  markUnresolved(dep, why) {
+    dep.status = "unresolved";
+    dep.error = why;
+    dep.unresolvedSince ??= new Date().toISOString();
+    this.state.save();
+    this.log(`${dep.tag ?? `deposit #${dep.nonce}`}: ${why}; re-checking every tick`);
+  }
+
+  /** Settle a deposit left "unresolved": ask the node again about the one
+   *  transaction in question, finish the step if it landed, retry cleanly if
+   *  it provably did not, and keep waiting otherwise. Returns true when the
+   *  deposit may continue its normal flow. */
+  async resolveUnresolved(dep) {
+    const st = dep.steps ?? {};
+    const cand = st.issueCandidate ?? st.mintCandidate ?? st.sendCandidate;
+    const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    if (!cand) {
+      dep.status = "failed_manual";
+      dep.error = "unresolved with no recorded transaction to examine";
+      this.state.save();
+      return false;
+    }
+    const fate = await this.resolveBroadcast(cand.txid);
+    if (fate === "unknown") {
+      const hours = (Date.now() - Date.parse(dep.unresolvedSince ?? dep.createdAt)) / 3_600_000;
+      if (hours > (this.cfg.unresolvedHours ?? 24)) {
+        dep.status = "failed_manual";
+        dep.error = `transaction ${cand.txid} still unresolved after ${Math.floor(hours)} h`;
+        this.state.save();
+        this.log(`${tag}: ${dep.error}; parked for the operator`);
+      }
+      return false;
+    }
+    delete dep.unresolvedSince;
+    if (st.issueCandidate) {
+      if (fate === "visible") this.finishIssue(dep);
+      else {
+        delete st.issueCandidate;
+        delete st.pendingIssue;
+      }
+    } else if (st.mintCandidate) {
+      if (fate === "visible") this.finishReissue(dep);
+      else {
+        delete st.mintCandidate;
+        delete st.pendingMint;
+      }
+    } else {
+      if (fate === "visible") {
+        this.finishSend(dep, cand.txid);
+        return false; // delivered: nothing left to drive
+      }
+      delete st.sendCandidate;
+      delete st.pendingSend;
+    }
+    this.log(`${tag}: transaction ${cand.txid} resolved as ${fate}`);
+    dep.status = "mint_retry"; // re-enters the idempotent flow from the top
+    delete dep.nextAttemptAt;
+    this.state.save();
+    return true;
   }
 
   // ---- Asset Registry integration --------------------------------------
@@ -796,6 +949,7 @@ export class Bridge {
         ...(admin ? { authorization: `Bearer ${this.cfg.registryAdminToken}` } : {}),
       },
       body: JSON.stringify({ asset_id: mapping.assetId, contract: mapping.contract }),
+      signal: AbortSignal.timeout(15_000),
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`registry ${res.status}: ${text.slice(0, 200)}`);
@@ -816,7 +970,9 @@ export class Bridge {
     if (!this.cfg.registryUrl) return;
     let index = null;
     try {
-      const res = await fetch(`${this.cfg.registryUrl.replace(/\/$/, "")}/index.minimal.json`);
+      const res = await fetch(`${this.cfg.registryUrl.replace(/\/$/, "")}/index.minimal.json`, {
+        signal: AbortSignal.timeout(15_000),
+      });
       if (res.ok) index = await res.json();
     } catch {
       // Registry unreachable: unregistered mappings still retry below, and
@@ -845,43 +1001,98 @@ export class Bridge {
   /** A mint step failed before anything landed on chain: safe to retry. */
   deferMint(dep, marker, err) {
     delete dep.steps[marker];
-    dep.attempts = (dep.attempts ?? 0) + 1;
-    dep.status = dep.attempts > 10 ? "failed_manual" : "mint_retry";
-    dep.error = err.message;
-    this.state.save();
-    this.log(`${dep.tag ?? `deposit #${dep.nonce}`}: mint deferred (attempt ${dep.attempts}): ${err.message}`);
+    this.scheduleRetry(dep, "mint_retry", err);
   }
 
-  /** True once the wallet tx is in the mempool or a block. The wallet can
-   *  commit a tx the chain rejects without surfacing an error, so never
-   *  treat a returned txid as broadcast without this check. */
-  async waitWalletTxVisible(txid, timeoutMs = 15000) {
+  /** Schedule a safe retry with exponential backoff (15 s doubling to one
+   *  hour), and give up to the operator only after `retryHours` of trying.
+   *  A short node restart or a fee-asset top-up is not a reason for a human
+   *  to look at every deposit that happened to be in flight. */
+  scheduleRetry(rec, status, err) {
+    const now = Date.now();
+    rec.attempts = (rec.attempts ?? 0) + 1;
+    rec.firstFailureAt ??= new Date(now).toISOString();
+    rec.error = err.message;
+    const hours = (now - Date.parse(rec.firstFailureAt)) / 3_600_000;
+    if (hours > (this.cfg.retryHours ?? 24)) {
+      rec.status = "failed_manual";
+      delete rec.nextAttemptAt;
+    } else {
+      rec.status = status;
+      const delay = Math.min(15_000 * 2 ** Math.min(rec.attempts - 1, 8), 3_600_000);
+      rec.nextAttemptAt = new Date(now + delay).toISOString();
+    }
+    this.state.save();
+    this.log(
+      `${rec.tag ?? `deposit #${rec.nonce}`}: ${rec.status === "failed_manual" ? "gave up" : "deferred"} ` +
+        `(attempt ${rec.attempts}): ${err.message}`
+    );
+  }
+
+  /** Whether a record parked for retry is due for another attempt. */
+  retryDue(rec) {
+    return !rec.nextAttemptAt || Date.parse(rec.nextAttemptAt) <= Date.now();
+  }
+
+  /** Is a wallet transaction in the mempool or in a block right now? Throws
+   *  when the node cannot answer: "I could not ask" is not "no". */
+  async txVisible(txid) {
+    try {
+      await this.seq.node("getmempoolentry", { txid });
+      return true;
+    } catch (e) {
+      if (e.code !== -5) throw e; // -5: not in the mempool; anything else is an outage
+    }
+    const gt = await this.seq.call("gettransaction", { txid });
+    return gt.confirmations > 0;
+  }
+
+  /** The fate of a transaction the wallet just built and broadcast:
+   *
+   *    "visible"  in the mempool or a block
+   *    "absent"   provably neither, and now abandoned, so it can never land
+   *    "unknown"  could not be established either way
+   *
+   *  The wallet can hand back a txid for a transaction the mempool rejected,
+   *  so a returned txid is never proof of broadcast. Nor is failing to see it
+   *  proof of absence: fifteen seconds of node trouble looks exactly like a
+   *  missing transaction. The proof of absence used here is the wallet
+   *  ACCEPTING abandontransaction, which it refuses for anything in the
+   *  mempool or in a block. Only "absent" makes a retry safe; a retry on
+   *  "unknown" is how a mint, a delivery or a burn happens twice. */
+  async confirmBroadcast(txid, timeoutMs = this.cfg.broadcastWaitMs ?? 15_000) {
     const t0 = Date.now();
     for (;;) {
       try {
-        await this.seq.node("getmempoolentry", { txid });
-        return true;
+        if (await this.txVisible(txid)) return "visible";
       } catch {
-        try {
-          const gt = await this.seq.call("gettransaction", { txid });
-          if (gt.confirmations > 0) return true;
-        } catch {}
+        // an outage; keep asking until the deadline
       }
-      if (Date.now() - t0 > timeoutMs) return false;
+      if (Date.now() - t0 > timeoutMs) break;
       await new Promise((r) => setTimeout(r, 1000));
+    }
+    try {
+      await this.seq.call("abandontransaction", { txid });
+      return "absent";
+    } catch {
+      try {
+        if (await this.txVisible(txid)) return "visible";
+      } catch {}
+      return "unknown";
     }
   }
 
-  /** Destroy (burn) `sats` of `assetId`, keeping circulating supply equal to
-   *  the funds locked on Ethereum. When a fee asset is configured the burn is
-   *  built as a raw transaction paying its fee in that asset, so the bridge
-   *  never needs the policy asset; otherwise it falls back to destroyamount
-   *  (which pays its fee in the policy asset). Returns the burn txid. */
-  async destroyAsset(assetId, sats) {
+  /** Re-examine a transaction whose broadcast was left "unknown": the same
+   *  three answers as confirmBroadcast, without waiting. */
+  async resolveBroadcast(txid) {
+    return this.confirmBroadcast(txid, 0);
+  }
+
+  /** Build and sign (but do not broadcast) a burn of `sats` of `assetId`.
+   *  When a fee asset is configured the burn pays its fee in that asset, so
+   *  the bridge never needs the policy asset. Returns { txid, hex }. */
+  async buildBurn(assetId, sats) {
     const amount = satsToAmount(sats);
-    if (!this.cfg.seqFeeAsset) {
-      return this.seq.call("destroyamount", { asset: assetId, amount });
-    }
     // No preset inputs: the any-asset-fee coin selector rejects them, so let
     // the node choose the asset inputs to burn and the fee-asset inputs.
     const base = await this.seq.call("createrawtransaction", {
@@ -890,7 +1101,7 @@ export class Bridge {
     });
     const funded = await this.seq.call("fundrawtransaction", {
       hexstring: base,
-      options: { fee_asset: this.cfg.seqFeeAsset },
+      options: this.cfg.seqFeeAsset ? { fee_asset: this.cfg.seqFeeAsset } : {},
     });
     // The wallet gives its change outputs blinding nonces even when receive
     // addresses are transparent, so blind before signing or the node rejects
@@ -899,21 +1110,32 @@ export class Bridge {
       hexstring: funded.hex,
       ignoreblindfail: true,
     });
-    const signed = await this.seq.call("signrawtransactionwithwallet", {
-      hexstring: blinded,
-    });
+    const signed = await this.seq.call("signrawtransactionwithwallet", { hexstring: blinded });
     if (!signed.complete) throw new Error("burn transaction signing incomplete");
-    const txid = await this.seq.call("sendrawtransaction", { hexstring: signed.hex });
-    if (!(await this.waitWalletTxVisible(txid))) {
-      await this.seq.call("abandontransaction", { txid }).catch(() => {});
-      throw new Error("burn transaction never reached the mempool");
-    }
-    return txid;
+    const decoded = await this.seq.call("decoderawtransaction", { hexstring: signed.hex });
+    return { txid: decoded.txid, hex: signed.hex };
   }
 
   /** Step 4: send the minted amount to the depositor's Sequentia address. */
   async sendMinted(dep, mapping) {
     const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    if (dep.steps.sendTxid) {
+      // Delivered already (a re-drive after a crash or a resolved check).
+      if (dep.status !== "minted") this.finishSend(dep, dep.steps.sendTxid);
+      return;
+    }
+    if (dep.steps.pendingSend) {
+      // A previous send was started and never settled. Sending again without
+      // knowing its fate is how a user gets paid twice.
+      if (dep.steps.sendCandidate) this.markUnresolved(dep, "an earlier delivery is still unresolved");
+      else {
+        dep.status = "failed_manual";
+        dep.error = "an earlier delivery was interrupted before its txid was recorded";
+        this.state.save();
+        this.log(`${tag}: ${dep.error}; parked for the operator`);
+      }
+      return;
+    }
     dep.steps.pendingSend = true;
     this.state.save();
     let sendTxid;
@@ -931,96 +1153,222 @@ export class Bridge {
       if (typeof e.code === "number") {
         // A JSON-RPC error means the node rejected the send outright, so
         // nothing went out: safe to retry (e.g. the mint output is not yet
-        // spendable). Ambiguous failures (network errors) keep the marker
-        // and halt for the operator instead.
+        // spendable, or the fee asset needs a top-up). Ambiguous failures
+        // (network errors) keep the marker and halt for the operator instead.
         delete dep.steps.pendingSend;
-        dep.attempts = (dep.attempts ?? 0) + 1;
-        dep.status = dep.attempts > 10 ? "failed_manual" : "send_retry";
-        dep.error = e.message;
-        this.state.save();
-        this.log(`${tag}: send rejected (attempt ${dep.attempts}): ${e.message}`);
+        this.scheduleRetry(dep, "send_retry", e);
         return;
       }
       throw e;
     }
-    // T8: never mark a deposit "delivered" until the final send is actually
-    // relayed. The wallet can return a txid for a tx the chain rejected (the
-    // issue/reissue/burn steps already guard this) — so confirm mempool/block
-    // visibility before "minted". If it never shows, roll back and retry rather
-    // than reporting a delivery that did not happen.
-    if (!(await this.waitWalletTxVisible(sendTxid))) {
-      await this.seq.call("abandontransaction", { txid: sendTxid }).catch(() => {});
+    dep.steps.sendCandidate = { txid: sendTxid };
+    this.state.save();
+    // Never mark a deposit delivered until the send is actually relayed: the
+    // wallet can return a txid for a transaction the mempool rejected.
+    const fate = await this.confirmBroadcast(sendTxid);
+    if (fate === "absent") {
       delete dep.steps.pendingSend;
-      dep.attempts = (dep.attempts ?? 0) + 1;
-      dep.status = dep.attempts > 10 ? "failed_manual" : "send_retry";
-      dep.error = "send transaction never reached the mempool";
-      this.state.save();
-      this.log(`${tag}: send not visible (attempt ${dep.attempts}), will retry`);
+      delete dep.steps.sendCandidate;
+      this.scheduleRetry(dep, "send_retry", new Error("send transaction never reached the mempool"));
       return;
     }
-    delete dep.steps.pendingSend;
-    dep.steps.sendTxid = sendTxid;
-    dep.status = "minted";
-    delete dep.error;
-    this.state.save();
+    if (fate === "unknown") {
+      this.markUnresolved(dep, `could not establish whether delivery ${sendTxid} was broadcast`);
+      return;
+    }
+    this.finishSend(dep, sendTxid);
     this.log(`${tag}: sent ${satsToAmount(dep.sats)} ${mapping.symbol} in ${sendTxid}`);
   }
 
-  /** Retry deposits that failed at a safely retryable point. */
+  /** Record a confirmed delivery. */
+  finishSend(dep, txid) {
+    delete dep.steps.pendingSend;
+    delete dep.steps.sendCandidate;
+    dep.steps.sendTxid = txid;
+    dep.status = "minted";
+    dep.deliveredAt = new Date().toISOString();
+    delete dep.error;
+    delete dep.nextAttemptAt;
+    delete dep.unresolvedSince;
+    this.state.save();
+  }
+
+  /** Retry deposits that failed at a safely retryable point, and settle
+   *  those whose last chain write is unresolved. */
   async retryDeposits() {
     for (const dep of Object.values(this.state.data.deposits)) {
-      if (dep.status === "send_retry") {
-        // Minting already happened; only the send to the user is outstanding.
-        const mapping = this.mappingFor(dep.tokenKey);
-        try {
-          await this.sendMinted(dep, mapping);
-        } catch (e) {
-          this.log(`deposit #${dep.nonce}: send retry failed: ${e.message}`);
-        }
-        continue;
+      await this.redriveDeposit(dep, (d) => this.mintDeposit(d), (d, e) => this.mintFailed(d, e));
+    }
+  }
+
+  /** Shared by both deposit legs: `mint` runs the leg's idempotent mint flow,
+   *  `onError` applies its failure split. */
+  async redriveDeposit(dep, mint, onError) {
+    const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    try {
+      if (dep.status === "unresolved") {
+        if (!(await this.resolveUnresolved(dep))) return;
       }
-      if (dep.status !== "mint_retry") continue;
+      if (dep.status === "send_retry") {
+        if (!this.retryDue(dep)) return;
+        // Minting already happened; only the send to the user is outstanding.
+        const mapping = Object.values(this.state.data.mappings).find((m) => m.assetId === dep.assetId);
+        if (!mapping) throw new Error(`no mapping for ${dep.assetId}`);
+        await this.sendMinted(dep, mapping);
+        return;
+      }
+      if (dep.status !== "mint_retry" || !this.retryDue(dep)) return;
       dep.status = "minting";
       this.state.save();
-      try {
-        await this.mintDeposit(dep);
-      } catch (e) {
-        dep.status =
-          dep.steps.pendingIssue || dep.steps.pendingMint || dep.steps.pendingSend
-            ? "failed_manual"
-            : "mint_retry";
+      await mint(dep);
+    } catch (e) {
+      if (dep.status === "minting") onError(dep, e);
+      else this.log(`${tag}: retry failed: ${e.message}`);
+    }
+  }
+
+  /** The Ethereum leg's failure split: nothing irreversible in flight means a
+   *  safe retry; a dangling marker with no recorded txid means the operator. */
+  mintFailed(dep, e) {
+    this.log(`${dep.tag ?? `deposit #${dep.nonce}`}: mint failed: ${e.message}`);
+    const st = dep.steps ?? {};
+    if (st.pendingIssue || st.pendingMint || st.pendingSend) {
+      if (st.issueCandidate || st.mintCandidate || st.sendCandidate) this.markUnresolved(dep, e.message);
+      else {
+        dep.status = "failed_manual";
         dep.error = e.message;
         this.state.save();
       }
+      return;
     }
+    this.scheduleRetry(dep, "mint_retry", e);
   }
 
   /** Pay back deposits whose Sequentia leg cannot happen. Idempotent via the
    *  vault's processedRedemptions guard keyed by a deterministic refund id. */
   async processRefunds() {
     for (const dep of Object.values(this.state.data.deposits)) {
-      if (dep.status !== "refund_pending") continue;
+      if (dep.status !== "refund_pending" && dep.status !== "refunding") continue;
       const id = refundId(this.cfg.ethChainId, dep.nonce, dep.key === dep.nonce ? null : dep.vault);
       // Refund out of the vault that took the deposit: no other vault holds
       // escrow for it.
       const vault = this.eth.vaultFor(dep.vault);
+      const tag = `deposit #${dep.nonce}`;
       try {
         if (await vault.processedRedemptions(id)) {
           dep.status = "refunded";
+          dep.refundTxHash ??= dep.ethTx?.hash ?? null;
+          delete dep.ethTx;
           this.state.save();
+          this.log(`${tag}: refunded (${dep.refundReason})`);
           continue;
         }
+        if (dep.status === "refunding") {
+          if ((await this.settleSentTx(dep, tag)) === "wait") continue;
+        }
         const tokenAddr = dep.token === "eth" ? ethers.ZeroAddress : dep.token;
-        const tx = await vault.release(tokenAddr, dep.from, dep.amountUnits, id);
-        await tx.wait(1);
-        dep.status = "refunded";
-        dep.refundTxHash = tx.hash;
+        dep.status = "refunding";
         this.state.save();
-        this.log(`deposit #${dep.nonce}: refunded (${dep.refundReason}) in ${tx.hash}`);
+        const r = await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id]);
+        if (r.paid) {
+          dep.status = "refunded";
+          dep.refundTxHash = r.paid;
+          delete dep.ethTx;
+          delete dep.waiting;
+          this.state.save();
+          this.log(`${tag}: refunded (${dep.refundReason}) in ${r.paid}`);
+        } else if (r.revert) {
+          await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
+        }
       } catch (e) {
-        this.log(`deposit #${dep.nonce}: refund attempt failed: ${e.message}`);
+        this.log(`${tag}: refund attempt failed: ${e.message}`);
       }
     }
+  }
+
+  /** Send one vault payout and report what happened: { paid: hash } once it
+   *  mined, { revert: name } when the vault refuses it, {} when it is sent
+   *  but not mined yet (the caller's record holds it as `ethTx`). */
+  async payOut(rec, vault, args) {
+    try {
+      const receipt = await this.eth.sendAndWait(vault, "release", args, (sent) => {
+        rec.ethTx = sent;
+        this.state.save();
+      });
+      if (!receipt) return {};
+      if (receipt.status === 1) return { paid: receipt.hash };
+      return {}; // mined but reverted: re-examined from the on-chain guard next tick
+    } catch (e) {
+      if (e?.code === "CALL_EXCEPTION" && typeof e.data === "string" && e.data.length >= 10) {
+        return { revert: this.eth.revertName(e.data) ?? e.data };
+      }
+      throw e;
+    }
+  }
+
+  /** A payout that was sent and not yet seen to mine. Returns "wait" while it
+   *  may still mine (replacing it at the same nonce once it has been stuck
+   *  for `ethStuckMinutes`), or "resend" once it provably never will. The
+   *  caller has already checked the on-chain replay guard, which is what
+   *  makes a resend safe: the vault refuses to pay the same id twice. */
+  async settleSentTx(rec, tag) {
+    if (!rec.ethTx) return "resend";
+    const st = await this.eth.sentTxState(rec.ethTx);
+    if (st === "pending") {
+      const minutes = (Date.now() - Date.parse(rec.ethTx.sentAt)) / 60_000;
+      if (minutes >= (this.cfg.ethStuckMinutes ?? 10)) {
+        rec.ethTx = await this.eth.replaceStuck(rec.ethTx);
+        this.state.save();
+        this.log(`${tag}: transaction stuck for ${Math.floor(minutes)} min; replaced at nonce ${rec.ethTx.nonce} (${rec.ethTx.hash})`);
+      }
+      return "wait";
+    }
+    // Mined-and-reverted, dropped, or displaced by another transaction of
+    // ours: none of these paid (the guard said so), so send it again.
+    this.log(`${tag}: earlier transaction ${rec.ethTx.hash} ${st}; sending again`);
+    delete rec.ethTx;
+    this.state.save();
+    return "resend";
+  }
+
+  /** Decide what a vault refusal means instead of filing every revert as a
+   *  manual case: a pause or a short vault is something to wait out, a
+   *  payout already made is a success, and only a recipient that cannot take
+   *  the funds needs a person. */
+  async parkRevert(rec, name, vault, tokenAddr, amountUnits, kind, tag) {
+    const isRefund = kind === "refund";
+    delete rec.ethTx;
+    const wait = (why, status) => {
+      rec.status = status;
+      rec.waiting = why;
+      this.state.save();
+      this.log(`${tag}: ${why}; waiting`);
+    };
+    if (name === "AlreadyReleased") {
+      rec.status = isRefund ? "refunded" : "released";
+      this.state.save();
+      return;
+    }
+    if (name === "ReleasesArePaused") {
+      return wait("releases are paused on the vault", isRefund ? "refund_pending" : "release_paused");
+    }
+    let short = name === "InsufficientVaultBalance";
+    if (!short && (name === "EtherTransferFailed" || name === "TokenTransferFailed")) {
+      // An older vault reports a short balance and a refusing recipient the
+      // same way; the balance tells them apart.
+      const held = await this.eth.vaultHolding(vault, tokenAddr);
+      short = held < BigInt(amountUnits);
+    }
+    if (short) {
+      return wait("the vault does not hold enough of this token right now", isRefund ? "refund_pending" : "awaiting_liquidity");
+    }
+    rec.status = isRefund ? "refund_failed_manual" : "release_failed_manual";
+    rec.error =
+      name === "EtherTransferFailed" || name === "TokenTransferFailed"
+        ? "the recipient address does not accept this payout"
+        : `the vault refused the payout (${name})`;
+    this.state.save();
+    this.log(`${tag}: ${rec.error}; flagged for the operator`);
   }
 
   // ================= Sequentia -> Ethereum =================
@@ -1265,6 +1613,8 @@ export class Bridge {
     if (rec.status === "new") {
       if (await vault.processedRedemptions(id)) {
         rec.status = "released"; // paid in a previous life; continue to destroy
+        this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
+        this.state.save();
       } else {
         // Anchoring is supreme: re-verify the burn is STILL final immediately
         // before the irreversible vault release. A crash or RPC outage can put
@@ -1286,61 +1636,64 @@ export class Bridge {
         const tokenAddr = rec.tokenKey.endsWith(":eth")
           ? ethers.ZeroAddress
           : ethSrc?.token ?? mapping.token;
-        try {
-          const tx = await vault.release(tokenAddr, rec.ethAddress, rec.amountUnits, id);
-          await tx.wait(1);
-          rec.releaseTxHash = tx.hash;
+        const tag = `redemption ${rec.key}`;
+        const r = await this.payOut(rec, vault, [tokenAddr, rec.ethAddress, rec.amountUnits, id]);
+        if (r.paid) {
+          rec.releaseTxHash = r.paid;
           rec.status = "released";
-          this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits);
+          delete rec.ethTx;
+          delete rec.waiting;
+          this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
           this.state.save();
-          this.log(
-            `redemption ${rec.key}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${tx.hash}`
-          );
-        } catch (e) {
-          // A CALL_EXCEPTION with revert data is a deterministic contract
-          // rejection (e.g. the recipient rejects ETH -> EtherTransferFailed,
-          // or a token transfer fails): retrying can't help, so flag it for the
-          // operator instead of looping forever. The burn already happened, so
-          // the returned amount is safe in the bridge wallet pending manual
-          // resolution. Transient errors (network/RPC) rethrow and are retried.
-          if (e?.code === "CALL_EXCEPTION" && typeof e.data === "string") {
-            rec.status = "release_failed_manual";
-            rec.error = `release reverted (${e.data})`;
-            this.state.save();
-            this.log(`redemption ${rec.key}: release reverted (${e.data}); flagged for operator, not retrying`);
-            return;
-          }
-          // transient (network/RPC): leave status "releasing" so
-          // retryRedemptions re-drives it (it reconciles against the on-chain
-          // processedRedemptions guard first).
-          throw e;
+          this.log(`${tag}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${r.paid}`);
+        } else if (r.revert) {
+          await this.parkRevert(rec, r.revert, vault, tokenAddr, rec.amountUnits, "redemption", tag);
+          if (rec.status === "released") this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
+        } else {
+          this.log(`${tag}: release sent (${rec.ethTx?.hash}), not mined yet`);
         }
       }
     }
 
-    if (rec.status === "released") {
+    if (["released", "destroy_pending", "destroying"].includes(rec.status)) {
       await this.destroyRedeemed(rec, mapping, mapping.symbol);
     }
   }
 
-  /** Retry stuck releases (daemon restarted mid-flight) and pending destroys. */
+  /** Re-drive every redemption between "final" and "done": releases that
+   *  were sent but not yet seen to mine (or were interrupted), releases
+   *  waiting out a vault pause, and burns still owed after a payout. */
   async retryRedemptions() {
     const s = this.state.data;
+    const ACTIVE = ["new", "releasing", "release_paused", "released", "destroy_pending", "destroying"];
     for (const rec of Object.values(s.redemptions)) {
-      if (rec.status !== "releasing" && rec.status !== "destroy_pending") continue;
+      if (!ACTIVE.includes(rec.status)) continue;
       const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
       if (!mapping) continue;
-      if (rec.status === "releasing") {
-        // The on-chain guard tells us whether the payout landed before the crash.
-        rec.status = (await this.eth.vaultFor(rec.vault).processedRedemptions(rec.redemptionId))
-          ? "released"
-          : "new";
-        this.state.save();
-      }
+      const tag = `redemption ${rec.key}`;
       try {
+        if (rec.status === "releasing" || rec.status === "release_paused" || rec.status === "new") {
+          // The on-chain guard is the authority on whether the payout landed.
+          const vault = this.eth.vaultFor(rec.vault);
+          const id = rec.redemptionId ?? redemptionIdOf(this.cfg.seqChainLabel, rec.txid, rec.vout);
+          if (await vault.processedRedemptions(id)) {
+            rec.status = "released";
+            rec.releaseTxHash ??= rec.ethTx?.hash ?? null;
+            delete rec.ethTx;
+            delete rec.waiting;
+            this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
+            this.state.save();
+          } else if (rec.status === "releasing") {
+            if ((await this.settleSentTx(rec, tag)) === "wait") continue;
+            rec.status = "new";
+            this.state.save();
+          } else {
+            rec.status = "new";
+          }
+        }
         await this.releaseRedemption(rec, mapping);
       } catch (e) {
-        this.log(`redemption ${rec.key}: retry failed: ${e.message}`);
+        this.log(`${tag}: retry failed: ${e.message}`);
       }
     }
   }
@@ -1355,11 +1708,21 @@ export class Bridge {
     const s = this.state.data;
     for (const dep of [...Object.values(s.deposits), ...Object.values(s.solDeposits ?? {})]) {
       if (dep.status !== "minting") continue;
-      const marker = dep.steps?.pendingIssue || dep.steps?.pendingMint || dep.steps?.pendingSend;
-      dep.status = marker ? "failed_manual" : "mint_retry";
-      dep.error = marker
-        ? "interrupted mid-mint with an irreversible step in flight"
-        : "interrupted before any irreversible step";
+      const st = dep.steps ?? {};
+      const marker = st.pendingIssue || st.pendingMint || st.pendingSend;
+      const candidate = st.issueCandidate || st.mintCandidate || st.sendCandidate;
+      if (!marker) {
+        dep.status = "mint_retry";
+        dep.error = "interrupted before any irreversible step";
+      } else if (candidate) {
+        // The transaction is known, so the chain can say whether it landed.
+        dep.status = "unresolved";
+        dep.unresolvedSince ??= new Date().toISOString();
+        dep.error = "interrupted with a recorded transaction in flight";
+      } else {
+        dep.status = "failed_manual";
+        dep.error = "interrupted mid-step before its transaction id was recorded";
+      }
       this.state.save();
       this.log(`${dep.tag ?? `deposit #${dep.nonce}`}: ${dep.error}; recovered at startup as ${dep.status}`);
     }
@@ -1547,20 +1910,7 @@ export class Bridge {
   /** Mirror of handleDeposit's failure split: nothing irreversible yet means
    *  retry next tick; a dangling marker means halt for the operator. */
   solMintFailed(dep, e) {
-    this.log(`${dep.tag}: mint failed: ${e.message}`);
-    if (
-      dep.status === "minting" &&
-      !dep.steps.pendingIssue &&
-      !dep.steps.pendingMint &&
-      !dep.steps.pendingSend
-    ) {
-      dep.status = "mint_retry";
-      dep.error = e.message;
-    } else if (dep.status === "minting") {
-      dep.status = "failed_manual";
-      dep.error = e.message;
-    }
-    this.state.save();
+    if (dep.status === "minting") this.mintFailed(dep, e);
   }
 
   async mintSolDeposit(dep) {
@@ -1591,8 +1941,9 @@ export class Bridge {
       this.state.save();
       return;
     }
-    const already = existing ? BigInt(existing.mintedSats) : 0n;
-    if (already + sats > SEQ_MAX_SATS) {
+    const minted = Boolean(dep.steps.issueTxid || dep.steps.mintTxid);
+    const already = existing && !minted ? BigInt(existing.mintedSats) : 0n;
+    if (!minted && already + sats > SEQ_MAX_SATS) {
       dep.status = "failed_manual";
       dep.error = "would exceed the Sequentia per-asset amount cap";
       this.state.save();
@@ -1632,19 +1983,7 @@ export class Bridge {
     await this.sol.ensureCluster();
     const s = this.state.data;
     for (const dep of Object.values(s.solDeposits)) {
-      if (dep.status === "send_retry") {
-        const mapping = Object.values(s.mappings).find((m) => m.assetId === dep.assetId);
-        try {
-          await this.sendMinted(dep, mapping);
-        } catch (e) {
-          this.log(`${dep.tag}: send retry failed: ${e.message}`);
-        }
-        continue;
-      }
-      if (dep.status !== "mint_retry") continue;
-      dep.status = "minting";
-      this.state.save();
-      await this.mintSolDeposit(dep).catch((e) => this.solMintFailed(dep, e));
+      await this.redriveDeposit(dep, (d) => this.mintSolDeposit(d), (d, e) => this.solMintFailed(d, e));
     }
   }
 
@@ -1880,7 +2219,7 @@ export class Bridge {
         if (fate === "landed") {
           rec.status = "released";
           rec.releaseSig = rec.release.signature;
-          this.debitEscrow(mapping, src.tokenKey, rec.amountUnits ?? rec.lamports);
+          this.debitEscrow(mapping, src.tokenKey, rec.amountUnits ?? rec.lamports, rec);
           this.state.save();
           this.log(
             `sol redemption ${rec.key}: released ${rec.amountUnits ?? rec.lamports} units of ${rec.symbol ?? "SOL"} to ${rec.solAddress} in ${rec.release.signature}`
@@ -1998,45 +2337,115 @@ export class Bridge {
       }
     }
 
-    if (rec.status === "released") {
+    if (["released", "destroy_pending", "destroying"].includes(rec.status)) {
       await this.destroyRedeemed(rec, mapping, rec.ticker ?? mapping.symbol);
     }
   }
 
-  /** Destroy the returned amount after a release, bracketed by a persisted
-   *  marker so a crash mid-burn can never burn twice: an interrupted destroy
-   *  parks as destroy_manual for the operator instead of re-broadcasting on
-   *  guesswork. Used by both the Ethereum and the Solana leg. */
+  /** Destroy the returned amount after a release, so circulating supply
+   *  keeps matching what the source chains hold. Used by every leg.
+   *
+   *  Replay-guarded the way Solana releases are: the signed burn is persisted
+   *  BEFORE it is broadcast, so after any interruption the daemon holds the
+   *  exact transaction in question. Re-broadcasting that same transaction can
+   *  never burn twice (it has one txid), so an interrupted burn finishes on
+   *  its own. A fresh burn is built only once the recorded one provably can
+   *  never land: its inputs were spent by something else. */
   async destroyRedeemed(rec, mapping, label) {
-    if (rec.pendingDestroy) {
+    if (rec.destroyTxid) return this.finishDestroy(rec, mapping, label, rec.destroyTxid);
+    if (rec.pendingDestroy && !rec.burn) {
+      // A burn interrupted by an older daemon that did not record its
+      // transaction first: nothing to examine, so a human must.
       rec.status = "destroy_manual";
       this.state.save();
-      this.log(`redemption ${rec.key}: destroy was interrupted mid-flight; parked for the operator`);
+      this.log(`redemption ${rec.key}: destroy was interrupted before its transaction was recorded; parked`);
       return;
     }
-    rec.pendingDestroy = true;
-    this.state.save();
-    try {
-      const burnTxid = await this.destroyAsset(rec.assetId, rec.sats);
-      delete rec.pendingDestroy;
-      rec.destroyTxid = burnTxid;
-      mapping.mintedSats = (BigInt(mapping.mintedSats) - BigInt(rec.sats)).toString();
-      rec.status = "done";
-      this.state.save();
-      this.log(`redemption ${rec.key}: destroyed ${satsToAmount(rec.sats)} ${label} in ${burnTxid}`);
-    } catch (e) {
-      // A node rejection, an abandoned tx, or an incomplete signing all mean
-      // nothing landed: safe to retry later. Anything else (a network error
-      // mid-broadcast) is ambiguous, so keep the marker and let the next pass
-      // park it for the operator. The user is already paid either way.
-      if (typeof e.code === "number" || /never reached the mempool|signing incomplete/.test(e.message)) {
-        delete rec.pendingDestroy;
+    rec.status = "destroying";
+    if (!rec.burn) {
+      try {
+        rec.burn = await this.buildBurn(rec.assetId, rec.sats);
+      } catch (e) {
         rec.status = "destroy_pending";
+        rec.error = e.message;
+        this.state.save();
+        this.log(`redemption ${rec.key}: could not build the burn, will retry: ${e.message}`);
+        return;
       }
-      rec.error = e.message;
-      this.state.save();
-      this.log(`redemption ${rec.key}: destroy failed (${rec.status ?? "ambiguous"}): ${e.message}`);
+      rec.burn.builtAt = new Date().toISOString();
+      this.state.save(); // persisted BEFORE broadcast
     }
+    const { txid, hex } = rec.burn;
+    let visible = false;
+    try {
+      visible = await this.txVisible(txid);
+    } catch {}
+    if (!visible) {
+      try {
+        await this.seq.node("sendrawtransaction", { hexstring: hex });
+      } catch (e) {
+        if (/missing-inputs|missingorspent|bad-txns-inputs/i.test(e.message)) {
+          // Its inputs are gone. If our burn had spent them it would be
+          // visible, and it is not, so something else did: this transaction
+          // can never land, and building a new one cannot double-burn.
+          let stillVisible = false;
+          try {
+            stillVisible = await this.txVisible(txid);
+          } catch {}
+          if (!stillVisible) {
+            await this.seq.call("abandontransaction", { txid }).catch(() => {});
+            delete rec.burn;
+            rec.status = "destroy_pending";
+            rec.error = "recorded burn's inputs were spent elsewhere; rebuilding";
+            this.state.save();
+            this.log(`redemption ${rec.key}: ${rec.error}`);
+            return;
+          }
+        } else if (!/already in (block ?chain|the mempool)|txn-already-(known|in-mempool)/i.test(e.message)) {
+          this.waitOnBurn(rec, `burn ${txid} could not be broadcast: ${e.message}`);
+          return;
+        }
+      }
+      const fate = await this.confirmBroadcast(txid);
+      if (fate === "absent") {
+        // Rejected by the mempool yet not conflicting: rebuild from fresh coins.
+        delete rec.burn;
+        rec.status = "destroy_pending";
+        rec.error = "burn was rejected by the mempool; rebuilding";
+        this.state.save();
+        this.log(`redemption ${rec.key}: ${rec.error}`);
+        return;
+      }
+      if (fate === "unknown") {
+        this.waitOnBurn(rec, `could not establish whether burn ${txid} was broadcast`);
+        return;
+      }
+    }
+    return this.finishDestroy(rec, mapping, label, txid);
+  }
+
+  /** Keep a recorded burn and try it again next tick; only a burn nobody can
+   *  settle for `unresolvedHours` becomes a manual case. The user is already
+   *  paid either way; this only keeps the supply figures exact. */
+  waitOnBurn(rec, why) {
+    rec.status = "destroying";
+    rec.error = why;
+    const hours = (Date.now() - Date.parse(rec.burn?.builtAt ?? rec.createdAt)) / 3_600_000;
+    if (hours > (this.cfg.unresolvedHours ?? 24)) rec.status = "destroy_manual";
+    this.state.save();
+    this.log(`redemption ${rec.key}: ${why}${rec.status === "destroy_manual" ? "; parked for the operator" : ""}`);
+  }
+
+  finishDestroy(rec, mapping, label, txid) {
+    if (rec.status === "done") return;
+    rec.destroyTxid = txid;
+    delete rec.burn;
+    delete rec.pendingDestroy;
+    delete rec.error;
+    mapping.mintedSats = (BigInt(mapping.mintedSats) - BigInt(rec.sats)).toString();
+    rec.status = "done";
+    this.state.save();
+    this.log(`redemption ${rec.key}: destroyed ${satsToAmount(rec.sats)} ${label} in ${txid}`);
   }
 
   /** Re-drive Solana redemptions across ticks: finality waits, in-flight
@@ -2049,7 +2458,7 @@ export class Bridge {
       try {
         if (rec.status === "awaiting_finality" || rec.status === "awaiting_liquidity") {
           await this.handleSolRedemption(rec);
-        } else if (["new", "releasing", "released", "destroy_pending"].includes(rec.status)) {
+        } else if (["new", "releasing", "released", "destroy_pending", "destroying"].includes(rec.status)) {
           const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
           if (mapping) await this.releaseSolRedemption(rec, mapping);
         }

@@ -42,6 +42,7 @@ SEQ_RPC=18892
 SEQ_P2P=18893
 API_PORT=9950
 SOL_PORT=18999
+FAULT_PORT=18894
 REGISTRY_PORT=13005
 REGISTRY_REPO="${REGISTRY_REPO:-$HOME/sequentia-registry}"
 REGISTRY_TOKEN=e2e-admin-token
@@ -56,7 +57,11 @@ seqcli() { "$ELC" -datadir="$RUN/seq" -chain=elementsregtest -rpcport=$SEQ_RPC -
 
 cleanup() {
   set +e
+  # The driver may restart the daemon (crash-recovery checks), so the live
+  # pid is whatever the pid file says now, not the one started below.
+  [ -f "$RUN/daemon.pid" ] && kill "$(cat "$RUN/daemon.pid")" 2>/dev/null
   [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null
+  [ -n "${FAULT_PID:-}" ] && kill "$FAULT_PID" 2>/dev/null
   [ -n "${REGISTRY_PID:-}" ] && kill "$REGISTRY_PID" 2>/dev/null
   [ -n "${SOL_PID:-}" ] && kill "$SOL_PID" 2>/dev/null
   seqcli stop >/dev/null 2>&1
@@ -180,6 +185,13 @@ USDC_SOL=$(solrpc mockCreateMint '[6]')
 solrpc mockSetMetadata "[\"$USDC_SOL\", \"USD Coin\", \"USDC\"]" >/dev/null
 echo "   usdc(sol): $USDC_SOL"
 
+echo "== starting the RPC fault proxy"
+# The daemon talks to the node through this, so checks can make the node
+# stop answering at exactly the moment a bridge is most likely to pay twice.
+node "$HERE/fault-proxy.mjs" --port $FAULT_PORT --target "http://127.0.0.1:$SEQ_RPC" > "$RUN/fault-proxy.log" 2>&1 &
+FAULT_PID=$!
+for _ in $(seq 1 40); do curl -s "http://127.0.0.1:$FAULT_PORT/__fault" >/dev/null 2>&1 && break; sleep 0.25; done
+
 echo "== writing daemon config"
 cat > "$RUN/config.json" <<EOF
 {
@@ -191,7 +203,9 @@ cat > "$RUN/config.json" <<EOF
   "ethConfirmations": 2,
   "ethLogChunk": 5000,
   "operatorKeyFile": "operator.key",
-  "seqRpcUrl": "http://e2e:e2e@127.0.0.1:$SEQ_RPC",
+  "seqRpcUrl": "http://e2e:e2e@127.0.0.1:$FAULT_PORT",
+  "broadcastWaitMs": 4000,
+  "ethTxWaitMs": 20000,
   "seqWallet": "compages",
   "seqChainLabel": "elementsregtest",
   "seqConfirmations": 2,
@@ -232,8 +246,9 @@ EOF
 echo "$OPERATOR_KEY" > "$RUN/operator.key"
 
 echo "== starting compagesd"
-node "$REPO/daemon/compagesd.js" "$RUN/config.json" > "$RUN/daemon.log" 2>&1 &
+node "$REPO/daemon/compagesd.js" "$RUN/config.json" >> "$RUN/daemon.log" 2>&1 &
 DAEMON_PID=$!
+echo $DAEMON_PID > "$RUN/daemon.pid"
 sleep 2
 kill -0 $DAEMON_PID 2>/dev/null || { echo "daemon died:"; cat "$RUN/daemon.log"; exit 1; }
 
@@ -241,7 +256,8 @@ echo "== running driver"
 ln -sfn "$REPO/daemon/node_modules" "$HERE/node_modules"
 VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX \
 USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
-SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT \
+SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT FAULT_PORT=$FAULT_PORT \
+RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" \
 REGISTRY_URL=$REGISTRY_URL SOL_RPC=http://127.0.0.1:$SOL_PORT \
 node "$HERE/driver.mjs"
 RC=$?

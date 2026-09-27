@@ -762,6 +762,129 @@ if (process.env.REGISTRY_URL) {
   );
 }
 
+// ---------------- test 9: outages and crashes never pay twice ----------------
+// The daemon reaches the node through a fault proxy (run-e2e.sh), so these
+// checks can make the node go silent at the exact moments a bridge is most
+// likely to repeat an irreversible step. The standard throughout: the supply
+// the CHAIN reports must equal the daemon's ledger afterwards, and the user
+// must hold exactly what they deposited, no more.
+{
+  const FAULT = `http://127.0.0.1:${process.env.FAULT_PORT}/__fault`;
+  const fault = async (cmd) =>
+    (await fetch(FAULT, { method: "POST", body: JSON.stringify(cmd) })).json();
+  const VISIBILITY = ["getmempoolentry", "gettransaction", "abandontransaction"];
+  const musdAssetId = minted1.assetId;
+  const porRow = async () => (await api(`por?asset=${musdAssetId}`)).assets[0];
+  const depositStatus = async (hash) => (await api(`deposit/tx/${hash}`))[0];
+  const waitDelta = async (desc, before, delta) => {
+    await waitFor(desc, async () =>
+      (await seqAssetBalance("user", musdAssetId)) - before >= delta ? 1 : null
+    );
+    await sleep(8000); // time for a second, wrong delivery to show up if there is one
+    return (await seqAssetBalance("user", musdAssetId)) - before;
+  };
+  await (await musd.approve(process.env.VAULT, 100_000_000n)).wait();
+
+  console.log("\n-- fault: the node goes silent right after a reissuance is broadcast");
+  await fault({ clear: true });
+  await fault({ after: "reissueasset", fail: VISIBILITY, seconds: 12 });
+  let bal0 = await seqAssetBalance("user", musdAssetId);
+  const f1 = await (await vault.depositToken(process.env.MUSD, 5_000_000n, userSeqAddr)).wait();
+  const sawUnresolved = await waitFor(
+    "deposit parked as unresolved",
+    async () => ((await depositStatus(f1.hash))?.status === "unresolved" ? true : null),
+    60_000
+  ).catch(() => false);
+  check("an unanswerable broadcast parks the deposit as unresolved, not retried", sawUnresolved === true);
+  await waitFor("unresolved deposit settles and delivers", async () =>
+    (await depositStatus(f1.hash))?.status === "minted" ? true : null
+  );
+  let delta = await waitDelta("user receives the 5 MUSD", bal0, 500_000_000);
+  check("the user received exactly one delivery", delta === 500_000_000, `${delta}`);
+  let row = await porRow();
+  check(
+    "chain supply equals the ledger: nothing was minted twice",
+    row.ledgerMatchesChain === true,
+    `${row.chainCirculatingAtoms} vs ${row.ledgerCirculatingAtoms}`
+  );
+
+  console.log("\n-- fault: the node goes silent right after a delivery is broadcast");
+  await fault({ after: "sendtoaddress", fail: VISIBILITY, seconds: 12 });
+  bal0 = await seqAssetBalance("user", musdAssetId);
+  const f2 = await (await vault.depositToken(process.env.MUSD, 3_000_000n, userSeqAddr)).wait();
+  await waitFor("delivery settles", async () =>
+    (await depositStatus(f2.hash))?.status === "minted" ? true : null
+  );
+  delta = await waitDelta("user receives the 3 MUSD", bal0, 300_000_000);
+  check("an unanswered delivery is never sent a second time", delta === 300_000_000, `${delta}`);
+
+  console.log("\n-- fault: the burn's response is lost after the node accepted it");
+  row = await porRow();
+  const supplyBefore = BigInt(row.chainCirculatingAtoms);
+  await fault({ dropResponse: "sendrawtransaction", count: 1 });
+  const fIntent = await api("redeem", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ethAddress: RECEIVER }),
+  });
+  await seqRpc(
+    "sendtoaddress",
+    { address: fIntent.seqAddress, amount: 2, assetlabel: musdAssetId, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  const fRed = await waitFor(
+    "redemption with a lost burn response completes",
+    async () => {
+      const r = await api(`redeem/${fIntent.seqAddress}`);
+      return r.redemptions[0]?.status === "done" ? r.redemptions[0] : null;
+    },
+    120_000
+  );
+  const fired = await (await fetch(FAULT)).json();
+  check("the burn's response really was dropped", fired.fired.dropped >= 1, `${fired.fired.dropped}`);
+  row = await porRow();
+  check(
+    "the re-broadcast burned exactly once",
+    BigInt(row.chainCirculatingAtoms) === supplyBefore - 200_000_000n && row.ledgerMatchesChain === true,
+    `${supplyBefore} -> ${row.chainCirculatingAtoms}, burn ${String(fRed.destroyTxid).slice(0, 12)}`
+  );
+
+  console.log("\n-- crash: the daemon is killed while a mint is unresolved, then restarted");
+  const { spawn } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const pidFile = `${process.env.RUN_DIR}/daemon.pid`;
+  await fault({ after: "reissueasset", fail: VISIBILITY, seconds: 60 });
+  bal0 = await seqAssetBalance("user", musdAssetId);
+  const f3 = await (await vault.depositToken(process.env.MUSD, 4_000_000n, userSeqAddr)).wait();
+  await waitFor(
+    "deposit parked as unresolved before the crash",
+    async () => ((await depositStatus(f3.hash))?.status === "unresolved" ? true : null),
+    60_000
+  );
+  process.kill(Number(fs.readFileSync(pidFile, "utf8")), "SIGKILL");
+  await sleep(1000);
+  await fault({ clear: true });
+  const logFd = fs.openSync(`${process.env.RUN_DIR}/daemon.log`, "a");
+  const child = spawn(process.execPath, [process.env.DAEMON_JS, `${process.env.RUN_DIR}/config.json`], {
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  fs.writeFileSync(pidFile, String(child.pid));
+  await waitFor("the API is back", async () => ((await api("status")).app ? true : null), 60_000);
+  await waitFor("the restarted daemon settles the unresolved mint", async () =>
+    (await depositStatus(f3.hash))?.status === "minted" ? true : null
+  );
+  delta = await waitDelta("user receives the 4 MUSD", bal0, 400_000_000);
+  check("after a crash mid-mint the user is paid exactly once", delta === 400_000_000, `${delta}`);
+  row = await porRow();
+  check(
+    "after the crash, chain supply still equals the ledger",
+    row.ledgerMatchesChain === true,
+    `${row.chainCirculatingAtoms} vs ${row.ledgerCirculatingAtoms}`
+  );
+}
+
 // ---------------- summary ----------------
 clearInterval(miner);
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : "\nALL CHECKS PASSED");

@@ -1,6 +1,12 @@
-// Durable daemon state: a single JSON file written atomically after every
-// mutation. Small enough for a PoC bridge; swap for a real DB when volume
-// demands it.
+// Durable daemon state: a single JSON file, written atomically and durably
+// after every mutation.
+//
+// Durability is not a nicety here. On the Solana leg the persisted transfer
+// signature IS the replay guard, and on every leg a step marker persisted
+// before an irreversible action is what stops a crash from repeating it. A
+// write the kernel still holds in its page cache when the power goes is a
+// write that never happened, so each save is flushed to disk (file, then the
+// directory entry the rename created) before save() returns.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -49,9 +55,42 @@ export class State {
   }
 
   save() {
+    const dir = path.dirname(this.file);
     const tmp = this.file + ".tmp";
-    fs.mkdirSync(path.dirname(this.file), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2));
+    fs.mkdirSync(dir, { recursive: true });
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+      fs.writeSync(fd, JSON.stringify(this.data));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, this.file);
+    const dfd = fs.openSync(dir, "r");
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+    this.snapshot();
+  }
+
+  /** Keep one copy per day for `keepDays`, beside the live file. This is a
+   *  local safety net against a bad write or an operator mistake; off-host
+   *  backup is still the host's job. */
+  snapshot(keepDays = 14) {
+    const day = new Date().toISOString().slice(0, 10);
+    if (this._snapshotDay === day) return;
+    const dir = path.join(path.dirname(this.file), "snapshots");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const base = path.basename(this.file, ".json");
+    fs.copyFileSync(this.file, path.join(dir, `${base}-${day}.json`));
+    const old = fs
+      .readdirSync(dir)
+      .filter((f) => f.startsWith(`${base}-`) && f.endsWith(".json"))
+      .sort()
+      .slice(0, -keepDays);
+    for (const f of old) fs.rmSync(path.join(dir, f), { force: true });
+    this._snapshotDay = day;
   }
 }
