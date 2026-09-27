@@ -788,8 +788,11 @@ Configuration reference (`daemon/config.example.json`):
 
 The Sequentia wallet named in `seqWallet` must hold enough of `seqFeeAsset`
 to pay Sequentia fees, the operator's Ethereum account needs gas for releases
-and refunds, and the operator key must match the vault's `operator()`; the
-daemon verifies all of this at startup.
+and refunds, and the operator key must match the vault's `operator()`. The
+daemon refuses to start when the operator key does not match or the Ethereum
+chain id differs from `ethChainId`, and logs the operator's gas balance when
+it starts. Both balances are then watched by the health report, which warns
+below `minOperatorGasWei` and `minFeeAssetBalance`.
 
 ### 3. Keep it running (systemd example)
 

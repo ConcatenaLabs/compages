@@ -76,7 +76,7 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   `assetamount: -1` for a blinded issuance AND for an explicit zero one, so the two are
   indistinguishable there. In the transaction they are not: an explicit amount, a commitment, and
   no issuance at all are three distinct things.
-- **Deposit nonces are per vault.** With more than one vault watched, a nonce no longer identifies
+- **Deposit nonces are per vault.** With more than one vault watched, a nonce alone does not identify
   a deposit and refund ids derived from it would collide. The primary vault keeps the bare nonce
   and the original refund-id form so records and ids already on chain stay valid; other vaults key
   `vault:nonce`.
