@@ -468,7 +468,9 @@ burner named by `setStablecoinBurner` can call `burnLockedUSDC()`, which burns
 the stablecoin's whole balance except what is committed to individual users:
 amounts owed to claimants, releases still in the queue, and cancelled releases
 the owner may still reinstate. Those are paid out as normal afterwards, and a
-guardian cancel can never make a user's escrow burnable.
+guardian cancel can never make a user's escrow burnable. The burn uses the
+token's own `burn`, so on USDC the issuer first makes the vault a minter; see
+"Rehearsing the hand-off to Circle".
 
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
@@ -832,6 +834,7 @@ compages-watch.js config.json`.
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
+| `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle") |
 
 The daemon's only runtime dependency is `ethers`.
 
@@ -892,6 +895,84 @@ the registry checks are skipped unless `REGISTRY_REPO` points at a checkout of
 
 The keys in the e2e script are anvil's standard, publicly known development
 keys; they hold nothing on any real network.
+
+## Rehearsing the hand-off to Circle
+
+Under Circle's
+[Bridged USDC Standard](https://github.com/circlefin/stablecoin-evm/blob/master/doc/bridged_USDC_standard.md)
+the issuer can adopt `USDC.e` in place: the supply is locked, Circle takes the
+minting power on Sequentia and burns the Ethereum escrow, and the asset becomes
+a direct liability of Circle without any balance moving. The Ethereum half of
+that can be rehearsed against the vault and USDC exactly as deployed on
+Sepolia:
+
+```
+contrib/handover-rehearsal.sh
+```
+
+It runs `contracts/test/fork/HandoverRehearsal.t.sol` on a local fork of
+Sepolia (Foundry required; the RPC defaults to Tenderly's public gateway and
+is overridden with `REHEARSAL_RPC_URL`). Nothing is broadcast: the vault's
+owner, guardian and operator, and USDC's `masterMinter` and `blacklister`
+(read from the token proxy), are impersonated on the fork. `FORK_BLOCK` pins
+the fork to one block for a reproducible run, `CIRCLE_BURNER` names the
+burner address Circle supplies, `VAULT` and `USDC` point it elsewhere, and
+further arguments go to `forge test` (`-vvvv` for call traces). A plain
+`forge test` skips it.
+
+It walks the hand-off in order and prints each step, whether it was accepted
+or refused, and the escrow before and after:
+
+1. **In flight.** Four redemptions are queued: one is executed, one is
+   cancelled by the guardian, one stays queued, and one pays a blacklisted
+   recipient and becomes owed. These are the three reservations the burn must
+   spare.
+2. **Supply lock.** The guardian pauses deposits, the in-flight releases
+   settle, then the guardian pauses releases. Deposits, releases, queued
+   executions and `rebalanceOut` are then refused.
+3. **Burner.** The owner calls `setStablecoinBurner(usdc, burner)`. The burn
+   still fails at this point, because FiatToken lets only a minter burn.
+4. **Minter.** USDC's `masterMinter` calls `configureMinter(vault, 0)`: the
+   vault can burn and cannot mint.
+5. **Burn.** Every other role is refused `burnLockedUSDC()`; the burner's call
+   emits `LockedStablecoinBurned`, and a second call finds nothing left.
+
+It passes only if USDC's `totalSupply` falls by exactly the vault's
+unreserved balance, the vault is left holding exactly its owed, queued and
+cancelled amounts, both pauses still hold afterwards, and an owed amount can
+still be claimed while releases stay paused. A vault holding under 1 USDC is
+first topped up with 10 USDC through a temporary minter, so there is always
+something to burn.
+
+The Sequentia half is performed with the node's RPCs (`sequentia-cli`), in
+this order, once the supply lock is in place and reconciled:
+
+- **Minting power.** `listissuances <asset>` gives the asset's reissuance
+  token id (`token`). The whole token supply, 1, goes to Circle's address with
+  `sendtoaddress` naming `assetlabel=<token>` (and the fee asset in
+  `fee_asset_label`). Holding it is the only way to mint the asset.
+- **Supervision keys.** Both rotations are signed by the *current* recovery
+  key, so the operational key is rotated first and the recovery key last.
+  `getsupervisionrecordhash rotateoperational <asset> <new key> <old key>
+  <txid> <vout>` gives the message to sign (BIP340, offline), where
+  `<txid> <vout>` is the first input the record's transaction will spend;
+  `buildsupervisionrecord` turns the signature into a record script,
+  `addsupervisionrecordoutput` appends it to a `createrawtransaction` that
+  spends that input, and `signrawtransactionwithwallet` and
+  `sendrawtransaction` publish it. Then the same with `rotaterecovery`.
+  `getsupervisedassets` shows the asset's current keys, and
+  `doc/sequentia/supervised-assets.md` in the node repository covers the
+  records.
+- **Registry identity.** The asset registry's `POST /succeed` takes
+  `{ asset_id, contract, signature }`: the new contract (Circle's name,
+  ticker and domain, at the same precision) signed by the current
+  `issuer_pubkey`, the key pinned as `unifiedIssuerPubkey`, with
+  `tools/sign-succession.js` from `sequentia-registry`. Circle's domain
+  serves the usual proof.
+
+The full sequence, including the reconciliation that makes the escrow equal
+the circulating supply, is in
+[`bridged-usdc-standard.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md).
 
 ## Limitations
 
