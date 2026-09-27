@@ -343,6 +343,7 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/sol/wrap/<solAddress>` | A wrap intent's bound Sequentia address and the status of every deposit seen on it |
 | `POST /api/sol/unwrap` `{"solAddress": "..."}` | Sequentia return address for a SOL.s → SOL unwrap |
 | `GET /api/sol/redeem/<seqAddress>` | A Solana unwrap address's bound Solana destination and the status of every redemption seen on it |
+| `GET /api/sol/intents` | The Solana treasury and every deposit address the bridge has handed out, for anyone checking the Solana escrow |
 | `GET /api/redeem/by-eth/<ethAddress>` | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one |
 | `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, and whether it is a blinded one; checked before any funds move |
 | `GET /api/health` | The operator's health report (see "Watch it and act on what it reports"); HTTP 503 while anything critical is wrong |
@@ -509,6 +510,46 @@ node admin.js unhalt <assetId>
 step is in flight. Every admin action is recorded in the state file's
 `adminLog`.
 
+## The watcher
+
+`watcher/compages-watch.js` is an independent check on the bridge, meant to
+run beside the daemon but trusting none of its bookkeeping. It reads the
+chains through its own endpoints and, once a minute:
+
+- **Rebuilds every vault's books from the vault's own events**, up to
+  Ethereum's finalized block: no token may have left a vault in greater
+  amount than entered it, the vault must hold (at that same block) what its
+  events say it holds, and the number of deposit events must equal the
+  vault's own deposit counter. Logs come from `ethLogsRpcUrl` and balances and
+  counters from `ethRpcUrl`, two different providers, so a log source that
+  drops events is caught by a counter it did not supply.
+- **Checks reserves**: for every bridged asset, circulating supply as the
+  block explorer's indexer counts it (`esploraUrl`, issuances minus burns,
+  never the bridge wallet) may not exceed what the source chains hold. A gap
+  must persist for `breachMinutes` before it counts, since a redemption is
+  paid out seconds before its burn.
+- **Checks the daemon**: its `/api/health` must answer, and not "failing",
+  within `daemonDownMinutes`.
+
+Critical findings go to `alertUrl`, and with `daemonAdminToken` set the
+affected assets are halted in the daemon, which stops their minting and
+payouts until an operator clears the halt. Payouts at or above
+`largePayout[token]` are announced as they happen (`announceEveryPayout`
+announces all of them). A JSON report is served on
+`127.0.0.1:<statusPort>/status`.
+
+```
+cd watcher
+npm install
+cp config.example.json config.json   # then fill in the URLs and tokens
+npm test
+npm start
+```
+
+A systemd unit for it looks like the daemon's, with
+`WorkingDirectory=<checkout>/watcher` and `ExecStart=/usr/bin/node
+compages-watch.js config.json`.
+
 ## Repository layout
 
 | Path | What it is |
@@ -516,6 +557,7 @@ step is in flight. Every admin action is recorded in the state file's
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule) |
 | `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
+| `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
 
 The daemon's only runtime dependency is `ethers`.
