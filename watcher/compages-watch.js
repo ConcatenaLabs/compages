@@ -67,7 +67,7 @@ const ERC20 = ["function balanceOf(address) view returns (uint256)"];
 const makeProvider = (url) => {
   const r = new ethers.FetchRequest(url);
   r.timeout = 30_000;
-  return new ethers.JsonRpcProvider(r, cfg.ethChainId, { staticNetwork: true });
+  return new ethers.JsonRpcProvider(r, cfg.ethChainId, { staticNetwork: true, batchMaxCount: 1 });
 };
 const provider = makeProvider(cfg.ethRpcUrl);
 const logsProvider = cfg.ethLogsRpcUrl ? makeProvider(cfg.ethLogsRpcUrl) : provider;

@@ -55,8 +55,13 @@ export class Eth {
     // answering must fail the tick, not hang it.
     const req = new ethers.FetchRequest(cfg.ethRpcUrl);
     req.timeout = cfg.ethRpcTimeoutMs ?? 30_000;
+    // One request per HTTP call. ethers batches JSON-RPC calls by default,
+    // and a provider that stalls on a batch holding eth_sendRawTransaction
+    // (Tenderly's Sepolia gateway does) turns every payout into a timeout
+    // while reads keep working, which hides the fault until money must move.
     this.provider = new ethers.JsonRpcProvider(req, cfg.ethChainId, {
       staticNetwork: true,
+      batchMaxCount: 1,
     });
     this.wallet = new ethers.Wallet(operatorKey, this.provider);
 
