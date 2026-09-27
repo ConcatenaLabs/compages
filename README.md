@@ -434,7 +434,7 @@ rebuilding its source commit reproduces the deployed bytecode exactly.
 | `operator` | the daemon's hot key | `release`, `refund`, `releaseViaCctp` and `refundViaCctp`, nothing else |
 | `guardian` | an incident-response key | `pauseDeposits`, `pauseReleases` and `cancelRelease`; never unpause, never move funds |
 
-[`contrib/safe-owner.md`](contrib/safe-owner.md) moves the owner role to a Safe multisig (and back), and explains why the guardian stays a single key and the operator a hot one.
+[`contrib/safe-owner.md`](contrib/safe-owner.md) moves the owner role to a Safe multisig (and back), and explains why the guardian stays a single key and the operator a hot one. The live vault's owner is a 2-of-3 Safe, [`0xc5540Be5eDc4D06459964dE061aFAB5c3b0025c0`](https://sepolia.etherscan.io/address/0xc5540Be5eDc4D06459964dE061aFAB5c3b0025c0), so every owner action needs two signers.
 
 **Rate limit and queue.** Each token (address zero for ether) has a token
 bucket set by `setReleaseLimit(token, capacity, refillPerSecond)`. A release
