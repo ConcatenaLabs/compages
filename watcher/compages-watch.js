@@ -48,16 +48,31 @@ const alerts = new Alerts({ ...cfg, alertUrl: cfg.alertUrl, alertCooldownMinutes
 const VAULT_EVENTS = new ethers.Interface([
   "event Deposited(uint256 indexed nonce, address indexed token, address indexed from, uint256 amount, string sequentiaAddress)",
   "event Released(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
-  "event Refunded(address indexed token, address indexed to, uint256 amount, bytes32 refundId)",
+  "event Refunded(address indexed token, address indexed to, uint256 amount, bytes32 indexed refundId)",
   "event ReleaseDeferred(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount)",
-  "event Claimed(address indexed token, address indexed recipient, address indexed payTo, uint256 amount)",
+  "event Claimed(address indexed token, address indexed account, address indexed payTo, uint256 amount)",
   "event Rebalanced(address indexed token, address indexed to, uint256 amount, string destination)",
   "event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender)",
+  "event CctpUnrecognized(uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount, bytes hookData)",
   "event LockedStablecoinBurned(address indexed token, uint256 amount)",
   "event ReleasedViaCctp(bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
   "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
 ]);
-const VAULT_VIEWS = ["function depositCount() view returns (uint256)"];
+const VAULT_VIEWS = ["function depositCount() view returns (uint256)", "function cctpUsdc() view returns (address)"];
+
+// The USDC a vault burns and mints through CCTP: its CCTP events name no
+// token, so the vault's own setting says which one moved.
+const usdcOfVault = new Map();
+async function cctpUsdcOf(address) {
+  if (!usdcOfVault.has(address)) {
+    let usdc = null;
+    try {
+      usdc = String(await new ethers.Contract(address, VAULT_VIEWS, provider).cctpUsdc()).toLowerCase();
+    } catch {}
+    usdcOfVault.set(address, usdc);
+  }
+  return usdcOfVault.get(address);
+}
 const ERC20 = ["function balanceOf(address) view returns (uint256)"];
 
 // Two Ethereum providers on purpose. Logs come from `ethLogsRpcUrl` (few
@@ -111,7 +126,7 @@ async function scanVault(v, safeHead) {
       }
       if (!ev) continue;
       const a = ev.args;
-      const token = a.token ?? cfg.cctpUsdc ?? ethers.ZeroAddress;
+      const token = a.token ?? (await cctpUsdcOf(v.address)) ?? ethers.ZeroAddress;
       const note = applyEvent(st.books, ev.name, {
         token: String(token),
         amount: BigInt(a.amount),
@@ -301,7 +316,43 @@ async function checkDaemon() {
 
 // ---- the brake ----------------------------------------------------------------
 
+// With a guardian key (a vault role that can pause and cancel queued
+// payouts, and nothing else), a critical finding also pauses payouts on the
+// vault itself. That holds even if the daemon, its host or its admin API is
+// the thing that failed; only the vault's owner can resume.
+const guardian = cfg.guardianKeyFile
+  ? new ethers.Wallet(fs.readFileSync(path.resolve(path.dirname(cfgPath), cfg.guardianKeyFile), "utf8").trim(), provider)
+  : null;
+const GUARDIAN_ABI = [
+  "function guardian() view returns (address)",
+  "function releasesPaused() view returns (bool)",
+  "function pauseReleases()",
+];
+
+async function pauseVault(address, why) {
+  if (!guardian) return;
+  try {
+    const v = new ethers.Contract(address, GUARDIAN_ABI, guardian);
+    if (String(await v.guardian()).toLowerCase() !== guardian.address.toLowerCase()) return; // not our role here
+    if (await v.releasesPaused()) return;
+    const tx = await v.pauseReleases();
+    await tx.wait(1, 120_000);
+    log(`PAUSED payouts on vault ${address} (${tx.hash}): ${why}`);
+    await alerts.raise(`paused:${address}`, `payouts paused on vault ${address.slice(0, 10)}`, `${why}. Only the owner can resume.`, {
+      priority: 5,
+    });
+  } catch (e) {
+    log(`could not pause vault ${address}: ${e.message}`);
+  }
+}
+
 async function brake(p) {
+  // Which vaults the finding concerns: the one named, or every vault that
+  // escrows the affected asset.
+  const vaults = new Set();
+  if (p.vault) vaults.add(p.vault);
+  if (p.assetId) for (const v of cfg.vaults) vaults.add(v.address);
+  for (const v of vaults) await pauseVault(v, p.title);
   if (!cfg.daemonAdminToken) return;
   const assets = await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/assets`).catch(() => []);
   let ids = [];
@@ -349,7 +400,7 @@ async function pass() {
   for (const p of problems) {
     active.add(p.key);
     await alerts.raise(p.key, p.title, p.detail, { priority: p.severity === "critical" ? 5 : 4 });
-    if (p.severity === "critical") await brake(p);
+    if (p.severity === "critical" && !p.noBrake) await brake(p);
   }
   await alerts.settle(active);
   report = { ...report, lastRun: new Date().toISOString(), problems };

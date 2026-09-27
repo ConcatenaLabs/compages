@@ -119,6 +119,7 @@ export function sourcesOf(mapping) {
       token: mapping.token,
       decimals: mapping.decimals,
       tokenProgram: mapping.tokenProgram,
+      ...(mapping.vault ? { vault: mapping.vault } : {}),
     },
   };
 }
@@ -780,6 +781,7 @@ export class Bridge {
     mapping = await this.ensureMintedMapping(dep, dep.tokenKey, sats, {
       chainId: this.cfg.ethChainId,
       token: dep.token,
+      vault: dep.vault ?? null,
       meta: { symbol: meta.symbol, name: meta.name, decimals: meta.decimals },
       chainName: this.cfg.ethChainName,
       tickerSuffix: ".e",
@@ -858,7 +860,7 @@ export class Bridge {
         sats: sats.toString(),
         mappingKey,
         tokenKey,
-        origin: { chainId: origin.chainId, token: origin.token, meta: origin.meta },
+        origin: { chainId: origin.chainId, token: origin.token, meta: origin.meta, vault: origin.vault ?? null },
         contract,
         contractHash: ch,
       };
@@ -923,6 +925,9 @@ export class Bridge {
       symbol: c.origin.meta.symbol,
       name: c.origin.meta.name,
       decimals: c.origin.meta.decimals,
+      // The vault that took this token's first deposit holds its escrow, and
+      // its payouts come from there.
+      ...(c.origin.vault ? { vault: c.origin.vault } : {}),
       assetId: c.asset,
       reissuanceToken: c.token,
       entropy: c.entropy,
@@ -1382,19 +1387,20 @@ export class Bridge {
    *  vault's processedRedemptions guard keyed by a deterministic refund id. */
   async processRefunds() {
     for (const dep of Object.values(this.state.data.deposits)) {
-      if (dep.status !== "refund_pending" && dep.status !== "refunding") continue;
+      if (!["refund_pending", "refunding", "refund_queued"].includes(dep.status)) continue;
       const id = refundId(this.cfg.ethChainId, dep.nonce, dep.key === dep.nonce ? null : dep.vault);
       // Refund out of the vault that took the deposit: no other vault holds
       // escrow for it.
       const vault = this.eth.vaultFor(dep.vault);
       const tag = `deposit #${dep.nonce}`;
       try {
+        if (dep.status === "refund_queued") {
+          await this.driveQueued(dep, vault, id, "refund", tag);
+          continue;
+        }
         if (await vault.processedRedemptions(id)) {
-          dep.status = "refunded";
-          dep.refundTxHash ??= dep.ethTx?.hash ?? null;
-          delete dep.ethTx;
-          this.state.save();
-          this.log(`${tag}: refunded (${dep.refundReason})`);
+          const o = await this.settledOutcome(vault, id, dep.refundFromBlock);
+          this.applyRefundOutcome(dep, o, tag);
           continue;
         }
         if (dep.status === "refunding") {
@@ -1402,41 +1408,153 @@ export class Bridge {
         }
         const tokenAddr = dep.token === "eth" ? ethers.ZeroAddress : dep.token;
         dep.status = "refunding";
+        dep.refundFromBlock ??= await this.eth.provider.getBlockNumber();
         this.state.save();
-        const r = await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id]);
-        if (r.paid) {
-          dep.status = "refunded";
-          dep.refundTxHash = r.paid;
-          delete dep.ethTx;
-          delete dep.waiting;
-          this.state.save();
-          this.log(`${tag}: refunded (${dep.refundReason}) in ${r.paid}`);
-        } else if (r.revert) {
-          await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
-        }
+        const r = await this.payOut(dep, vault, [tokenAddr, dep.from, dep.amountUnits, id], "refund");
+        if (r.revert) await this.parkRevert(dep, r.revert, vault, tokenAddr, dep.amountUnits, "refund", tag);
+        else if (r.paid || r.queued) this.applyRefundOutcome(dep, r, tag);
       } catch (e) {
         this.log(`${tag}: refund attempt failed: ${e.message}`);
       }
     }
   }
 
-  /** Send one vault payout and report what happened: { paid: hash } once it
-   *  mined, { revert: name } when the vault refuses it, {} when it is sent
-   *  but not mined yet (the caller's record holds it as `ethTx`). */
-  async payOut(rec, vault, args) {
+  /** Record a redemption payout's outcome: paid (possibly owed to the
+   *  recipient, who claims it), queued, or cancelled by the guardian. */
+  applyReleaseOutcome(rec, o, tag, mapping = null) {
+    mapping ??= Object.values(this.state.data.mappings).find((m) => m.assetId === rec.assetId);
+    delete rec.ethTx;
+    delete rec.waiting;
+    if (o.queued) {
+      rec.status = "queued";
+      rec.executeAfter = new Date(o.queued * 1000).toISOString();
+      if (o.block) rec.queuedBlock = o.block;
+      this.log(`${tag}: over the vault's rate limit; queued until ${rec.executeAfter}`);
+    } else if (o.cancelled) {
+      rec.status = "release_cancelled";
+      this.log(`${tag}: the queued release was cancelled on the vault; an operator must decide`);
+    } else {
+      rec.status = "released";
+      rec.releaseTxHash ??= o.paid ?? null;
+      if (o.deferred) rec.deferred = o.deferred;
+      if (mapping) this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
+      this.log(
+        `${tag}: released ${rec.amountUnits} units of ${rec.symbol ?? ""} to ${rec.ethAddress}` +
+          (o.deferred ? " (the address refused it; it is owed on the vault and claimable)" : "")
+      );
+    }
+    this.state.save();
+  }
+
+  applyRefundOutcome(dep, o, tag) {
+    delete dep.ethTx;
+    delete dep.waiting;
+    if (o.queued && o.block) dep.queuedBlock = o.block;
+    if (o.queued) {
+      dep.status = "refund_queued";
+      dep.executeAfter = new Date(o.queued * 1000).toISOString();
+      this.log(`${tag}: refund over the vault's rate limit; queued until ${dep.executeAfter}`);
+    } else if (o.cancelled) {
+      dep.status = "refund_cancelled";
+      this.log(`${tag}: the queued refund was cancelled on the vault; an operator must decide`);
+    } else {
+      dep.status = "refunded";
+      dep.refundTxHash ??= o.paid ?? null;
+      if (o.deferred) dep.deferred = o.deferred;
+      this.log(`${tag}: refunded (${dep.refundReason})${o.deferred ? "; the address refused it, so it is owed and claimable" : ""}`);
+    }
+    this.state.save();
+  }
+
+  /** Send one vault payout and report what happened:
+   *    { paid: hash }                     the funds reached the recipient
+   *    { paid: hash, deferred: {to,...} } the recipient refused them; they are
+   *                                       owed on the vault and claimable
+   *    { queued: executeAfter }           over the rate limit; in the queue
+   *    { revert: name }                   the vault refused the call
+   *    {}                                 sent, not mined yet (held as ethTx)
+   *  `kind` "refund" uses refund() on a vault that has it. */
+  async payOut(rec, vault, args, kind = "release") {
+    const v3 = (await this.eth.vaultVersion(vault)) >= 3;
+    const method = v3 && kind === "refund" ? "refund" : "release";
     try {
-      const receipt = await this.eth.sendAndWait(vault, "release", args, (sent) => {
+      const receipt = await this.eth.sendAndWait(vault, method, args, (sent) => {
         rec.ethTx = sent;
         this.state.save();
       });
-      if (!receipt) return {};
-      if (receipt.status === 1) return { paid: receipt.hash };
-      return {}; // mined but reverted: re-examined from the on-chain guard next tick
+      if (!receipt || receipt.status !== 1) return {}; // re-examined from the chain next tick
+      return v3 ? this.readPayoutOutcome(vault, receipt, args[3]) : { paid: receipt.hash };
     } catch (e) {
       if (e?.code === "CALL_EXCEPTION" && typeof e.data === "string" && e.data.length >= 10) {
         return { revert: this.eth.revertName(e.data) ?? e.data };
       }
       throw e;
+    }
+  }
+
+  /** The outcome of payout `id` from the vault events in a receipt. */
+  readPayoutOutcome(vault, receipt, id) {
+    const ev = this.eth.payoutEvents(vault, receipt, id);
+    if (ev.ReleaseQueued) return { queued: Number(ev.ReleaseQueued.executeAfter), block: receipt.blockNumber };
+    if (ev.ReleaseDeferred) {
+      return { paid: receipt.hash, deferred: { to: ev.ReleaseDeferred.to, amount: ev.ReleaseDeferred.amount.toString() } };
+    }
+    return { paid: receipt.hash };
+  }
+
+  /** Where payout `id` stands on a vault that has already marked it
+   *  processed. On a version-3 vault "processed" also covers queued and
+   *  cancelled payouts, so the queue decides; a payout that left the queue,
+   *  or never entered it, was paid, possibly as an owed amount. */
+  async settledOutcome(vault, id, fromBlock = null) {
+    if ((await this.eth.vaultVersion(vault)) < 3) return { paid: null };
+    const q = await vault.queuedRelease(id);
+    const state = Number(q.state);
+    if (state === 1) return { queued: Number(q.executeAfter) };
+    if (state === 2) return { cancelled: true };
+    // Paid: look for an owed amount, which the page must tell the user about.
+    const from = fromBlock ?? Math.max(0, (await this.eth.provider.getBlockNumber()) - (this.cfg.ethLookbackBlocks ?? 250_000));
+    const deferred = await vault.queryFilter(vault.filters.ReleaseDeferred(id), from).catch(() => []);
+    if (deferred.length) {
+      const a = deferred[0].args;
+      return { paid: deferred[0].transactionHash, deferred: { to: a.to, amount: a.amount.toString() } };
+    }
+    return { paid: null };
+  }
+
+  /** Move a queued payout along: execute it once its delay has passed
+   *  (anyone may; the operator does), and notice if someone else executed
+   *  it or the guardian cancelled it. */
+  async driveQueued(rec, vault, id, kind, tag) {
+    if (rec.ethTx) {
+      const st = await this.eth.sentTxState(rec.ethTx);
+      if (st === "pending") return;
+      delete rec.ethTx;
+    }
+    const o = await this.settledOutcome(vault, id, rec.queuedBlock ?? null);
+    const apply = (x) => (kind === "refund" ? this.applyRefundOutcome(rec, x, tag) : this.applyReleaseOutcome(rec, x, tag));
+    if (!o.queued) return apply(o);
+    rec.executeAfter = new Date(o.queued * 1000).toISOString();
+    // The vault measures the delay in block time, so ask the chain.
+    const now = (await this.eth.provider.getBlock("latest")).timestamp;
+    if (now < o.queued) return;
+    try {
+      const receipt = await this.eth.sendAndWait(vault, "executeRelease", [id], (sent) => {
+        rec.ethTx = sent;
+        this.state.save();
+      });
+      if (receipt?.status === 1) return apply(this.readPayoutOutcome(vault, receipt, id));
+    } catch (e) {
+      if (e?.code !== "CALL_EXCEPTION" || typeof e.data !== "string") throw e;
+      const name = this.eth.revertName(e.data) ?? e.data;
+      rec.waiting =
+        name === "ReleasesArePaused"
+          ? "releases are paused on the vault"
+          : name === "InsufficientVaultBalance"
+            ? "the vault does not hold enough of this token right now"
+            : `the vault refused to execute it (${name})`;
+      this.state.save();
+      this.log(`${tag}: queued payout not executed: ${rec.waiting}`);
     }
   }
 
@@ -1479,8 +1597,17 @@ export class Bridge {
       this.log(`${tag}: ${why}; waiting`);
     };
     if (name === "AlreadyReleased") {
-      rec.status = isRefund ? "refunded" : "released";
+      // On a version-3 vault the id may be queued or cancelled rather than
+      // paid; the next pass reads which from the vault.
+      rec.status = isRefund ? "refunding" : "releasing";
       this.state.save();
+      return;
+    }
+    if (name === "InvalidRecipient") {
+      rec.status = isRefund ? "refund_failed_manual" : "release_failed_manual";
+      rec.error = "the vault refuses this recipient address";
+      this.state.save();
+      this.log(`${tag}: ${rec.error}; flagged for the operator`);
       return;
     }
     if (name === "ReleasesArePaused") {
@@ -1712,7 +1839,7 @@ export class Bridge {
     }
     // Pin the vault holding this source's escrow now, so a later config change
     // cannot redirect an in-flight release to a vault that never held it.
-    rec.vault = src.vault ?? this.cfg.vaultAddress ?? null;
+    rec.vault = src.vault ?? mapping.vault ?? this.cfg.vaultAddress ?? null;
     rec.symbol = mapping.symbol;
 
     const units = atomsToUnits(rec.sats, src.decimals, mapping.precision);
@@ -1765,9 +1892,8 @@ export class Bridge {
 
     if (rec.status === "new") {
       if (await vault.processedRedemptions(id)) {
-        rec.status = "released"; // paid in a previous life; continue to destroy
-        this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
-        this.state.save();
+        // Handled in a previous life: paid, owed, queued or cancelled.
+        this.applyReleaseOutcome(rec, await this.settledOutcome(vault, id, rec.releaseFromBlock), `redemption ${rec.key}`, mapping);
       } else {
         // Anchoring is supreme: re-verify the burn is STILL final immediately
         // before the irreversible vault release. A crash or RPC outage can put
@@ -1790,15 +1916,10 @@ export class Bridge {
           ? ethers.ZeroAddress
           : ethSrc?.token ?? mapping.token;
         const tag = `redemption ${rec.key}`;
+        rec.releaseFromBlock ??= await this.eth.provider.getBlockNumber();
         const r = await this.payOut(rec, vault, [tokenAddr, rec.ethAddress, rec.amountUnits, id]);
-        if (r.paid) {
-          rec.releaseTxHash = r.paid;
-          rec.status = "released";
-          delete rec.ethTx;
-          delete rec.waiting;
-          this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
-          this.state.save();
-          this.log(`${tag}: released ${rec.amountUnits} units of ${mapping.symbol} to ${rec.ethAddress} in ${r.paid}`);
+        if (r.paid || r.queued) {
+          this.applyReleaseOutcome(rec, r, tag, mapping);
         } else if (r.revert) {
           await this.parkRevert(rec, r.revert, vault, tokenAddr, rec.amountUnits, "redemption", tag);
           if (rec.status === "released") this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
@@ -1815,27 +1936,27 @@ export class Bridge {
 
   /** Re-drive every redemption between "final" and "done": releases that
    *  were sent but not yet seen to mine (or were interrupted), releases
-   *  waiting out a vault pause, and burns still owed after a payout. */
+   *  waiting out a vault pause or the vault's queue, and burns still owed
+   *  after a payout. */
   async retryRedemptions() {
     const s = this.state.data;
-    const ACTIVE = ["new", "releasing", "release_paused", "released", "destroy_pending", "destroying"];
+    const ACTIVE = ["new", "releasing", "release_paused", "queued", "released", "destroy_pending", "destroying"];
     for (const rec of Object.values(s.redemptions)) {
       if (!ACTIVE.includes(rec.status)) continue;
       const mapping = Object.values(s.mappings).find((m) => m.assetId === rec.assetId);
       if (!mapping) continue;
       const tag = `redemption ${rec.key}`;
       try {
-        if (rec.status === "releasing" || rec.status === "release_paused" || rec.status === "new") {
-          // The on-chain guard is the authority on whether the payout landed.
-          const vault = this.eth.vaultFor(rec.vault);
-          const id = rec.redemptionId ?? redemptionIdOf(this.cfg.seqChainLabel, rec.txid, rec.vout);
+        const vault = this.eth.vaultFor(rec.vault);
+        const id = rec.redemptionId ?? redemptionIdOf(this.cfg.seqChainLabel, rec.txid, rec.vout);
+        if (rec.status === "queued") {
+          await this.driveQueued(rec, vault, id, "release", tag);
+          if (rec.status !== "released") continue;
+        } else if (["releasing", "release_paused", "new"].includes(rec.status)) {
+          // The vault is the authority on whether the payout happened.
           if (await vault.processedRedemptions(id)) {
-            rec.status = "released";
-            rec.releaseTxHash ??= rec.ethTx?.hash ?? null;
-            delete rec.ethTx;
-            delete rec.waiting;
-            this.debitEscrow(mapping, rec.tokenKey, rec.amountUnits, rec);
-            this.state.save();
+            this.applyReleaseOutcome(rec, await this.settledOutcome(vault, id, rec.releaseFromBlock), tag, mapping);
+            if (rec.status !== "released") continue;
           } else if (rec.status === "releasing") {
             if ((await this.settleSentTx(rec, tag)) === "wait") continue;
             rec.status = "new";
@@ -2897,6 +3018,8 @@ export class Bridge {
       "refund_failed_manual",
       "destroy_manual",
       "delivery_reorged",
+      "release_cancelled",
+      "refund_cancelled",
     ]);
     const records = {};
     for (const [group, list] of Object.entries({

@@ -23,6 +23,7 @@ export function applyEvent(books, name, a) {
       books.deposits += 1;
       return null;
     case "RebalancedIn":
+    case "CctpUnrecognized": // USDC that arrived for no known purpose; the daemon refunds it
       tokenBook(books, a.token).in += a.amount;
       return null;
     case "Released":
@@ -67,6 +68,8 @@ export function checkVault(vault, books, balances, depositCount) {
       title: `vault ${short(vault)} counts ${depositCount} deposits but the RPC returned ${books.deposits}`,
       detail: "the Ethereum RPC is dropping logs; nothing read from it can be trusted until a full rescan agrees",
       rescan: true,
+      // A data-source fault, not a fault of the vault: alert, never brake.
+      noBrake: true,
     });
   }
   for (const [token, b] of Object.entries(books.tokens)) {
@@ -78,6 +81,7 @@ export function checkVault(vault, books, balances, depositCount) {
         title: `vault ${short(vault)} paid out more ${short(token)} than was ever deposited`,
         detail: `in ${b.in}, out ${b.out}, owed ${b.owed}`,
         token,
+        vault,
       });
     }
     const held = balances[token];
@@ -88,6 +92,7 @@ export function checkVault(vault, books, balances, depositCount) {
         title: `vault ${short(vault)} holds less ${short(token)} than its own events account for`,
         detail: `holds ${held}, events say ${b.in - committed}: funds left by a path that emits no event`,
         token,
+        vault,
       });
     }
   }

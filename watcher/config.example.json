@@ -20,6 +20,7 @@
   "solTreasury": "76ZPjfcZGjidKPm9eqmCADKvkYzsEfTwv1wroANJZuhv",
   "daemonUrl": "http://127.0.0.1:9950",
   "daemonAdminToken": "",
+  "guardianKeyFile": "",
   "alertUrl": "",
   "breachMinutes": 10,
   "daemonDownMinutes": 10,

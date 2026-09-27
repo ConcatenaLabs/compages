@@ -930,6 +930,86 @@ if (process.env.REGISTRY_URL) {
   check("the admin API lists records by status", Array.isArray(recs) && recs.length > 0, `${recs.length}`);
 }
 
+// ---------------- test 11: the vault's limits, queue, pause and claims ----------------
+{
+  console.log("\n-- vault: a payout over the rate limit waits in the queue, then pays");
+  const owner = new ethers.Wallet(process.env.OWNER_KEY, provider);
+  const guardian = new ethers.Wallet(process.env.GUARDIAN_KEY, provider);
+  const vaultAdmin = new ethers.Contract(
+    process.env.VAULT,
+    [
+      "function setReleaseLimit(address,uint256,uint256)",
+      "function pauseReleases()",
+      "function unpauseReleases()",
+      "function owed(address,address) view returns (uint256)",
+    ],
+    owner
+  );
+  const redeemTo = async (ethAddress, amount, assetId) => {
+    const intent = await api("redeem", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ethAddress }),
+    });
+    const txid = await seqRpc(
+      "sendtoaddress",
+      { address: intent.seqAddress, amount, assetlabel: assetId, fee_asset_label: process.env.FEEX },
+      "user"
+    );
+    const find = async () => (await api(`redeem/${intent.seqAddress}`)).redemptions.find((x) => x.txid === txid);
+    return { find };
+  };
+  const QUEUE_TO = "0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc"; // anvil #5
+  // MUSD's bucket: nearly empty, refilling at one base unit a second.
+  await (await vaultAdmin.setReleaseLimit(process.env.MUSD, 1_000_000n, 1n)).wait();
+  const recvBefore = await musd.balanceOf(QUEUE_TO);
+  const q = await redeemTo(QUEUE_TO, 3, minted1.assetId);
+  const queued = await waitFor("redemption queued by the vault", async () => {
+    const r = await q.find();
+    return r?.status === "queued" ? r : null;
+  }, 180_000);
+  check("a payout over the rate limit is queued, not paid", !!queued, queued?.executeAfter);
+  check("nothing reached the recipient while queued", (await musd.balanceOf(QUEUE_TO)) === recvBefore);
+  await provider.send("evm_increaseTime", [Number(process.env.RELEASE_DELAY) + 60]);
+  await provider.send("evm_mine", []);
+  const executed = await waitFor("queued redemption executed and burned", async () => {
+    const r = await q.find();
+    return r?.status === "done" ? r : null;
+  }, 180_000);
+  check("after the delay the daemon executes the queued payout", !!executed);
+  check("the recipient got exactly 3 MUSD", (await musd.balanceOf(QUEUE_TO)) - recvBefore === 3_000_000n);
+  await (await vaultAdmin.setReleaseLimit(process.env.MUSD, 10n ** 24n, 10n ** 21n)).wait();
+
+  console.log("\n-- vault: the guardian pauses payouts; the owner resumes them");
+  await (await vaultAdmin.connect(guardian).pauseReleases()).wait();
+  const p = await redeemTo(QUEUE_TO, 1, minted1.assetId);
+  const paused = await waitFor("redemption waits on the pause", async () => {
+    const r = await p.find();
+    return r?.status === "release_paused" ? r : null;
+  }, 180_000);
+  check("a paused vault makes a redemption wait, not fail", !!paused, paused?.waiting);
+  await (await vaultAdmin.unpauseReleases()).wait();
+  const resumed = await waitFor("paused redemption completes after unpause", async () => {
+    const r = await p.find();
+    return r?.status === "done" ? r : null;
+  }, 180_000);
+  check("after unpausing, the redemption completes", !!resumed);
+
+  console.log("\n-- vault: ether to an address that refuses it becomes owed, then claimed");
+  const d = await redeemTo(process.env.REJECTOR, 0.05, minted3.assetId);
+  const deferred = await waitFor("redemption to a refusing address settles", async () => {
+    const r = await d.find();
+    return r?.status === "done" ? r : null;
+  }, 180_000);
+  check("the payout is recorded as owed, not failed", !!deferred?.deferred, JSON.stringify(deferred?.deferred));
+  const owedNow = await vaultAdmin.owed(ethers.ZeroAddress, process.env.REJECTOR);
+  check("the vault owes the refusing address exactly 0.05 ETH", owedNow === ethers.parseEther("0.05"), `${owedNow}`);
+  const rejector = new ethers.Contract(process.env.REJECTOR, ["function claimFrom(address,address,address)"], user);
+  const payTo = ethers.Wallet.createRandom().address;
+  await (await rejector.claimFrom(process.env.VAULT, ethers.ZeroAddress, payTo)).wait();
+  check("the owed ether can be claimed to another address", (await provider.getBalance(payTo)) === ethers.parseEther("0.05"));
+}
+
 // ---------------- summary ----------------
 clearInterval(miner);
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : "\nALL CHECKS PASSED");
