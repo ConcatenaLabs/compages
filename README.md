@@ -303,30 +303,48 @@ deployment. Its `VERSION` constant says which one an address runs.
 
 | Role | Intended holder | Can |
 |---|---|---|
-| `owner` | a Safe or a cold key | set the other roles and every limit, unpause, reinstate cancelled releases, move unreserved escrow with `rebalanceOut`, configure CCTP and the stablecoin burner. Transferred in two steps (`transferOwnership`, then `acceptOwnership` by the new owner) |
+| `owner` | a Safe or a cold key | set the other roles and every limit, unpause, reinstate, amend or discard cancelled releases, move unreserved escrow with `rebalanceOut` and add ether escrow with `fundEther`, configure CCTP and the stablecoin burner. Transferred in two steps (`transferOwnership`, then `acceptOwnership` by the new owner) |
 | `operator` | the daemon's hot key | `release`, `refund`, `releaseViaCctp` and `refundViaCctp`, nothing else |
 | `guardian` | an incident-response key | `pauseDeposits`, `pauseReleases` and `cancelRelease`; never unpause, never move funds |
 
 **Rate limit and queue.** Each token (address zero for ether) has a token
 bucket set by `setReleaseLimit(token, capacity, refillPerSecond)`. A release
 or refund that fits in the bucket pays at once; one that does not is queued
-for `releaseDelay` seconds (at most 30 days) and emits `ReleaseQueued`. After
-the delay anyone may call `executeRelease(id)`. During it the guardian or
-owner can `cancelRelease(id)`, and only the owner can `reinstateRelease(id)`,
-which queues it again with a fresh delay. A token with no bucket has capacity
+for `releaseDelay` seconds (between one hour and 30 days) and emits
+`ReleaseQueued`. After the delay anyone may call `executeRelease(id)`. During
+it the guardian or owner can `cancelRelease(id)`. A cancelled release stays
+with the owner, who can `reinstateRelease(id)` (queued again with a fresh
+delay), first `amendCancelledRelease` its destination (a different recipient,
+or switching between a direct and a CCTP payout, keeping the token and
+amount), or `discardCancelledRelease(id)` it for good, which is how a bogus
+entry queued with a stolen operator key is cleared. A token with no bucket has capacity
 zero, so every payout of it is queued. A newly configured bucket starts empty
 and fills at its refill rate, and reconfiguring one never tops it up. An id is
 marked processed the moment it is paid or queued, and a cancelled id stays
 spent. `availableToRelease(token)` and `queuedRelease(id)` show the current
 state.
 
+Queued releases and cancelled ones the owner may still reinstate are
+reserved, like owed amounts: no immediate payout and no rebalance can spend
+the escrow they will need. A queued release executes only while the vault
+covers every reservation, so a shortfall stops the queue until the escrow is
+refilled rather than letting one release take another's funds.
+
 **Owed payouts and claims.** Before paying, the vault requires its unreserved
-balance (balance minus what it owes claimants) to cover the amount, and
+balance (balance minus what it owes claimants and what queued and cancelled
+releases hold, shown by `unreservedBalance(token)`) to cover the amount, and
 otherwise reverts with `InsufficientVaultBalance` so the payout can be retried
 later. If the transfer itself fails, the amount becomes owed to the recipient
 (`ReleaseDeferred`), stays reserved, and the recipient calls
-`claim(token, payTo)` to withdraw it to any address. `Released`, `Refunded` and
-the CCTP payout events are emitted only when funds actually leave.
+`claim(token, payTo)` to withdraw it to any address. Only the recipient itself
+can claim, so a contract that can neither accept the payout nor make calls can
+never collect what it is owed. `Released`, `Refunded` and the CCTP payout
+events are emitted only when funds actually leave.
+
+**Adding escrow.** Tokens arrive by plain transfer. Ether has no such path,
+since the vault has no `receive()`: the owner adds it with `fundEther()`,
+which emits `RebalancedIn` with the source domain `FUNDING_DOMAIN`
+(`type(uint32).max`) and creates no deposit.
 
 **Deposit rules.** The owner can set a per-token minimum (`setMinDeposit`), a
 cap on the vault's balance after a deposit (`setDepositCap`, zero for none),
@@ -341,17 +359,27 @@ arrive from and leave to other chains while staying in this one escrow:
 
 - *Inbound.* A burn on the source chain names the vault as `mintRecipient`
   and as `destinationCaller`, and anyone relays it with
-  `receiveCctp(message, attestation)`. Its hookData decides what it is. The
-  ASCII bytes `compages:deposit:` followed by a Sequentia address (14 to 120
-  bytes) make a deposit, which emits `Deposited` (with `from` zero) and
+  `receiveCctp(message, attestation)`. The `destinationCaller` matters: a burn
+  that leaves it empty can be relayed straight to Circle's transmitter,
+  around the vault, and its USDC then arrives with no event, as an
+  unaccounted donation. Its hookData decides what it is. The ASCII bytes
+  `compages:deposit:` followed by a Sequentia address (14 to 120 bytes) make
+  a deposit, which emits `Deposited` (with `from` zero) and
   `CctpDeposit(nonce, sourceDomain, sender, cctpNonce, amount)` under the same
   deposit number. Exactly `compages:rebalance` is liquidity from another
-  escrow and emits `RebalancedIn`. Anything else is refused, which leaves the
-  message unreceived rather than crediting unaccounted funds. The amount
-  credited is the USDC balance change across the mint. A deposit is refused
-  while deposits are paused and can be relayed again afterwards; the
-  deposit minimum, cap and token block do not apply, since the dollars are
-  already minted and the daemon refunds what it cannot bridge.
+  escrow and emits `RebalancedIn`. Anything else, a malformed deposit
+  included, is still received, because nothing but the vault could ever
+  complete it, and is reported with `CctpUnrecognized(sourceDomain, sender,
+  cctpNonce, amount, hookData)` so it can be refunded with `refundViaCctp`.
+  A burn that names the vault as `destinationCaller` but mints to someone
+  else is relayed too, for the same reason: it credits nothing, emits
+  `CctpForwarded(sourceDomain, mintRecipient, cctpNonce)`, and reverts if it
+  would change the vault's USDC balance. The vault relays only messages
+  addressed to Circle's TokenMessenger.
+  The amount credited is the USDC balance change across the mint. A deposit
+  is refused while deposits are paused and can be relayed again afterwards;
+  the deposit minimum, cap and token block do not apply, since the dollars
+  are already minted and the daemon refunds what it cannot bridge.
 - *Outbound.* `releaseViaCctp(amount, destinationDomain, mintRecipient,
   redemptionId, maxFee)` burns USDC here for minting on another chain, under
   the same replay map, USDC rate limit, queue and pause as `release`, at
@@ -363,8 +391,9 @@ arrive from and leave to other chains while staying in this one escrow:
 freezes the escrow against the circulating supply. With the supply locked, the
 burner named by `setStablecoinBurner` can call `burnLockedUSDC()`, which burns
 the stablecoin's whole balance except what is committed to individual users:
-amounts owed to claimants and releases still in the queue, which are paid out
-as normal afterwards.
+amounts owed to claimants, releases still in the queue, and cancelled releases
+the owner may still reinstate. Those are paid out as normal afterwards, and a
+guardian cancel can never make a user's escrow burnable.
 
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
@@ -531,7 +560,7 @@ OWNER=0x... OPERATOR=0x... GUARDIAN=0x... RELEASE_DELAY=86400 \
 | `OWNER` | The owner: a Safe or a cold key. Holds every administrative power |
 | `OPERATOR` | The daemon's hot key, the address of `operator.key` |
 | `GUARDIAN` | The incident key that can pause and cancel queued releases |
-| `RELEASE_DELAY` | Seconds a payout over the rate limit waits before it can be executed (at most 2592000, 30 days) |
+| `RELEASE_DELAY` | Seconds a payout over the rate limit waits before it can be executed (3600 to 2592000: one hour to 30 days) |
 
 The deployer holds no role. Until the owner configures a release limit, every
 payout is queued, so the owner's next steps are `setReleaseLimit` for each
@@ -722,7 +751,8 @@ deploy script; CCTP tests against mocks that follow Circle's V2 message layout,
 pinned byte for byte to a real Sepolia message; and an invariant suite that
 drives random sequences of every operation and checks that the vault's
 balance always equals what its events credited in less what they paid out,
-and that it always covers what it owes:
+that it always covers what it owes, and that no outflow ever spends escrow
+reserved for queued, cancelled or owed amounts:
 
 ```
 cd contracts

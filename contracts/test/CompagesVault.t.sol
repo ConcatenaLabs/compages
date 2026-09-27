@@ -13,7 +13,7 @@ import {
     BlocklistPausableERC20,
     RebasingERC20
 } from "./mocks/MockTokens.sol";
-import {RejectingReceiver, GasBurner, ReentrantReceiver} from "./mocks/MockReceivers.sol";
+import {RejectingReceiver, GasBurner, ReentrantReceiver, PickyReceiver} from "./mocks/MockReceivers.sol";
 
 contract CompagesVaultTest is Test {
     CompagesVault vault;
@@ -111,7 +111,7 @@ contract CompagesVaultTest is Test {
         assertEq(vault.pendingOwner(), address(0));
     }
 
-    function test_constructor_rejectsZeroAddressesAndLongDelay() public {
+    function test_constructor_rejectsZeroAddressesAndBadDelay() public {
         vm.expectRevert(CompagesVault.ZeroAddress.selector);
         new CompagesVault(address(0), operator, guardian, DELAY);
         vm.expectRevert(CompagesVault.ZeroAddress.selector);
@@ -120,6 +120,11 @@ contract CompagesVaultTest is Test {
         new CompagesVault(owner, operator, address(0), DELAY);
         vm.expectRevert(CompagesVault.DelayTooLong.selector);
         new CompagesVault(owner, operator, guardian, 30 days + 1);
+        vm.expectRevert(CompagesVault.DelayTooShort.selector);
+        new CompagesVault(owner, operator, guardian, 1 hours - 1);
+        vm.expectRevert(CompagesVault.DelayTooShort.selector);
+        new CompagesVault(owner, operator, guardian, 0);
+        new CompagesVault(owner, operator, guardian, 1 hours);
     }
 
     // ------------------------------------------------------------------
@@ -704,16 +709,47 @@ contract CompagesVaultTest is Test {
         vm.prank(owner);
         vault.unpauseReleases();
 
-        // The owner moved liquidity away meanwhile: execution waits for it.
-        vm.prank(owner);
-        vault.rebalanceOut(address(token), payable(carol), 50e6, "solana");
-        vm.expectRevert(
-            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 80e6, 50e6)
-        );
-        vault.executeRelease(id);
-        _escrow(30e6);
         vault.executeRelease(id);
         assertEq(token.balanceOf(bob), 80e6);
+    }
+
+    function test_queue_executeWaitsForLiquidity() public {
+        // A release may be queued beyond what the vault holds; it executes
+        // once the escrow is refilled.
+        _escrow(100e6);
+        bytes32 id = keccak256("q-short");
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 150e6, id);
+        vm.warp(block.timestamp + DELAY);
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 150e6, 100e6)
+        );
+        vault.executeRelease(id);
+        _escrow(50e6);
+        vault.executeRelease(id);
+        assertEq(token.balanceOf(bob), 150e6);
+    }
+
+    function test_queue_executeRequiresTheWholeReservationCovered() public {
+        // With two queued releases and escrow for only one, neither executes:
+        // a queued release is only paid while every other commitment stays
+        // covered, so the shortfall is visible and refilled rather than
+        // silently shifted onto whoever executes last.
+        _escrow(100e6);
+        vm.startPrank(operator);
+        vault.release(address(token), payable(bob), 60e6, keccak256("a"));
+        vault.release(address(token), payable(carol), 60e6, keccak256("b"));
+        vm.stopPrank();
+        vm.warp(block.timestamp + DELAY);
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 60e6, 40e6)
+        );
+        vault.executeRelease(keccak256("a"));
+        _escrow(20e6);
+        vault.executeRelease(keccak256("a"));
+        vault.executeRelease(keccak256("b"));
+        assertEq(token.balanceOf(bob), 60e6);
+        assertEq(token.balanceOf(carol), 60e6);
     }
 
     function test_queue_usesDelayAtQueueTime() public {
@@ -737,9 +773,16 @@ contract CompagesVaultTest is Test {
         vm.prank(owner);
         vault.setReleaseDelay(30 days);
         assertEq(vault.releaseDelay(), 30 days);
+        vm.startPrank(owner);
+        vm.expectRevert(CompagesVault.DelayTooShort.selector);
+        vault.setReleaseDelay(1 hours - 1);
+        vm.expectRevert(CompagesVault.DelayTooShort.selector);
+        vault.setReleaseDelay(0);
+        vault.setReleaseDelay(1 hours);
+        vm.stopPrank();
         vm.prank(operator);
         vm.expectRevert(CompagesVault.NotOwner.selector);
-        vault.setReleaseDelay(0);
+        vault.setReleaseDelay(2 hours);
     }
 
     function test_executeRelease_unknownId() public {
@@ -1180,8 +1223,8 @@ contract CompagesVaultTest is Test {
         _lock();
         vm.prank(circle);
         vault.burnLockedUSDC();
-        // 1000 - 100 owed - 300 queued = 600 burned (the cancelled 50 included).
-        assertEq(usdc.balanceOf(address(vault)), 400e6);
+        // 1000 - 100 owed - 300 queued - 50 cancelled = 550 burned.
+        assertEq(usdc.balanceOf(address(vault)), 450e6);
 
         // The committed amounts are still paid.
         vm.prank(owner);
@@ -1190,7 +1233,8 @@ contract CompagesVaultTest is Test {
         vault.claim(address(usdc), payable(bob));
         vm.warp(block.timestamp + DELAY);
         vault.executeRelease(keccak256("queued"));
-        assertEq(usdc.balanceOf(address(vault)), 0);
+        assertEq(usdc.balanceOf(address(vault)), 50e6);
+        assertEq(vault.cancelledTotal(address(usdc)), 50e6);
     }
 
     function test_burnLockedUSDC_revertsWhenTheTokenCannotBurn() public {
@@ -1256,6 +1300,241 @@ contract CompagesVaultTest is Test {
         vm.prank(owner);
         vm.expectRevert(CompagesVault.EtherTransferFailed.selector);
         vault.rebalanceOut(ETH, payable(address(r)), 1 ether, "x");
+    }
+
+    // ------------------------------------------------------------------
+    // reservation of queued and cancelled releases
+    // ------------------------------------------------------------------
+
+    function test_regression_rebalanceCannotSpendQueuedFunds() public {
+        _escrow(100e6);
+        bytes32 id = keccak256("r1");
+        vm.prank(operator);
+        vault.release(address(token), payable(alice), 100e6, id); // unconfigured: queued
+        assertEq(vault.unreservedBalance(address(token)), 0);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 100e6, 0)
+        );
+        vault.rebalanceOut(address(token), payable(owner), 100e6, "x");
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(id);
+        assertEq(token.balanceOf(alice), 1_000_000e6);
+    }
+
+    function test_regression_immediatePayoutCannotSpendQueuedFunds() public {
+        _escrow(100e6);
+        vm.prank(operator);
+        vault.release(address(token), payable(alice), 100e6, keccak256("big")); // queued
+        _unlimit(address(token));
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 100e6, 0)
+        );
+        vault.release(address(token), payable(bob), 100e6, keccak256("small"));
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(keccak256("big"));
+    }
+
+    function test_regression_guardianCancelDoesNotMakeEscrowBurnable() public {
+        _escrow(100e6);
+        vm.prank(operator);
+        vault.release(address(token), payable(alice), 40e6, keccak256("q"));
+        address burner = makeAddr("burner");
+        vm.prank(owner);
+        vault.setStablecoinBurner(address(token), burner);
+        vm.startPrank(guardian);
+        vault.pauseDeposits();
+        vault.pauseReleases();
+        vault.cancelRelease(keccak256("q"));
+        vm.stopPrank();
+        assertEq(vault.cancelledTotal(address(token)), 40e6);
+        vm.prank(burner);
+        vault.burnLockedUSDC();
+        assertEq(token.balanceOf(address(vault)), 40e6); // the cancelled release survives
+
+        // The owner can still reinstate and pay it.
+        vm.startPrank(owner);
+        vault.unpauseReleases();
+        vault.reinstateRelease(keccak256("q"));
+        vm.stopPrank();
+        assertEq(vault.cancelledTotal(address(token)), 0);
+        assertEq(vault.queuedTotal(address(token)), 40e6);
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(keccak256("q"));
+        assertEq(token.balanceOf(address(vault)), 0);
+    }
+
+    function test_cancelledFundsStayReserved() public {
+        _escrow(100e6);
+        vm.prank(operator);
+        vault.release(address(token), payable(alice), 70e6, keccak256("c"));
+        vm.prank(guardian);
+        vault.cancelRelease(keccak256("c"));
+        assertEq(vault.unreservedBalance(address(token)), 30e6);
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 31e6, 30e6)
+        );
+        vault.rebalanceOut(address(token), payable(owner), 31e6, "x");
+    }
+
+    function test_discardCancelledRelease_clearsABogusQueueEntry() public {
+        // A compromised operator queues an absurd release; the guardian
+        // cancels it; while it is reserved nothing else can move.
+        _escrow(100e6);
+        bytes32 bogus = keccak256("bogus");
+        vm.prank(operator);
+        vault.release(address(token), payable(operator), type(uint128).max, bogus); // over any limit: queued
+        vm.prank(guardian);
+        vault.cancelRelease(bogus);
+        _unlimit(address(token));
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 1e6, 0));
+        vault.release(address(token), payable(bob), 1e6, keccak256("legit"));
+
+        vm.prank(guardian);
+        vm.expectRevert(CompagesVault.NotOwner.selector);
+        vault.discardCancelledRelease(bogus);
+        vm.prank(owner);
+        vault.discardCancelledRelease(bogus);
+        assertEq(uint8(_state(bogus)), uint8(CompagesVault.ReleaseState.Discarded));
+        assertEq(vault.cancelledTotal(address(token)), 0);
+        assertTrue(vault.processedRedemptions(bogus));
+
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 1e6, keccak256("legit"));
+        assertEq(token.balanceOf(bob), 1e6);
+
+        // A discarded entry can be neither reinstated, amended nor executed.
+        vm.startPrank(owner);
+        vm.expectRevert(CompagesVault.NotCancelled.selector);
+        vault.reinstateRelease(bogus);
+        vm.expectRevert(CompagesVault.NotCancelled.selector);
+        vault.discardCancelledRelease(bogus);
+        vm.expectRevert(CompagesVault.NotCancelled.selector);
+        vault.amendCancelledRelease(bogus, false, bob, 0, bytes32(0), 0);
+        vm.stopPrank();
+        vm.expectRevert(CompagesVault.NotQueued.selector);
+        vault.executeRelease(bogus);
+    }
+
+    function test_amendCancelledRelease_direct() public {
+        _fund();
+        RejectingReceiver r = new RejectingReceiver();
+        bytes32 id = keccak256("amend");
+        vm.prank(operator);
+        vault.release(ETH, payable(address(r)), 1 ether, id); // queued
+        vm.prank(guardian);
+        vault.cancelRelease(id);
+
+        vm.startPrank(owner);
+        vm.expectRevert(CompagesVault.InvalidRecipient.selector);
+        vault.amendCancelledRelease(id, false, address(0), 0, bytes32(0), 0);
+        vm.expectRevert(CompagesVault.InvalidRecipient.selector);
+        vault.amendCancelledRelease(id, false, address(vault), 0, bytes32(0), 0);
+        // Ether cannot be sent over CCTP.
+        vm.expectRevert(CompagesVault.CctpDisabled.selector);
+        vault.amendCancelledRelease(id, true, address(0), 5, keccak256("x"), 0);
+        vm.stopPrank();
+
+        vm.prank(guardian);
+        vm.expectRevert(CompagesVault.NotOwner.selector);
+        vault.amendCancelledRelease(id, false, carol, 0, bytes32(0), 0);
+
+        vm.startPrank(owner);
+        vault.amendCancelledRelease(id, false, carol, 7, keccak256("ignored"), 3);
+        (bool viaCctp, uint32 domain, bytes32 recipient, uint256 maxFee) = vault.queuedCctpRelease(id);
+        assertFalse(viaCctp);
+        assertEq(domain, 0);
+        assertEq(recipient, bytes32(0));
+        assertEq(maxFee, 0);
+        vault.reinstateRelease(id);
+        vm.stopPrank();
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(id);
+        assertEq(carol.balance, 1 ether);
+    }
+
+    function test_amendCancelledRelease_onlyCancelled() public {
+        _escrow(100e6);
+        bytes32 id = keccak256("q");
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 1e6, id);
+        vm.prank(owner);
+        vm.expectRevert(CompagesVault.NotCancelled.selector);
+        vault.amendCancelledRelease(id, false, carol, 0, bytes32(0), 0);
+        vm.prank(owner);
+        vm.expectRevert(CompagesVault.NotCancelled.selector);
+        vault.amendCancelledRelease(keccak256("unknown"), false, carol, 0, bytes32(0), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // ether funding
+    // ------------------------------------------------------------------
+
+    event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender);
+
+    function test_regression_etherCanMoveBetweenVaults() public {
+        CompagesVault other = new CompagesVault(owner, operator, guardian, DELAY);
+        vm.prank(alice);
+        vault.depositEther{value: 1 ether}(SEQ_ADDR);
+
+        // A vault has no receive(), so it cannot be a rebalance target directly...
+        vm.prank(owner);
+        vm.expectRevert(CompagesVault.EtherTransferFailed.selector);
+        vault.rebalanceOut(ETH, payable(address(other)), 1 ether, "vault2");
+
+        // ...but the owner can carry the ether across with fundEther.
+        vm.prank(owner);
+        vault.rebalanceOut(ETH, payable(owner), 1 ether, "vault2");
+        vm.prank(owner);
+        vm.expectEmit(true, true, true, true, address(other));
+        emit RebalancedIn(ETH, 1 ether, type(uint32).max, bytes32(uint256(uint160(owner))));
+        other.fundEther{value: 1 ether}();
+        assertEq(address(other).balance, 1 ether);
+        assertEq(other.depositCount(), 0);
+    }
+
+    function test_fundEther_onlyOwnerAndNonZero() public {
+        vm.deal(owner, 1 ether);
+        vm.prank(owner);
+        vm.expectRevert(CompagesVault.ZeroAmount.selector);
+        vault.fundEther{value: 0}();
+        vm.deal(operator, 1 ether);
+        vm.prank(operator);
+        vm.expectRevert(CompagesVault.NotOwner.selector);
+        vault.fundEther{value: 1}();
+        // Plain ether sent to the vault is refused.
+        vm.prank(alice);
+        (bool ok,) = address(vault).call{value: 1}("");
+        assertFalse(ok);
+    }
+
+    // ------------------------------------------------------------------
+    // payout gas
+    // ------------------------------------------------------------------
+
+    /// Whatever gas the executor supplies, a recipient that needs the full
+    /// PAYOUT_GAS either gets it or the call reverts: starvation never turns
+    /// into a deferral.
+    function test_regression_gasFloorNeverStarves() public {
+        vm.deal(address(vault), 1000 ether);
+        uint256 deferred;
+        for (uint256 g = 200_000; g < 400_000; g += 500) {
+            PickyReceiver r = new PickyReceiver();
+            vm.prank(operator);
+            vault.release(ETH, payable(address(r)), 1, keccak256(abi.encode(g)));
+        }
+        vm.warp(block.timestamp + DELAY + 1);
+        for (uint256 g = 200_000; g < 400_000; g += 500) {
+            bytes32 id = keccak256(abi.encode(g));
+            (, address to,,,,) = vault.queuedRelease(id);
+            try vault.executeRelease{gas: g}(id) {
+                if (!PickyReceiver(payable(to)).got()) deferred++;
+            } catch {}
+        }
+        assertEq(deferred, 0);
     }
 
     // ------------------------------------------------------------------

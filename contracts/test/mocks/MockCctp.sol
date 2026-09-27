@@ -118,6 +118,10 @@ contract MockTokenMessengerV2 {
         transmitter = t;
     }
 
+    function setFeeRecipient(address r) external {
+        feeRecipient = r;
+    }
+
     function localMessageTransmitter() external view returns (address) {
         return address(transmitter);
     }

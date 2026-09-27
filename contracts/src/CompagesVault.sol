@@ -57,6 +57,8 @@ interface ICctpMessageTransmitterV2 {
 /// can cancel it. Anyone may execute a queued release once its delay has
 /// passed. A token with no configured bucket has capacity zero, so every
 /// release of it is queued: the safe default for an arbitrary ERC-20.
+/// Queued releases, and cancelled ones the owner may reinstate, are reserved:
+/// no immediate payout or rebalance can spend the funds they will need.
 ///
 /// Undeliverable payouts. A payout the recipient cannot accept (a contract or
 /// EIP-7702 account that rejects plain ether, a blocklisted recipient, a
@@ -92,8 +94,15 @@ contract CompagesVault {
 
     uint256 public constant VERSION = 3;
 
-    /// @notice Upper bound on the timelock applied to queued releases.
+    /// @notice Bounds on the timelock applied to queued releases. The lower
+    ///         bound keeps the queue meaningful: with no delay, a release over
+    ///         the rate limit could be executed before anyone could cancel it.
+    uint256 public constant MIN_RELEASE_DELAY = 1 hours;
     uint256 public constant MAX_RELEASE_DELAY = 30 days;
+
+    /// @notice sourceDomain reported by RebalancedIn for ether the owner adds
+    ///         with fundEther(): no CCTP domain has this number.
+    uint32 public constant FUNDING_DOMAIN = type(uint32).max;
 
     /// @notice Gas forwarded to a recipient or token on a direct release,
     ///         refund or queued execution.
@@ -149,7 +158,8 @@ contract CompagesVault {
         None, // never queued: either unknown or settled immediately
         Queued, // waiting for its delay, executable afterwards
         Cancelled, // stopped by the guardian or owner; owner may reinstate
-        Executed // paid out, burned via CCTP, or deferred to an owed balance
+        Executed, // paid out, burned via CCTP, or deferred to an owed balance
+        Discarded // cancelled and then dropped by the owner; never payable
     }
 
     struct QueuedRelease {
@@ -242,6 +252,12 @@ contract CompagesVault {
     ///         per token. Left untouched by a stablecoin burn.
     mapping(address => uint256) public queuedTotal;
 
+    /// @notice Sum of the amounts of releases currently in the Cancelled
+    ///         state, per token. Their Sequentia side is already settled and
+    ///         the owner may reinstate them, so they stay reserved until the
+    ///         owner reinstates or discards them.
+    mapping(address => uint256) public cancelledTotal;
+
     mapping(bytes32 => QueuedRelease) private _queue;
 
     // ------------------------------------------------------------------
@@ -262,6 +278,16 @@ contract CompagesVault {
     );
     /// @notice USDC arrived over CCTP tagged as liquidity, not a deposit.
     event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender);
+    /// @notice A CCTP burn naming this vault as destinationCaller but minting
+    ///         to `mintRecipient` was relayed through it. Nothing was credited.
+    event CctpForwarded(uint32 indexed sourceDomain, bytes32 indexed mintRecipient, bytes32 cctpNonce);
+    /// @notice USDC arrived over CCTP with hookData that is neither a
+    ///         well-formed deposit nor the rebalance tag. The dollars are kept
+    ///         and reported so the daemon can send them back to `sender` on
+    ///         `sourceDomain` with refundViaCctp.
+    event CctpUnrecognized(
+        uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount, bytes hookData
+    );
     /// @notice Funds reached the recipient against a redemption.
     event Released(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount);
     /// @notice Funds reached the depositor against a refund.
@@ -282,6 +308,15 @@ contract CompagesVault {
     );
     event ReleaseCancelled(bytes32 indexed redemptionId, address indexed by);
     event ReleaseReinstated(bytes32 indexed redemptionId, uint256 executeAfter);
+    event ReleaseAmended(
+        bytes32 indexed redemptionId,
+        bool viaCctp,
+        address to,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        uint256 maxFee
+    );
+    event ReleaseDiscarded(bytes32 indexed redemptionId);
     /// @notice The recipient could not accept the payout; it is now owed and
     ///         claimable. The id counts as processed.
     event ReleaseDeferred(bytes32 indexed redemptionId, address indexed token, address indexed to, uint256 amount);
@@ -343,6 +378,7 @@ contract CompagesVault {
     error DepositCapExceeded(uint256 cap);
     error ValueTooLarge();
     error DelayTooLong();
+    error DelayTooShort();
     error AlreadyReleased();
     error NotQueued();
     error NotCancelled();
@@ -356,7 +392,6 @@ contract CompagesVault {
     error CctpDisabled();
     error CctpMisconfigured();
     error CctpBadMessage();
-    error CctpBadHookData();
     error CctpNothingMinted();
     error CctpBurnFailed();
     error MaxFeeTooHigh();
@@ -406,6 +441,7 @@ contract CompagesVault {
     constructor(address owner_, address operator_, address guardian_, uint256 releaseDelay_) {
         if (owner_ == address(0) || operator_ == address(0) || guardian_ == address(0)) revert ZeroAddress();
         if (releaseDelay_ > MAX_RELEASE_DELAY) revert DelayTooLong();
+        if (releaseDelay_ < MIN_RELEASE_DELAY) revert DelayTooShort();
         owner = owner_;
         operator = operator_;
         guardian = guardian_;
@@ -464,59 +500,91 @@ contract CompagesVault {
     ///         relay it.
     ///
     /// The burn on the source chain names this vault as mintRecipient and, so
-    /// that only this function can complete it, as destinationCaller. Its
-    /// hookData says what the dollars are for:
+    /// that only this function can complete it, as destinationCaller. (A burn
+    /// that leaves destinationCaller empty can also be relayed straight to
+    /// Circle's transmitter, bypassing this function: the USDC then arrives
+    /// with no event here, as an unaccounted donation.) Its hookData says what
+    /// the dollars are for:
     /// - CCTP_DEPOSIT_TAG followed by a Sequentia address (14 to 120 bytes): a
     ///   deposit. Emits Deposited (from = address(0)) and CctpDeposit with the
-    ///   same nonce.
+    ///   same nonce. Reverts while deposits are paused; the message stays
+    ///   valid and can be relayed again after unpausing.
     /// - exactly CCTP_REBALANCE_TAG: liquidity from another escrow. Emits
     ///   RebalancedIn and creates no deposit.
-    /// Anything else reverts, leaving the message unreceived rather than
-    /// turning it into an unaccounted donation. The credited amount is the
-    /// USDC balance change across the mint, never the message's own figures.
-    /// A deposit reverts while deposits are paused; the message stays valid
-    /// and can be relayed again after unpausing. Deposit minimums, caps and
-    /// token blocking do not apply here: the dollars are already minted, and
-    /// the daemon refunds what it cannot bridge.
+    /// - anything else: the mint is still completed, because with this vault
+    ///   as destinationCaller nothing else could ever complete it, and
+    ///   CctpUnrecognized reports it for refunding.
+    /// A burn that mints to someone other than this vault is relayed for the
+    /// same reason, credits nothing and emits CctpForwarded; it reverts if the
+    /// vault's USDC balance would change.
+    /// The credited amount is the USDC balance change across the mint, never
+    /// the message's own figures. Deposit minimums, caps and token blocking do
+    /// not apply here: the dollars are already minted, and the daemon refunds
+    /// what it cannot bridge.
     function receiveCctp(bytes calldata message, bytes calldata attestation) external nonReentrant {
         address transmitter = cctpMessageTransmitter;
         address usdc = cctpUsdc;
         if (transmitter == address(0)) revert CctpDisabled();
         if (message.length < BURN_HOOK) revert CctpBadMessage();
         // The message must be addressed to the local TokenMessenger, so its
-        // body is a burn message the messenger validates, and mint to us.
-        // mintRecipient is read the way Circle reads it: its low 160 bits.
+        // body is a burn message the messenger validates. The vault never
+        // relays anything else in its own name.
         if (bytes32(message[76:108]) != bytes32(uint256(uint160(cctpTokenMessenger)))) revert CctpBadMessage();
+        // mintRecipient is read the way Circle reads it: its low 160 bits.
         if (address(uint160(uint256(bytes32(message[MSG_BODY + 36:MSG_BODY + 68])))) != address(this)) {
-            revert CctpBadMessage();
+            _forwardCctp(message, attestation, transmitter, usdc);
+            return;
         }
 
-        bytes calldata hook = message[BURN_HOOK:];
-        uint256 tagLen = CCTP_DEPOSIT_TAG.length;
-        bool isDeposit = hook.length >= tagLen && keccak256(hook[:tagLen]) == keccak256(CCTP_DEPOSIT_TAG);
-        if (isDeposit) {
-            _checkSequentiaAddress(hook.length - tagLen);
-            if (depositsPaused) revert DepositsArePaused();
-        } else if (keccak256(hook) != keccak256(CCTP_REBALANCE_TAG)) {
-            revert CctpBadHookData();
-        }
+        uint8 kind = _cctpKind(message[BURN_HOOK:]);
+        if (kind == CCTP_DEPOSIT && depositsPaused) revert DepositsArePaused();
 
         uint256 before = _balanceOf(usdc);
         if (!ICctpMessageTransmitterV2(transmitter).receiveMessage(message, attestation)) revert CctpBadMessage();
         uint256 credited = _balanceOf(usdc) - before;
         if (credited == 0) revert CctpNothingMinted();
-        _recordCctpArrival(message, usdc, credited, isDeposit);
+        _recordCctpArrival(message, usdc, credited, kind);
     }
 
-    function _recordCctpArrival(bytes calldata message, address usdc, uint256 credited, bool isDeposit) private {
+    /// @dev A burn that names this vault as destinationCaller but mints to
+    ///      someone else can only be completed here, so it is relayed rather
+    ///      than stranded. Nothing is credited, and the vault's USDC balance
+    ///      must not move across it.
+    function _forwardCctp(bytes calldata message, bytes calldata attestation, address transmitter, address usdc)
+        private
+    {
+        uint256 before = _balanceOf(usdc);
+        if (!ICctpMessageTransmitterV2(transmitter).receiveMessage(message, attestation)) revert CctpBadMessage();
+        if (_balanceOf(usdc) != before) revert CctpBadMessage();
+        emit CctpForwarded(
+            uint32(bytes4(message[4:8])), bytes32(message[MSG_BODY + 36:MSG_BODY + 68]), bytes32(message[12:44])
+        );
+    }
+
+    uint8 private constant CCTP_DEPOSIT = 0;
+    uint8 private constant CCTP_REBALANCE = 1;
+    uint8 private constant CCTP_UNRECOGNIZED = 2;
+
+    function _cctpKind(bytes calldata hook) private pure returns (uint8) {
+        uint256 tagLen = CCTP_DEPOSIT_TAG.length;
+        if (hook.length >= tagLen && keccak256(hook[:tagLen]) == keccak256(CCTP_DEPOSIT_TAG)) {
+            uint256 len = hook.length - tagLen;
+            return len >= 14 && len <= 120 ? CCTP_DEPOSIT : CCTP_UNRECOGNIZED;
+        }
+        return keccak256(hook) == keccak256(CCTP_REBALANCE_TAG) ? CCTP_REBALANCE : CCTP_UNRECOGNIZED;
+    }
+
+    function _recordCctpArrival(bytes calldata message, address usdc, uint256 credited, uint8 kind) private {
         uint32 sourceDomain = uint32(bytes4(message[4:8]));
         bytes32 sender = bytes32(message[MSG_BODY + 100:MSG_BODY + 132]);
-        if (isDeposit) {
+        if (kind == CCTP_DEPOSIT) {
             uint256 nonce = depositCount++;
             emit Deposited(nonce, usdc, address(0), credited, string(message[BURN_HOOK + CCTP_DEPOSIT_TAG.length:]));
             emit CctpDeposit(nonce, sourceDomain, sender, bytes32(message[12:44]), credited);
-        } else {
+        } else if (kind == CCTP_REBALANCE) {
             emit RebalancedIn(usdc, credited, sourceDomain, sender);
+        } else {
+            emit CctpUnrecognized(sourceDomain, sender, bytes32(message[12:44]), credited, message[BURN_HOOK:]);
         }
     }
 
@@ -598,7 +666,9 @@ contract CompagesVault {
         address token = q.token;
         uint256 amount = q.amount;
         if (q.viaCctp && token != cctpUsdc) revert CctpDisabled();
-        _requireUnreserved(token, amount);
+        // This release is leaving the queue, so its own amount is not held
+        // back from it.
+        _requireUnreserved(token, amount, amount);
         q.state = ReleaseState.Executed;
         queuedTotal[token] -= amount;
         if (q.viaCctp) {
@@ -615,6 +685,7 @@ contract CompagesVault {
         if (q.state != ReleaseState.Queued) revert NotQueued();
         q.state = ReleaseState.Cancelled;
         queuedTotal[q.token] -= q.amount;
+        cancelledTotal[q.token] += q.amount;
         emit ReleaseCancelled(redemptionId, msg.sender);
     }
 
@@ -625,15 +696,64 @@ contract CompagesVault {
         uint64 executeAfter = uint64(block.timestamp) + releaseDelay;
         q.state = ReleaseState.Queued;
         q.executeAfter = executeAfter;
+        cancelledTotal[q.token] -= q.amount;
         queuedTotal[q.token] += q.amount;
         emit ReleaseReinstated(redemptionId, executeAfter);
+    }
+
+    /// @notice Change where a cancelled release pays out, for one whose
+    ///         destination stopped working (a CCTP domain or recipient that
+    ///         fails, a recipient that should be paid on another chain). The
+    ///         token, amount and release/refund kind stay as they were; the
+    ///         owner then reinstates it, which restarts its delay.
+    function amendCancelledRelease(
+        bytes32 redemptionId,
+        bool viaCctp,
+        address to,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        uint256 maxFee
+    ) external onlyOwner {
+        QueuedRelease storage q = _queue[redemptionId];
+        if (q.state != ReleaseState.Cancelled) revert NotCancelled();
+        if (viaCctp) {
+            if (q.token != cctpUsdc || q.token == address(0)) revert CctpDisabled();
+            if (mintRecipient == bytes32(0)) revert InvalidRecipient();
+            if (maxFee >= q.amount) revert MaxFeeTooHigh();
+            to = address(0);
+        } else {
+            if (to == address(0) || to == address(this)) revert InvalidRecipient();
+            destinationDomain = 0;
+            mintRecipient = bytes32(0);
+            maxFee = 0;
+        }
+        q.viaCctp = viaCctp;
+        q.to = to;
+        q.destinationDomain = destinationDomain;
+        q.mintRecipient = mintRecipient;
+        q.maxFee = maxFee;
+        emit ReleaseAmended(redemptionId, viaCctp, to, destinationDomain, mintRecipient, maxFee);
+    }
+
+    /// @notice Drop a cancelled release for good, releasing its reservation.
+    ///         Its id stays processed, so it can never be paid. This is how
+    ///         the owner clears a bogus entry queued with a compromised
+    ///         operator key after the guardian cancels it.
+    function discardCancelledRelease(bytes32 redemptionId) external onlyOwner {
+        QueuedRelease storage q = _queue[redemptionId];
+        if (q.state != ReleaseState.Cancelled) revert NotCancelled();
+        q.state = ReleaseState.Discarded;
+        cancelledTotal[q.token] -= q.amount;
+        emit ReleaseDiscarded(redemptionId);
     }
 
     /// @notice Withdraw everything owed to the caller in `token` to `payTo`.
     /// @dev Not stopped by the release pause: owed funds were already paid out
     ///      as far as the bridge is concerned, and are excluded from both the
     ///      releasable balance and a stablecoin burn. Reverts if the transfer
-    ///      fails, so the caller can retry with another address.
+    ///      fails, so the caller can retry with another address. Only the owed
+    ///      account can claim: a contract that can neither accept the payout
+    ///      nor make calls can never collect it.
     function claim(address token, address payable payTo) external nonReentrant {
         if (payTo == address(0) || payTo == address(this)) revert InvalidRecipient();
         uint256 amount = owed[token][msg.sender];
@@ -678,11 +798,13 @@ contract CompagesVault {
         return _bucketLevel(releaseBuckets[token]);
     }
 
-    /// @notice The vault's balance of `token` minus what it owes to claimants:
-    ///         the most a single payout or rebalance can take.
+    /// @notice The vault's balance of `token` minus everything committed to
+    ///         individual users: owed to claimants, queued, and cancelled but
+    ///         reinstatable. The most an immediate payout or a rebalance can
+    ///         take.
     function unreservedBalance(address token) external view returns (uint256) {
         uint256 balance = token == address(0) ? address(this).balance : _balanceOf(token);
-        uint256 reserved = owedTotal[token];
+        uint256 reserved = _reserved(token);
         return balance > reserved ? balance - reserved : 0;
     }
 
@@ -734,6 +856,7 @@ contract CompagesVault {
 
     function setReleaseDelay(uint256 newDelay) external onlyOwner {
         if (newDelay > MAX_RELEASE_DELAY) revert DelayTooLong();
+        if (newDelay < MIN_RELEASE_DELAY) revert DelayTooShort();
         emit ReleaseDelaySet(releaseDelay, newDelay);
         // forge-lint: disable-next-line(unsafe-typecast) -- at most MAX_RELEASE_DELAY
         releaseDelay = uint64(newDelay);
@@ -856,8 +979,9 @@ contract CompagesVault {
     /// asset on Sequentia stops being backed by tokens held here and becomes a
     /// direct liability of the issuer instead. It burns the whole balance
     /// except what is already committed to individual users whose Sequentia
-    /// side is settled - amounts owed to claimants (owedTotal) and releases
-    /// waiting in the queue (queuedTotal) - rather than an amount passed in,
+    /// side is settled - amounts owed to claimants (owedTotal), releases
+    /// waiting in the queue (queuedTotal) and cancelled releases the owner may
+    /// still reinstate (cancelledTotal) - rather than an amount passed in,
     /// because the supply lock has already made that remainder equal to the
     /// circulating supply on Sequentia; letting a caller name an amount would
     /// just add a way to get it wrong. The committed amounts stay here and are
@@ -866,8 +990,9 @@ contract CompagesVault {
     /// Requires the supply to be locked, so the equality being relied on
     /// cannot change under the burn. Burning uses the token's own burn
     /// function, which for a fiat-backed stablecoin the issuer authorizes this
-    /// vault to call as part of the hand-off. A cancelled release is no longer
-    /// committed; the owner reinstates any legitimate one before the burn.
+    /// vault to call as part of the hand-off. A cancelled release stays
+    /// reserved until the owner reinstates or discards it, so a guardian
+    /// cancel can never make a user's escrow burnable.
     function burnLockedUSDC() external nonReentrant {
         if (msg.sender != stablecoinBurner) revert NotBurner();
         address token = lockedStablecoin;
@@ -875,7 +1000,7 @@ contract CompagesVault {
         if (!depositsPaused || !releasesPaused) revert SupplyNotLocked();
 
         uint256 balance = _balanceOf(token);
-        uint256 reserved = owedTotal[token] + queuedTotal[token];
+        uint256 reserved = _reserved(token);
         if (balance <= reserved) revert ZeroAmount();
         uint256 amount = balance - reserved;
         (bool ok,) = token.call(abi.encodeWithSignature("burn(uint256)", amount));
@@ -897,8 +1022,8 @@ contract CompagesVault {
     /// event rather than reusing Released, so that an auditor reconciling the
     /// escrow can always tell liquidity movements from user redemptions;
     /// `destination` records where the value went. It cannot touch amounts
-    /// owed to claimants, and it is stopped by the release pause so a locked
-    /// supply stays locked.
+    /// committed to users (owed, queued or cancelled-but-reinstatable), and it
+    /// is stopped by the release pause so a locked supply stays locked.
     function rebalanceOut(address token, address payable to, uint256 amount, string calldata destination)
         external
         onlyOwner
@@ -907,9 +1032,19 @@ contract CompagesVault {
         if (releasesPaused) revert ReleasesArePaused();
         if (to == address(0) || to == address(this)) revert InvalidRecipient();
         if (amount == 0) revert ZeroAmount();
-        _requireUnreserved(token, amount);
+        _requireUnreserved(token, amount, 0);
         _transferOrRevert(token, to, amount);
         emit Rebalanced(token, to, amount, destination);
+    }
+
+    /// @notice Add ether escrow without creating a deposit: the counterpart of
+    ///         rebalanceOut for ether, which has no other way in. Emits
+    ///         RebalancedIn with sourceDomain FUNDING_DOMAIN and the funder as
+    ///         sender. The vault deliberately has no receive(), so ether sent
+    ///         to it any other way is refused.
+    function fundEther() external payable onlyOwner nonReentrant {
+        if (msg.value == 0) revert ZeroAmount();
+        emit RebalancedIn(address(0), msg.value, FUNDING_DOMAIN, bytes32(uint256(uint160(msg.sender))));
     }
 
     // ------------------------------------------------------------------
@@ -961,7 +1096,7 @@ contract CompagesVault {
         Bucket storage b = releaseBuckets[token];
         uint256 level = _bucketLevel(b);
         if (amount > level) return false;
-        _requireUnreserved(token, amount);
+        _requireUnreserved(token, amount, 0);
         // forge-lint: disable-next-line(unsafe-typecast) -- level <= capacity, a uint128
         b.available = uint128(level - amount);
         b.updatedAt = uint64(block.timestamp);
@@ -1066,9 +1201,18 @@ contract CompagesVault {
         if (ok) ok = returnSize == 0 ? token.code.length != 0 : (returnSize >= 32 && returnWord == 1);
     }
 
-    function _requireUnreserved(address token, uint256 amount) private view {
+    /// @dev Everything committed to individual users whose Sequentia side is
+    ///      already settled: owed, queued, and cancelled (reinstatable).
+    function _reserved(address token) private view returns (uint256) {
+        return owedTotal[token] + queuedTotal[token] + cancelledTotal[token];
+    }
+
+    /// @dev Revert unless the balance, less what is reserved for others,
+    ///      covers `amount`. `ownShare` is the part of the reservation that
+    ///      belongs to this very payout (a queued release being executed).
+    function _requireUnreserved(address token, uint256 amount, uint256 ownShare) private view {
         uint256 balance = token == address(0) ? address(this).balance : _balanceOf(token);
-        uint256 reserved = owedTotal[token];
+        uint256 reserved = _reserved(token) - ownShare;
         uint256 unreserved = balance > reserved ? balance - reserved : 0;
         if (amount > unreserved) revert InsufficientVaultBalance(token, amount, unreserved);
     }

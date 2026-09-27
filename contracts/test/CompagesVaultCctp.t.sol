@@ -36,6 +36,18 @@ contract CompagesVaultCctpTest is Test {
         uint256 indexed nonce, uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount
     );
     event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender);
+    event CctpForwarded(uint32 indexed sourceDomain, bytes32 indexed mintRecipient, bytes32 cctpNonce);
+    event CctpUnrecognized(
+        uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount, bytes hookData
+    );
+    event ReleaseAmended(
+        bytes32 indexed redemptionId,
+        bool viaCctp,
+        address to,
+        uint32 destinationDomain,
+        bytes32 mintRecipient,
+        uint256 maxFee
+    );
     event ReleasedViaCctp(
         bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount
     );
@@ -273,21 +285,60 @@ contract CompagesVaultCctpTest is Test {
         assertEq(usdc.balanceOf(address(vault)), 10e6 - 1e4);
     }
 
-    function test_receive_wrongMintRecipientReverts() public {
-        bytes memory m = _message(
-            SOLANA,
-            0,
-            keccak256("n3"),
-            REMOTE_TM,
-            _b32(address(messenger)),
-            bytes32(0),
-            2000,
-            2000,
-            _burnBody(SOL_USDC, _b32(alice), 10e6, SOL_SENDER, 0, 0, 0, _depositHook(SEQ_ADDR))
-        );
+    function _toAlice(bytes32 nonce, uint256 fee) internal view returns (bytes memory) {
+        bytes memory body = _burnBody(SOL_USDC, _b32(alice), 10e6, SOL_SENDER, fee, fee, 0, _depositHook(SEQ_ADDR));
+        return _message(SOLANA, 0, nonce, REMOTE_TM, _b32(address(messenger)), _b32(address(vault)), 2000, 2000, body);
+    }
+
+    /// A burn that names the vault as destinationCaller but mints to someone
+    /// else can only be completed by the vault: it is relayed, not stranded.
+    function test_receive_otherMintRecipient_isForwarded() public {
+        _depositViaCctp(50e6);
+        uint256 countBefore = vault.depositCount();
+        bytes memory m = _toAlice(keccak256("n3"), 0);
+        vm.expectRevert("Invalid caller for message");
+        transmitter.receiveMessage(m, ATTESTATION);
+
+        vm.recordLogs();
         vm.prank(relayer);
+        vault.receiveCctp(m, ATTESTATION);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(usdc.balanceOf(alice), 10e6);
+        assertEq(usdc.balanceOf(address(vault)), 50e6);
+        assertEq(vault.depositCount(), countBefore);
+        uint256 seen;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter != address(vault)) continue;
+            seen++;
+            assertEq(logs[i].topics[0], CctpForwarded.selector);
+            assertEq(logs[i].topics[1], bytes32(uint256(SOLANA)));
+            assertEq(logs[i].topics[2], _b32(alice));
+            assertEq(abi.decode(logs[i].data, (bytes32)), keccak256("n3"));
+        }
+        assertEq(seen, 1);
+
+        // Forwarding does not bypass the transmitter's replay guard.
+        vm.expectRevert("Nonce already used");
+        vault.receiveCctp(m, ATTESTATION);
+    }
+
+    function test_receive_forwardMustNotMoveVaultFunds() public {
+        _depositViaCctp(50e6);
+        // Circle's fee on the forwarded mint would land in the vault.
+        messenger.setFeeRecipient(address(vault));
+        bytes memory m = _toAlice(keccak256("fee"), 1e6);
         vm.expectRevert(CompagesVault.CctpBadMessage.selector);
         vault.receiveCctp(m, ATTESTATION);
+        assertEq(usdc.balanceOf(address(vault)), 50e6);
+        assertEq(usdc.balanceOf(alice), 0);
+    }
+
+    function test_receive_forwardWorksWhileDepositsPaused() public {
+        vm.prank(guardian);
+        vault.pauseDeposits();
+        vault.receiveCctp(_toAlice(keccak256("p"), 0), ATTESTATION);
+        assertEq(usdc.balanceOf(alice), 10e6);
     }
 
     function test_receive_messageNotForTheTokenMessengerReverts() public {
@@ -351,7 +402,7 @@ contract CompagesVaultCctpTest is Test {
         vault.receiveCctp(m, "forged");
     }
 
-    function test_receive_malformedHookDataReverts() public {
+    function test_receive_unrecognizedHookData_isKeptAndReported() public {
         bytes[5] memory bad = [
             bytes(""),
             bytes("compages:deposit"),
@@ -360,10 +411,14 @@ contract CompagesVaultCctpTest is Test {
             bytes("something else entirely")
         ];
         for (uint256 i; i < bad.length; i++) {
-            bytes memory m = _inbound(keccak256(abi.encode("bad", i)), _b32(address(vault)), 10e6, 0, bad[i]);
-            vm.expectRevert(CompagesVault.CctpBadHookData.selector);
+            bytes32 nonce = keccak256(abi.encode("bad", i));
+            bytes memory m = _inbound(nonce, _b32(address(vault)), 10e6, 0, bad[i]);
+            vm.expectEmit(true, true, true, true, address(vault));
+            emit CctpUnrecognized(SOLANA, SOL_SENDER, nonce, 10e6, bad[i]);
             vault.receiveCctp(m, ATTESTATION);
         }
+        assertEq(vault.depositCount(), 0);
+        assertEq(usdc.balanceOf(address(vault)), 50e6);
     }
 
     function test_receive_depositAddressLengthBounds() public {
@@ -372,11 +427,12 @@ contract CompagesVaultCctpTest is Test {
         bytes memory a120 = new bytes(120);
         bytes memory a121 = new bytes(121);
         bytes memory m;
+        // Out-of-bounds addresses are not deposits: kept and reported instead.
         m = _inbound(keccak256("l13"), bytes32(0), 1e6, 0, abi.encodePacked("compages:deposit:", a13));
-        vm.expectRevert(CompagesVault.BadSequentiaAddress.selector);
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit CctpUnrecognized(SOLANA, SOL_SENDER, keccak256("l13"), 1e6, abi.encodePacked("compages:deposit:", a13));
         vault.receiveCctp(m, ATTESTATION);
         m = _inbound(keccak256("l121"), bytes32(0), 1e6, 0, abi.encodePacked("compages:deposit:", a121));
-        vm.expectRevert(CompagesVault.BadSequentiaAddress.selector);
         vault.receiveCctp(m, ATTESTATION);
         vault.receiveCctp(
             _inbound(keccak256("l14"), bytes32(0), 1e6, 0, abi.encodePacked("compages:deposit:", a14)), ATTESTATION
@@ -715,5 +771,90 @@ contract CompagesVaultCctpTest is Test {
         vault.burnLockedUSDC();
         // 1500 held - 100 owed - 250 queued = 1150 burned.
         assertEq(usdc.balanceOf(address(vault)), 350e6);
+    }
+
+    // ------------------------------------------------------------------
+    // regressions from review
+    // ------------------------------------------------------------------
+
+    /// A burn addressed to the vault with a malformed deposit tag used to be
+    /// unreceivable forever (only the vault may relay it). It now lands, is
+    /// reported, and can be refunded to its sender.
+    function test_regression_badHookIsRefundable() public {
+        bytes memory longAddr = new bytes(121);
+        for (uint256 i; i < 121; i++) {
+            longAddr[i] = "a";
+        }
+        bytes memory hook = abi.encodePacked("compages:deposit:", longAddr);
+        bytes memory m = _inbound(keccak256("n1"), _b32(address(vault)), 100e6, 0, hook);
+        vm.expectRevert(bytes("Invalid caller for message"));
+        transmitter.receiveMessage(m, ATTESTATION);
+
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit CctpUnrecognized(SOLANA, SOL_SENDER, keccak256("n1"), 100e6, hook);
+        vm.prank(relayer);
+        vault.receiveCctp(m, ATTESTATION);
+        assertEq(usdc.balanceOf(address(vault)), 100e6);
+        assertEq(vault.depositCount(), 0);
+
+        _usdcLimit(1000e6);
+        vm.prank(operator);
+        vault.refundViaCctp(100e6, SOLANA, SOL_SENDER, keccak256("refund-n1"), 0);
+        assertEq(usdc.balanceOf(address(vault)), 0);
+        assertEq(messenger.lastMintRecipient(), SOL_SENDER);
+    }
+
+    function test_receive_unrecognizedLandsWhileDepositsPaused() public {
+        vm.prank(guardian);
+        vault.pauseDeposits();
+        vault.receiveCctp(_inbound(keccak256("u"), _b32(address(vault)), 5e6, 0, "hello"), ATTESTATION);
+        assertEq(usdc.balanceOf(address(vault)), 5e6);
+    }
+
+    function test_amendCancelledRelease_cctp() public {
+        _depositViaCctp(100e6);
+        bytes32 id = keccak256("stranded");
+        // Queued to a domain with no TokenMessenger: execution would revert forever.
+        vm.prank(operator);
+        vault.releaseViaCctp(40e6, 99, SOL_SENDER, id, 0);
+        vm.warp(block.timestamp + DELAY);
+        vm.expectRevert("No TokenMessenger for domain");
+        vault.executeRelease(id);
+
+        vm.prank(guardian);
+        vault.cancelRelease(id);
+        vm.startPrank(owner);
+        vm.expectRevert(CompagesVault.InvalidRecipient.selector);
+        vault.amendCancelledRelease(id, true, address(0), SOLANA, bytes32(0), 0);
+        vm.expectRevert(CompagesVault.MaxFeeTooHigh.selector);
+        vault.amendCancelledRelease(id, true, address(0), SOLANA, SOL_SENDER, 40e6);
+        vm.expectEmit(true, true, true, true, address(vault));
+        emit ReleaseAmended(id, true, address(0), SOLANA, SOL_SENDER, 1e6);
+        vault.amendCancelledRelease(id, true, alice, SOLANA, SOL_SENDER, 1e6); // `to` is ignored for CCTP
+        (, address to,,,,) = vault.queuedRelease(id);
+        assertEq(to, address(0));
+        vault.reinstateRelease(id);
+        vm.stopPrank();
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(id);
+        assertEq(messenger.lastDestinationDomain(), SOLANA);
+        assertEq(messenger.lastMaxFee(), 1e6);
+        assertEq(usdc.balanceOf(address(vault)), 60e6);
+    }
+
+    function test_amendCancelledRelease_cctpToDirect() public {
+        _depositViaCctp(100e6);
+        bytes32 id = keccak256("to-direct");
+        vm.prank(operator);
+        vault.releaseViaCctp(40e6, 99, SOL_SENDER, id, 0);
+        vm.prank(guardian);
+        vault.cancelRelease(id);
+        vm.startPrank(owner);
+        vault.amendCancelledRelease(id, false, alice, 0, bytes32(0), 0);
+        vault.reinstateRelease(id);
+        vm.stopPrank();
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(id);
+        assertEq(usdc.balanceOf(alice), 40e6);
     }
 }

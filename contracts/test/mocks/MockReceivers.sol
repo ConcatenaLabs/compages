@@ -39,3 +39,14 @@ contract ReentrantReceiver {
         } catch {}
     }
 }
+
+/// @notice Accepts ether only when given at least 200k gas, so a payout that
+///         forwarded less would show up as a deferral.
+contract PickyReceiver {
+    bool public got;
+
+    receive() external payable {
+        if (gasleft() < 200_000) revert("starved");
+        got = true;
+    }
+}

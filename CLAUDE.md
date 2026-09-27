@@ -87,12 +87,18 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   Do not give the operator a way around the bucket or the queue, and do not let a payout the
   recipient refuses revert: it becomes owed (`ReleaseDeferred`) and is claimed, which is what keeps
   one bad recipient from blocking a redemption forever.
-- **Owed and queued amounts are reserved from the hand-off burn.** `burnLockedUSDC` burns the
-  stablecoin balance minus `owedTotal` and `queuedTotal`: those belong to users whose Sequentia side
-  is already settled. `rebalanceOut` and every payout likewise leave `owedTotal` untouched.
-- **An inbound CCTP message with unknown hookData must revert**, never credit. Only
-  `compages:deposit:<Sequentia address>` and exactly `compages:rebalance` are accepted, and the
-  credited amount is the vault's measured USDC balance change, never the message's own figures.
+- **Owed, queued and cancelled amounts are reserved.** `owedTotal + queuedTotal + cancelledTotal`
+  belongs to users whose Sequentia side is already settled: no immediate payout, `rebalanceOut` or
+  `burnLockedUSDC` may spend it, and a queued release executes only while the vault covers all of
+  it. A cancelled entry leaves the reservation only through the owner (`reinstateRelease`, or
+  `discardCancelledRelease` for a bogus one), never through a guardian cancel.
+- **An inbound CCTP mint to the vault must never be refused for its hookData.** With the vault as
+  destinationCaller nothing else can complete it, so a revert would burn the user's USDC for good.
+  `compages:deposit:<14..120-byte address>` is a deposit, exactly `compages:rebalance` is liquidity,
+  anything else lands as `CctpUnrecognized` for a refund, and a mint to another recipient is relayed
+  as `CctpForwarded` without moving vault funds. Only a well-formed deposit may revert
+  (while deposits are paused), because it stays retryable. The credited amount is the vault's
+  measured USDC balance change, never the message's own figures.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
   locked Ethereum funds.
 - **Undeliverable deposits are refunded automatically** — an invalid Sequentia address, or an
