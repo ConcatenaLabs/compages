@@ -131,8 +131,8 @@ code pins it to a particular network. It has only ever run on testnets.
    address works too and hides the amount received on chain, except for
    supervised assets (USDC.e, EURC.e): consensus never lets one sit in a
    blinded output, so the bridge delivers it to the same address's
-   transparent `tb1...` form, the same wallet with the amount visible. The page checks
-   the address with the bridge's node as you type and keeps the deposit
+   transparent `tb1...` form, the same wallet with the amount visible. The
+   page checks the address with the bridge's node as you type and keeps the deposit
    button disabled while it is invalid. When a Sequentia wallet is installed
    in the browser, "Use my Sequentia wallet" fills it in. A preview shows the
    exact amount and ticker you will receive (`SYMBOL.e`) and the expected
