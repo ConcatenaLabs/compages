@@ -316,7 +316,8 @@ it the guardian or owner can `cancelRelease(id)`. A cancelled release stays
 with the owner, who can `reinstateRelease(id)` (queued again with a fresh
 delay), first `amendCancelledRelease` its destination (a different recipient,
 or switching between a direct and a CCTP payout, keeping the token and
-amount), or `discardCancelledRelease(id)` it for good, which is how a bogus
+amount), or `discardCancelledRelease(id)` it for good once `releaseDelay` has
+passed since the cancel (`releaseDiscardableAfter(id)`), which is how a bogus
 entry queued with a stolen operator key is cleared. A token with no bucket has capacity
 zero, so every payout of it is queued. A newly configured bucket starts empty
 and fills at its refill rate, and reconfiguring one never tops it up. An id is
@@ -326,11 +327,13 @@ state.
 
 Queued releases and cancelled ones the owner may still reinstate are
 reserved, like owed amounts: no immediate payout and no rebalance can spend
-the escrow they will need. A queued release executes only while the vault
-covers every reservation, so a shortfall stops the queue until the escrow is
-refilled rather than letting one release take another's funds.
+the escrow they will need. A release is refused outright, paid now or queued,
+when the unreserved balance cannot cover it, so the queue never promises more
+than the vault holds and a stolen operator key cannot reserve a token away.
+Queued releases draw on the escrow first come, first served: executing one
+holds back only owed and cancelled amounts.
 
-**Owed payouts and claims.** Before paying, the vault requires its unreserved
+**Owed payouts and claims.** Before paying or queuing, the vault requires its unreserved
 balance (balance minus what it owes claimants and what queued and cancelled
 releases hold, shown by `unreservedBalance(token)`) to cover the amount, and
 otherwise reverts with `InsufficientVaultBalance` so the payout can be retried
@@ -370,7 +373,9 @@ arrive from and leave to other chains while staying in this one escrow:
   escrow and emits `RebalancedIn`. Anything else, a malformed deposit
   included, is still received, because nothing but the vault could ever
   complete it, and is reported with `CctpUnrecognized(sourceDomain, sender,
-  cctpNonce, amount, hookData)` so it can be refunded with `refundViaCctp`.
+  cctpNonce, amount, hookData)` so it can be refunded with `refundViaCctp`;
+  like a deposit, it waits out a deposit pause, so nothing new becomes
+  burnable while the supply is locked.
   A burn that names the vault as `destinationCaller` but mints to someone
   else is relayed too, for the same reason: it credits nothing, emits
   `CctpForwarded(sourceDomain, mintRecipient, cctpNonce)`, and reverts if it
@@ -751,8 +756,8 @@ deploy script; CCTP tests against mocks that follow Circle's V2 message layout,
 pinned byte for byte to a real Sepolia message; and an invariant suite that
 drives random sequences of every operation and checks that the vault's
 balance always equals what its events credited in less what they paid out,
-that it always covers what it owes, and that no outflow ever spends escrow
-reserved for queued, cancelled or owed amounts:
+that it always covers everything owed, queued or cancelled, and that no
+outflow ever spends that reserved escrow:
 
 ```
 cd contracts

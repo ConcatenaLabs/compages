@@ -804,11 +804,24 @@ contract CompagesVaultCctpTest is Test {
         assertEq(messenger.lastMintRecipient(), SOL_SENDER);
     }
 
-    function test_receive_unrecognizedLandsWhileDepositsPaused() public {
-        vm.prank(guardian);
+    function test_regression_N3_unrecognizedWaitsOutADepositPause() public {
+        address burner = makeAddr("burner");
+        vm.startPrank(owner);
+        vault.setStablecoinBurner(address(usdc), burner);
         vault.pauseDeposits();
-        vault.receiveCctp(_inbound(keccak256("u"), _b32(address(vault)), 5e6, 0, "hello"), ATTESTATION);
-        assertEq(usdc.balanceOf(address(vault)), 5e6);
+        vault.pauseReleases();
+        vm.stopPrank();
+        bytes memory m = _inbound(keccak256("u"), _b32(address(vault)), 70e6, 0, bytes("compages:deposit:short"));
+        vm.expectRevert(CompagesVault.DepositsArePaused.selector);
+        vault.receiveCctp(m, ATTESTATION);
+        assertEq(transmitter.usedNonces(keccak256("u")), 0); // still relayable
+        assertEq(usdc.balanceOf(address(vault)), 0);
+
+        // After the lock it lands and is reported for a refund.
+        vm.prank(owner);
+        vault.unpauseDeposits();
+        vault.receiveCctp(m, ATTESTATION);
+        assertEq(usdc.balanceOf(address(vault)), 70e6);
     }
 
     function test_amendCancelledRelease_cctp() public {

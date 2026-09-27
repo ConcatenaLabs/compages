@@ -58,7 +58,9 @@ interface ICctpMessageTransmitterV2 {
 /// passed. A token with no configured bucket has capacity zero, so every
 /// release of it is queued: the safe default for an arbitrary ERC-20.
 /// Queued releases, and cancelled ones the owner may reinstate, are reserved:
-/// no immediate payout or rebalance can spend the funds they will need.
+/// no immediate payout or rebalance can spend the funds they will need, and a
+/// release is refused outright, queued or not, when the unreserved balance
+/// cannot cover it, so the queue never promises more than the vault holds.
 ///
 /// Undeliverable payouts. A payout the recipient cannot accept (a contract or
 /// EIP-7702 account that rejects plain ether, a blocklisted recipient, a
@@ -170,6 +172,7 @@ contract CompagesVault {
         bool viaCctp;
         address to; // address(0) for a CCTP release
         uint32 destinationDomain; // CCTP only
+        uint64 discardableAfter; // set when cancelled
         uint256 amount;
         bytes32 mintRecipient; // CCTP only
         uint256 maxFee; // CCTP only
@@ -379,6 +382,7 @@ contract CompagesVault {
     error ValueTooLarge();
     error DelayTooLong();
     error DelayTooShort();
+    error DiscardNotReady(uint256 discardableAfter);
     error AlreadyReleased();
     error NotQueued();
     error NotCancelled();
@@ -513,7 +517,8 @@ contract CompagesVault {
     ///   RebalancedIn and creates no deposit.
     /// - anything else: the mint is still completed, because with this vault
     ///   as destinationCaller nothing else could ever complete it, and
-    ///   CctpUnrecognized reports it for refunding.
+    ///   CctpUnrecognized reports it for refunding. Like a deposit, it
+    ///   reverts while deposits are paused and can be relayed afterwards.
     /// A burn that mints to someone other than this vault is relayed for the
     /// same reason, credits nothing and emits CctpForwarded; it reverts if the
     /// vault's USDC balance would change.
@@ -537,7 +542,9 @@ contract CompagesVault {
         }
 
         uint8 kind = _cctpKind(message[BURN_HOOK:]);
-        if (kind == CCTP_DEPOSIT && depositsPaused) revert DepositsArePaused();
+        // Everything but operator liquidity waits out a deposit pause, so
+        // nothing new becomes burnable while the supply is locked.
+        if (kind != CCTP_REBALANCE && depositsPaused) revert DepositsArePaused();
 
         uint256 before = _balanceOf(usdc);
         if (!ICctpMessageTransmitterV2(transmitter).receiveMessage(message, attestation)) revert CctpBadMessage();
@@ -666,9 +673,9 @@ contract CompagesVault {
         address token = q.token;
         uint256 amount = q.amount;
         if (q.viaCctp && token != cctpUsdc) revert CctpDisabled();
-        // This release is leaving the queue, so its own amount is not held
-        // back from it.
-        _requireUnreserved(token, amount, amount);
+        // Queued releases compete with each other, first executed first
+        // paid; only owed and cancelled amounts are held back from them.
+        _requireUnreserved(token, amount, queuedTotal[token]);
         q.state = ReleaseState.Executed;
         queuedTotal[token] -= amount;
         if (q.viaCctp) {
@@ -684,6 +691,7 @@ contract CompagesVault {
         QueuedRelease storage q = _queue[redemptionId];
         if (q.state != ReleaseState.Queued) revert NotQueued();
         q.state = ReleaseState.Cancelled;
+        q.discardableAfter = uint64(block.timestamp) + releaseDelay;
         queuedTotal[q.token] -= q.amount;
         cancelledTotal[q.token] += q.amount;
         emit ReleaseCancelled(redemptionId, msg.sender);
@@ -738,10 +746,15 @@ contract CompagesVault {
     /// @notice Drop a cancelled release for good, releasing its reservation.
     ///         Its id stays processed, so it can never be paid. This is how
     ///         the owner clears a bogus entry queued with a compromised
-    ///         operator key after the guardian cancels it.
+    ///         operator key after the guardian cancels it. Allowed only once
+    ///         `releaseDelay` (as it stood at the cancel) has passed since the
+    ///         cancel, so no single key can cancel, discard and rebalance a
+    ///         user's queued funds away in one go.
     function discardCancelledRelease(bytes32 redemptionId) external onlyOwner {
         QueuedRelease storage q = _queue[redemptionId];
         if (q.state != ReleaseState.Cancelled) revert NotCancelled();
+        // forge-lint: disable-next-line(block-timestamp) -- a timelock measured in hours or days
+        if (block.timestamp < q.discardableAfter) revert DiscardNotReady(q.discardableAfter);
         q.state = ReleaseState.Discarded;
         cancelledTotal[q.token] -= q.amount;
         emit ReleaseDiscarded(redemptionId);
@@ -779,6 +792,12 @@ contract CompagesVault {
     {
         QueuedRelease storage q = _queue[redemptionId];
         return (q.token, q.to, q.amount, q.executeAfter, q.state, q.isRefund);
+    }
+
+    /// @notice When a cancelled release may be discarded; 0 if it was never
+    ///         cancelled.
+    function releaseDiscardableAfter(bytes32 redemptionId) external view returns (uint256) {
+        return _queue[redemptionId].discardableAfter;
     }
 
     /// @notice The CCTP destination of a queued release; viaCctp is false for
@@ -1084,19 +1103,21 @@ contract CompagesVault {
     }
 
     /// @dev Checks shared by every release and refund, plus the replay mark.
-    ///      Returns true when the amount fits the token's bucket - which is
-    ///      then debited, after checking the vault can cover it now - and
-    ///      false when it must be queued.
+    ///      The unreserved balance must cover the amount whether it is paid
+    ///      now or queued, so a queue entry can never exceed the escrow (and a
+    ///      stolen operator key cannot reserve the whole token away). Returns
+    ///      true when the amount fits the token's bucket, which is then
+    ///      debited, and false when it must be queued.
     function _admit(address token, uint256 amount, bytes32 id) private returns (bool payNow) {
         if (releasesPaused) revert ReleasesArePaused();
         if (amount == 0) revert ZeroAmount();
         if (processedRedemptions[id]) revert AlreadyReleased();
         processedRedemptions[id] = true;
 
+        _requireUnreserved(token, amount, 0);
         Bucket storage b = releaseBuckets[token];
         uint256 level = _bucketLevel(b);
         if (amount > level) return false;
-        _requireUnreserved(token, amount, 0);
         // forge-lint: disable-next-line(unsafe-typecast) -- level <= capacity, a uint128
         b.available = uint128(level - amount);
         b.updatedAt = uint64(block.timestamp);
@@ -1207,12 +1228,12 @@ contract CompagesVault {
         return owedTotal[token] + queuedTotal[token] + cancelledTotal[token];
     }
 
-    /// @dev Revert unless the balance, less what is reserved for others,
-    ///      covers `amount`. `ownShare` is the part of the reservation that
-    ///      belongs to this very payout (a queued release being executed).
-    function _requireUnreserved(address token, uint256 amount, uint256 ownShare) private view {
+    /// @dev Revert unless the balance, less what is reserved, covers `amount`.
+    ///      `excluded` is the part of the reservation this payout may draw on
+    ///      (the whole queue, for a queued release being executed).
+    function _requireUnreserved(address token, uint256 amount, uint256 excluded) private view {
         uint256 balance = token == address(0) ? address(this).balance : _balanceOf(token);
-        uint256 reserved = _reserved(token) - ownShare;
+        uint256 reserved = _reserved(token) - excluded;
         uint256 unreserved = balance > reserved ? balance - reserved : 0;
         if (amount > unreserved) revert InsufficientVaultBalance(token, amount, unreserved);
     }

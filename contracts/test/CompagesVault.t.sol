@@ -178,14 +178,10 @@ contract CompagesVaultTest is Test {
         vm.expectRevert(CompagesVault.TokenTransferFailed.selector);
         vault.depositToken(ghost, 1, SEQ_ADDR);
 
-        // Unconfigured, so a release queues; executing it cannot read a balance.
-        bytes32 id = keccak256("ghost");
+        // Paid now or queued, a release needs the balance, which cannot be read.
         vm.prank(operator);
-        vault.release(ghost, payable(bob), 1, id);
-        vm.warp(block.timestamp + DELAY);
         vm.expectRevert(CompagesVault.TokenTransferFailed.selector);
-        vault.executeRelease(id);
-
+        vault.release(ghost, payable(bob), 1, keccak256("ghost"));
         _unlimit(ghost);
         vm.prank(operator);
         vm.expectRevert(CompagesVault.TokenTransferFailed.selector);
@@ -713,43 +709,84 @@ contract CompagesVaultTest is Test {
         assertEq(token.balanceOf(bob), 80e6);
     }
 
-    function test_queue_executeWaitsForLiquidity() public {
-        // A release may be queued beyond what the vault holds; it executes
-        // once the escrow is refilled.
+    function test_regression_N2_queueRefusedBeyondUnreservedBalance() public {
+        // A release is refused, queued or not, when the unreserved balance
+        // cannot cover it; nothing is recorded, so it is retried later.
         _escrow(100e6);
         bytes32 id = keccak256("q-short");
         vm.prank(operator);
-        vault.release(address(token), payable(bob), 150e6, id);
-        vm.warp(block.timestamp + DELAY);
         vm.expectRevert(
             abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 150e6, 100e6)
         );
-        vault.executeRelease(id);
-        _escrow(50e6);
-        vault.executeRelease(id);
-        assertEq(token.balanceOf(bob), 150e6);
-    }
+        vault.release(address(token), payable(bob), 150e6, id);
+        assertFalse(vault.processedRedemptions(id));
 
-    function test_queue_executeRequiresTheWholeReservationCovered() public {
-        // With two queued releases and escrow for only one, neither executes:
-        // a queued release is only paid while every other commitment stays
-        // covered, so the shortfall is visible and refilled rather than
-        // silently shifted onto whoever executes last.
-        _escrow(100e6);
-        vm.startPrank(operator);
+        // Queued amounts count against the next one.
+        vm.prank(operator);
         vault.release(address(token), payable(bob), 60e6, keccak256("a"));
-        vault.release(address(token), payable(carol), 60e6, keccak256("b"));
-        vm.stopPrank();
-        vm.warp(block.timestamp + DELAY);
+        vm.prank(operator);
         vm.expectRevert(
             abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 60e6, 40e6)
         );
-        vault.executeRelease(keccak256("a"));
-        _escrow(20e6);
-        vault.executeRelease(keccak256("a"));
-        vault.executeRelease(keccak256("b"));
-        assertEq(token.balanceOf(bob), 60e6);
-        assertEq(token.balanceOf(carol), 60e6);
+        vault.release(address(token), payable(bob), 60e6, keccak256("b"));
+
+        _escrow(50e6);
+        vm.prank(operator);
+        vault.release(address(token), payable(bob), 150e6 - 60e6, id);
+        assertEq(vault.queuedTotal(address(token)), 150e6);
+    }
+
+    function test_regression_N2_stolenOperatorCannotReserveTheTokenAway() public {
+        _escrow(100e6);
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                CompagesVault.InsufficientVaultBalance.selector, address(token), type(uint128).max, 100e6
+            )
+        );
+        vault.release(address(token), payable(operator), type(uint128).max, keccak256("bogus"));
+    }
+
+    function test_regression_N1_shortEscrowPaysQueueFirstComeFirstServed() public {
+        // Queue entries can only outgrow the escrow if the balance shrinks
+        // underneath them (a rebasing token here). The queue then keeps
+        // moving: whoever executes first is paid, the rest wait for a refill.
+        RebasingERC20 reb = new RebasingERC20();
+        reb.mint(alice, 120e18);
+        vm.startPrank(alice);
+        reb.approve(address(vault), 120e18);
+        vault.depositToken(address(reb), 120e18, SEQ_ADDR);
+        vm.stopPrank();
+        vm.startPrank(operator);
+        vault.release(address(reb), payable(bob), 60e18, keccak256("A"));
+        vault.release(address(reb), payable(carol), 60e18, keccak256("B"));
+        vm.stopPrank();
+        reb.rebase(uint256(1e18) * 100 / 120); // balance ~100 against 120 queued
+        vm.warp(block.timestamp + DELAY);
+
+        vault.executeRelease(keccak256("A"));
+        assertApproxEqAbs(reb.balanceOf(bob), 60e18, 1e3);
+        vm.expectRevert();
+        vault.executeRelease(keccak256("B"));
+        reb.mint(address(vault), 30e18);
+        vault.executeRelease(keccak256("B"));
+        assertApproxEqAbs(reb.balanceOf(carol), 60e18, 1e3);
+    }
+
+    function test_executeStillHoldsBackOwedAndCancelled() public {
+        _escrow(100e6);
+        vm.startPrank(operator);
+        vault.release(address(token), payable(bob), 50e6, keccak256("q"));
+        vault.release(address(token), payable(bob), 30e6, keccak256("c"));
+        vm.stopPrank();
+        vm.prank(guardian);
+        vault.cancelRelease(keccak256("c"));
+        // Owner moves out the 20 that is free; the queued 50 is still covered.
+        vm.prank(owner);
+        vault.rebalanceOut(address(token), payable(owner), 20e6, "x");
+        vm.warp(block.timestamp + DELAY);
+        vault.executeRelease(keccak256("q"));
+        assertEq(token.balanceOf(address(vault)), 30e6); // the cancelled 30 remains
     }
 
     function test_queue_usesDelayAtQueueTime() public {
@@ -1380,14 +1417,16 @@ contract CompagesVaultTest is Test {
     }
 
     function test_discardCancelledRelease_clearsABogusQueueEntry() public {
-        // A compromised operator queues an absurd release; the guardian
-        // cancels it; while it is reserved nothing else can move.
+        // A compromised operator queues the whole free escrow to itself; the
+        // guardian cancels it; while it is reserved nothing else can move.
         _escrow(100e6);
         bytes32 bogus = keccak256("bogus");
         vm.prank(operator);
-        vault.release(address(token), payable(operator), type(uint128).max, bogus); // over any limit: queued
+        vault.release(address(token), payable(operator), 100e6, bogus); // over any limit: queued
         vm.prank(guardian);
         vault.cancelRelease(bogus);
+        uint256 discardable = block.timestamp + DELAY;
+        assertEq(vault.releaseDiscardableAfter(bogus), discardable);
         _unlimit(address(token));
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 1e6, 0));
@@ -1396,6 +1435,10 @@ contract CompagesVaultTest is Test {
         vm.prank(guardian);
         vm.expectRevert(CompagesVault.NotOwner.selector);
         vault.discardCancelledRelease(bogus);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(CompagesVault.DiscardNotReady.selector, discardable));
+        vault.discardCancelledRelease(bogus);
+        vm.warp(discardable);
         vm.prank(owner);
         vault.discardCancelledRelease(bogus);
         assertEq(uint8(_state(bogus)), uint8(CompagesVault.ReleaseState.Discarded));
@@ -1417,6 +1460,26 @@ contract CompagesVaultTest is Test {
         vm.stopPrank();
         vm.expectRevert(CompagesVault.NotQueued.selector);
         vault.executeRelease(bogus);
+    }
+
+    function test_regression_N4_ownerCannotCancelDiscardAndRebalanceAtOnce() public {
+        _escrow(100e6);
+        vm.prank(operator);
+        vault.release(address(token), payable(alice), 100e6, keccak256("q"));
+        vm.startPrank(owner);
+        vault.cancelRelease(keccak256("q"));
+        vm.expectRevert(abi.encodeWithSelector(CompagesVault.DiscardNotReady.selector, block.timestamp + DELAY));
+        vault.discardCancelledRelease(keccak256("q"));
+        vm.expectRevert(
+            abi.encodeWithSelector(CompagesVault.InsufficientVaultBalance.selector, address(token), 100e6, 0)
+        );
+        vault.rebalanceOut(address(token), payable(owner), 100e6, "x");
+        // Lowering the delay afterwards does not shorten the wait.
+        vault.setReleaseDelay(1 hours);
+        vm.warp(block.timestamp + 1 hours);
+        vm.expectRevert();
+        vault.discardCancelledRelease(keccak256("q"));
+        vm.stopPrank();
     }
 
     function test_amendCancelledRelease_direct() public {

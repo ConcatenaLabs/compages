@@ -89,15 +89,18 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   one bad recipient from blocking a redemption forever.
 - **Owed, queued and cancelled amounts are reserved.** `owedTotal + queuedTotal + cancelledTotal`
   belongs to users whose Sequentia side is already settled: no immediate payout, `rebalanceOut` or
-  `burnLockedUSDC` may spend it, and a queued release executes only while the vault covers all of
-  it. A cancelled entry leaves the reservation only through the owner (`reinstateRelease`, or
-  `discardCancelledRelease` for a bogus one), never through a guardian cancel.
+  `burnLockedUSDC` may spend it, and nothing may be queued beyond what is left, so for a normal
+  token the balance always covers all three. Queued releases compete first come, first served (an
+  execution holds back only owed and cancelled). A cancelled entry leaves the reservation only
+  through the owner (`reinstateRelease`, or `discardCancelledRelease` no sooner than `releaseDelay`
+  after the cancel), never through a guardian cancel.
 - **An inbound CCTP mint to the vault must never be refused for its hookData.** With the vault as
   destinationCaller nothing else can complete it, so a revert would burn the user's USDC for good.
   `compages:deposit:<14..120-byte address>` is a deposit, exactly `compages:rebalance` is liquidity,
   anything else lands as `CctpUnrecognized` for a refund, and a mint to another recipient is relayed
-  as `CctpForwarded` without moving vault funds. Only a well-formed deposit may revert
-  (while deposits are paused), because it stays retryable. The credited amount is the vault's
+  as `CctpForwarded` without moving vault funds. Deposits and unrecognised arrivals revert while
+  deposits are paused (they stay retryable, and nothing new becomes burnable during a supply lock);
+  rebalances and forwards do not. The credited amount is the vault's
   measured USDC balance change, never the message's own figures.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
   locked Ethereum funds.

@@ -448,11 +448,13 @@ contract CompagesVaultInvariantTest is Test {
         }
     }
 
-    /// What the vault owes claimants is always there.
-    function invariant_balanceCoversOwed() public view {
+    /// Everything committed to users - owed to claimants, queued, and
+    /// cancelled but reinstatable - is always there: payouts, rebalances and
+    /// burns spend only the rest, and nothing is queued beyond it.
+    function invariant_balanceCoversAllReservations() public view {
         for (uint256 i; i < handler.tokenCount(); i++) {
             address t = handler.tokens(i);
-            assertGe(_balance(t), vault.owedTotal(t), "owed");
+            assertGe(_balance(t), vault.owedTotal(t) + vault.queuedTotal(t) + vault.cancelledTotal(t), "reservations");
         }
     }
 
