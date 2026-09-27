@@ -1,6 +1,6 @@
 // CCTP V2 Solana encoders and parsers against fixtures produced by the
 // reference tooling (Anchor + @solana/web3.js over Circle's V2 IDLs), real
-// Iris attestation responses and a devnet simulation. Run: node --test test/
+// Iris attestation responses and a devnet simulation. Run: npm test
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";

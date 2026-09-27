@@ -127,8 +127,11 @@ code pins it to a particular network. It has only ever run on testnets.
    bridge** of that token (your deposit issues a brand-new Sequentia asset) or
    whether it **mints more of an existing asset**.
 3. Enter the amount and your Sequentia address. The default `tb1...` address
-   from any Sequentia wallet works; a confidential (blinded) `tsqb1...`
-   address works too and hides the amount received on chain. The page checks
+   from any Sequentia wallet works. A confidential (blinded) `tsqb1...`
+   address works too and hides the amount received on chain, except for
+   supervised assets (USDC.e, EURC.e): consensus never lets one sit in a
+   blinded output, so the bridge delivers it to the same address's
+   transparent `tb1...` form, the same wallet with the amount visible. The page checks
    the address with the bridge's node as you type and keeps the deposit
    button disabled while it is invalid. When a Sequentia wallet is installed
    in the browser, "Use my Sequentia wallet" fills it in. A preview shows the
@@ -487,8 +490,11 @@ required to reach `btcAnchorConfirmations`. Because consecutive Sequentia
 blocks share a Bitcoin anchor, this depth advances only as Bitcoin advances,
 which is precisely the finality that protects the release. The gate also
 requires the node's `anchorstatus` to be `"ok"` and, when the node reports it,
-the burn block to be committee-certified. On a chain without anchoring
-(e.g. regtest) it falls back to a Sequentia-confirmation count.
+the burn block to be committee-certified. If the node cannot report its
+anchor status, or does not validate anchors, nothing is final and releases
+wait. Only a local test chain that has no anchoring at all sets
+`allowUnanchoredFinality`, which falls back to a count of
+`seqConfirmations` Sequentia blocks.
 
 Choosing `btcAnchorConfirmations`: it must exceed the deepest reorg of the
 anchor chain you are willing to tolerate. The live deployment anchors to
@@ -567,14 +573,17 @@ The daemon serves the static web app and a JSON API from the same port
 (`apiPort`, default 9950). The live instance is reverse-proxied under
 `https://sequentiatestnet.com/bridge/`. CORS is permissive; the API holds no
 secrets, and the only public mutating calls create deposit or redemption
-intents, rate-limited per client; none moves funds. Redemption records report
+intents, rate-limited per client (`intentLimitPerHour`); none moves funds.
+The heavier reads (`por`, `seqaddress`, `token`, `health`) have their own
+per-client limit (`readLimitPerHour`), and IPv6 clients are counted per /64.
+Error text in responses never carries an RPC URL. Redemption records report
 their progress toward finality as numbers (`finalityProgress`:
 `{depth, need, kind}`), so a page can draw it.
 
 | Method and path | Purpose |
 |---|---|
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
-| `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`) |
+| `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`), and whether the asset is `supervised` (freezable by its issuer and never blinded) |
 | `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero |
 | `GET /api/token/<address\|eth>` | Metadata for a token and whether it is already bridged (used by the front-end's token lookup) |
 | `POST /api/redeem` `{"ethAddress": "0x..."}` | Create a redemption intent; returns the Sequentia address to send bridged assets to |
@@ -590,27 +599,32 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/sol/intents` | The Solana treasury and every deposit address the bridge has handed out, for anyone checking the Solana escrow |
 | `POST /api/cctp/deposit` `{"sourceDomain": 6, "txHash": "0x..."}` | Report a USDC burn made on another CCTP chain for relaying (see "USDC from and to other chains") |
 | `GET /api/cctp/deposit/<domain>/<txHash>` | Where a reported burn stands (`attesting`, `relaying`, `relayed`, `not_found`, `not_for_bridge`) and the deposit it became |
-| `GET /api/redeem/by-eth/<ethAddress>` | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one |
-| `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, and whether it is a blinded one; checked before any funds move |
+| `GET /api/redeem/by-eth/<ethAddress>` (optionally `?domain=<cctpDomain>`) | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one. An address can have one per payout chain; `?domain=` picks the one paying out on that CCTP domain (0 is the vault's own chain) |
+| `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, whether it is a blinded one, and for a blinded one its `unconfidential` form (where supervised assets are delivered); checked before any funds move |
 | `GET /api/health` | The operator's health report (see "Watch it and act on what it reports"); HTTP 503 while anything critical is wrong |
 | `/api/admin/*` | Operator actions (records, resolve, halt, unhalt, retire-asset); exists only with `adminToken`, and answers 404 without it |
 
 Deposit records move through the statuses `minting`, `mint_retry` and
 `send_retry` (a safe retry, with backoff), `unresolved` (a chain write whose
 outcome the node could not confirm yet; re-checked every tick), `minted`
-(delivered; watched until the delivery is final under Bitcoin anchoring),
+(delivered; watched until the delivery is final under Bitcoin anchoring;
+`deliveredTo` names the address used when it differs from the one given),
 `delivery_reorged` (a delivery later displaced on Sequentia), `refund_pending`,
 `refunding`, `refund_queued` (over the vault's rate limit, waiting out its
 delay), `refunded`, `refund_cancelled` (a queued refund the guardian
-cancelled), `refund_failed_manual`, and `failed_manual` (paused
+cancelled), `refund_discarded` (a cancelled refund the owner discarded on the
+vault; an operator decides), `refund_failed_manual`, and `failed_manual` (paused
 for operator review; Solana deposits use `dust_manual` instead of the refund
 states). A deposit of a halted asset waits in `mint_retry` with a `waiting`
-reason. Redemption records move through `awaiting_finality`,
-`awaiting_liquidity`, `halted`, `new`, `releasing`, `release_paused` (the
+reason; a refund that comes due while its asset is halted stays
+`refund_pending`. Redemption records move through `awaiting_finality`,
+`awaiting_liquidity` (the payout chain's treasury is short; a `waiting`
+reason says of what), `halted`, `new`, `releasing`, `release_paused` (the
 vault's releases are paused), `queued` (over the vault's rate limit; the
 daemon executes it once `executeAfter` passes, in block time),
 `release_cancelled` (a queued release the guardian cancelled; an operator
-decides), `released`, `destroy_pending`, `destroying`, `done`,
+decides), `release_discarded` (a cancelled release the owner discarded on
+the vault; an operator decides), `released`, `destroy_pending`, `destroying`, `done`,
 plus the terminal `dust_ignored`, `ignored_unknown_asset`,
 `ignored_wrong_network` (an asset returned to the wrong leg's address),
 `release_failed_manual` (the vault refuses the recipient address) and
@@ -674,7 +688,7 @@ Configuration reference (`daemon/config.example.json`):
 | `ethChainName`, `ethChainId` | Display name and chain id of the Ethereum network (checked against the RPC at startup) |
 | `ethRpcUrl` | Ethereum JSON-RPC endpoint (must support `eth_getLogs`) |
 | `vaultAddress`, `vaultDeployBlock` | The primary `CompagesVault` and the block to start scanning from |
-| `vaults` | Optional list of `{address, deployBlock}`; the daemon watches every vault in it (`vaultAddress` stays the primary). Omit to watch `vaultAddress` alone |
+| `vaults` | Optional list of `{address, deployBlock, version}`; the daemon watches every vault in it (`vaultAddress` stays the primary). Omit to watch `vaultAddress` alone. `version` pins the vault's interface version (3 for a vault with `VERSION()`, 1 for an older one) instead of asking the vault at startup; an address missing from this list and from `vaultAddress` is never acted on |
 | `depositVault` | The vault the web page sends new deposits to, when it is not `vaultAddress`. `vaultAddress` never changes once deposits exist: deposit records of the primary vault are keyed by their bare number. A token's first deposit fixes which vault holds its escrow and pays its redemptions |
 | `ethFinality` | `finalized` (default): a deposit mints once Ethereum finalizes its block, so no Ethereum reorg can undo a deposit that was already minted. `confirmations`: after `ethConfirmations` blocks instead, for local test chains |
 | `ethConfirmations` | Confirmations before a deposit is processed when `ethFinality` is `confirmations` |
@@ -683,7 +697,8 @@ Configuration reference (`daemon/config.example.json`):
 | `seqRpcUrl` | Sequentia node RPC, `http://user:pass@host:port` |
 | `seqWallet` | Node wallet name; auto-loaded at startup if on disk |
 | `seqChainLabel` | Label mixed into redemption ids (prevents cross-chain replay) |
-| `seqConfirmations` | Sequentia confirmations; also the finality fallback on chains without anchoring |
+| `seqConfirmations` | Sequentia confirmations; also the finality count under `allowUnanchoredFinality` |
+| `allowUnanchoredFinality` | For a local test chain with no Bitcoin anchoring only: treat a burn as final after `seqConfirmations` blocks. Unset (the default), a node that cannot report or does not validate anchors makes every release wait |
 | `btcAnchorConfirmations` | Bitcoin-anchor depth required before a release (see "Finality") |
 | `registryUrl`, `registryAdminToken`, `assetDomain` | Asset Registry endpoint, optional admin token, and the entity domain written into asset contracts |
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
@@ -704,7 +719,7 @@ Configuration reference (`daemon/config.example.json`):
 | `pollIntervalMs`, `solPollIntervalMs` | Interval of the main loop and of the Solana leg's own loop |
 | `adminToken` | Enables `/api/admin/*` and `admin.js` for anyone presenting it. Unset, the admin API does not exist |
 | `alertUrl`, `alertToken`, `alertCooldownMinutes` | Where alerts are POSTed (an ntfy topic URL, or anything that takes a plain-text POST), an optional bearer token, and how often an unchanged alert repeats (default 360). Unset, alerts go to the log only |
-| `trustProxy`, `intentLimitPerHour` | Take the client address from `X-Forwarded-For` (only behind a proxy you run), and how many intents one client may create per hour (default 30) |
+| `trustProxy`, `intentLimitPerHour`, `readLimitPerHour` | Take the client address from `X-Forwarded-For` (only behind a proxy you run), how many intents one client may create per hour (default 30), and how many of the heavier reads it may make per hour (default 1200) |
 | `solMaxWatchedIntents`, `maxNewAssetsPerDay` | Caps on Solana deposit addresses watched at once (default 1000) and on newly bridged tokens issued per day (default 20) |
 | `retryHours`, `unresolvedHours` | How long a safe retry, or an unconfirmable transaction, keeps being tried before it becomes an operator case (default 24 each) |
 | `ethStuckMinutes`, `ethTxWaitMs` | When an unmined payout is replaced at the same nonce with higher fees (default 10), and how long one send waits for mining (default 180000) |

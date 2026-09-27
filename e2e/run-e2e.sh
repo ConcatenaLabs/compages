@@ -252,6 +252,7 @@ cat > "$RUN/config.json" <<EOF
   "seqRpcUrl": "http://e2e:e2e@127.0.0.1:$FAULT_PORT",
   "broadcastWaitMs": 4000,
   "ethFinality": "confirmations",
+  "allowUnanchoredFinality": true,
   "adminToken": "e2e-admin",
   "intentLimitPerHour": 1000,
   "invariantIntervalMs": 5000,

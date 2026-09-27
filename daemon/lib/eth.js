@@ -122,8 +122,10 @@ export class Eth {
       : [{ address: cfg.vaultAddress, deployBlock: cfg.vaultDeployBlock }];
     this.vaults = new Map();
     this.deployBlocks = new Map();
+    this._versions = new Map();
     for (const v of configured) {
       if (!v?.address) continue;
+      if (v.version !== undefined) this._versions.set(v.address.toLowerCase(), Number(v.version));
       if (v.deployBlock !== undefined) this.deployBlocks.set(v.address.toLowerCase(), v.deployBlock);
       this.vaults.set(v.address.toLowerCase(), new ethers.Contract(v.address, VAULT_ABI, this.wallet));
     }
@@ -140,8 +142,13 @@ export class Eth {
    *  predates multi-vault support and names none. */
   vaultFor(address) {
     if (!address) return this.vault;
-    return this.vaults.get(String(address).toLowerCase()) ?? this.vault;
+    const v = this.vaults.get(String(address).toLowerCase());
+    // A record that names a vault must be paid from that vault. Falling back
+    // to another one would read its replay guard ("not paid") and pay twice.
+    if (!v) throw new Error(`vault ${address} is not in this daemon's configuration`);
+    return v;
   }
+
 
   /** The vault's contract version: 3 for a vault with the release queue,
    *  owed payouts and CCTP (it has VERSION()), 1 for an older one, which
@@ -150,16 +157,22 @@ export class Eth {
     this._versions ??= new Map();
     const addr = (await vault.getAddress()).toLowerCase();
     if (!this._versions.has(addr)) {
-      let v = 1;
+      let v;
       try {
         v = Number(await vault.VERSION());
       } catch (e) {
-        if (e.code !== "CALL_EXCEPTION" && e.code !== "BAD_DATA") throw e; // an outage is not an answer
+        // Only a revert from deployed code means "an older vault without
+        // VERSION()". An empty answer (a lagging node) or an outage is no
+        // answer at all, and caching it would hide the queue for good.
+        if (e.code !== "CALL_EXCEPTION") throw e;
+        if ((await this.provider.getCode(addr)) === "0x") throw new Error(`no contract at vault ${addr}`);
+        v = 1;
       }
       this._versions.set(addr, v);
     }
     return this._versions.get(addr);
   }
+
 
   /** Vault events in a receipt that concern payout id `id`, by name. */
   payoutEvents(vault, receipt, id) {
@@ -200,14 +213,24 @@ export class Eth {
    *  the caller re-examines it with sentTxState and, if it is stuck, replaces
    *  it at the same nonce with replaceStuck). A revert found while estimating
    *  gas throws before anything is sent. */
+  /** Run `fn` after every earlier operator send has been handed to the
+   *  node, so the core and Solana loops never pick the same nonce. */
+  sendLock(fn) {
+    const run = (this._sendTail ?? Promise.resolve()).then(fn);
+    this._sendTail = run.catch(() => {});
+    return run;
+  }
+
   async sendAndWait(contract, method, args, record, timeoutMs = this.cfg.ethTxWaitMs ?? 180_000) {
-    const populated = await contract[method].populateTransaction(...args);
-    const gasLimit = ((await contract[method].estimateGas(...args)) * 12n) / 10n;
-    const fee = await this.provider.getFeeData();
-    const tx = await this.wallet.sendTransaction({
-      ...populated,
-      gasLimit,
-      ...(fee.maxFeePerGas ? { maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas } : {}),
+    const tx = await this.sendLock(async () => {
+      const populated = await contract[method].populateTransaction(...args);
+      const gasLimit = ((await contract[method].estimateGas(...args)) * 12n) / 10n;
+      const fee = await this.provider.getFeeData();
+      return this.wallet.sendTransaction({
+        ...populated,
+        gasLimit,
+        ...(fee.maxFeePerGas ? { maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas } : {}),
+      });
     });
     const sent = {
       hash: tx.hash,
@@ -261,7 +284,7 @@ export class Eth {
     };
     const maxFeePerGas = bump(sent.maxFeePerGas, fee.maxFeePerGas);
     const maxPriorityFeePerGas = bump(sent.maxPriorityFeePerGas, fee.maxPriorityFeePerGas);
-    const tx = await this.wallet.sendTransaction({
+    const tx = await this.sendLock(() => this.wallet.sendTransaction({
       to: sent.to,
       data: sent.data,
       value: BigInt(sent.value ?? 0),
@@ -269,7 +292,7 @@ export class Eth {
       gasLimit: BigInt(sent.gasLimit),
       maxFeePerGas,
       maxPriorityFeePerGas,
-    });
+    }));
     return {
       ...sent,
       hash: tx.hash,

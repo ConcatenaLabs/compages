@@ -22,8 +22,10 @@
 //
 // Anything critical is pushed to `alertUrl` and, when `daemonAdminToken` is
 // set, the affected assets are halted in the daemon (minting and payouts
-// stop until an operator clears them). Every payout is also announced, so a
-// payout nobody expected is seen when it happens.
+// stop until an operator clears them); with a guardian key the watcher also
+// pauses payouts on a version-3 vault itself. Payouts at or above
+// largePayout[token] (or all of them, with announceEveryPayout) are announced
+// as they happen, so a payout nobody expected is seen.
 //
 // A status report is served on `statusPort` (127.0.0.1) at /status.
 
@@ -59,7 +61,58 @@ const VAULT_EVENTS = new ethers.Interface([
   "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
 ]);
 const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
-const VAULT_VIEWS = ["function depositCount() view returns (uint256)", "function cctpUsdc() view returns (address)"];
+const VAULT_VIEWS = [
+  "function depositCount() view returns (uint256)",
+  "function cctpUsdc() view returns (address)",
+  "function VERSION() view returns (uint256)",
+  "function owedTotal(address) view returns (uint256)",
+  "function queuedTotal(address) view returns (uint256)",
+  "function cancelledTotal(address) view returns (uint256)",
+];
+
+/** What a vault holds of `token` that actually backs circulating supply:
+ *  its balance minus what it has set aside for claimants and for queued or
+ *  cancelled payouts (a version-3 vault's reservations). Counting those as
+ *  backing would hide a shortfall of that size. */
+async function backingHeld(address, token) {
+  const held = (await vaultBalances(address, [token]))[token];
+  const v = new ethers.Contract(address, VAULT_VIEWS, provider);
+  let reserved = 0n;
+  try {
+    if (Number(await v.VERSION()) >= 3) {
+      reserved = BigInt(await v.owedTotal(token)) + BigInt(await v.queuedTotal(token)) + BigInt(await v.cancelledTotal(token));
+    }
+  } catch (e) {
+    if (e.code !== "CALL_EXCEPTION") throw e; // an older vault reserves nothing
+  }
+  return held > reserved ? held - reserved : 0n;
+}
+
+/** USDC burned on Solana by the bridge's CCTP consolidation and not yet
+ *  minted on Ethereum is still backing. The daemon lists those burns; each is
+ *  checked here on Solana itself (final, successful, and moving that amount
+ *  out of the treasury) rather than taken on the daemon's word. */
+async function verifiedInTransit(assetId, mint) {
+  let total = 0n;
+  let por;
+  try {
+    por = (await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/por?asset=${assetId}`)).assets?.[0];
+  } catch {
+    return 0n;
+  }
+  for (const b of por?.inTransit ?? []) {
+    if (!b.solanaBurn || !cfg.solRpcUrl) continue;
+    const tx = await solRpc("getTransaction", [b.solanaBurn, { encoding: "jsonParsed", commitment: "finalized", maxSupportedTransactionVersion: 0 }]);
+    if (!tx || tx.meta?.err) continue;
+    const bal = (list) =>
+      (list ?? [])
+        .filter((x) => x.mint === mint && x.owner === cfg.solTreasury)
+        .reduce((a, x) => a + BigInt(x.uiTokenAmount?.amount ?? 0), 0n);
+    const moved = bal(tx.meta.preTokenBalances) - bal(tx.meta.postTokenBalances);
+    if (moved === BigInt(b.amount)) total += moved;
+  }
+  return total;
+}
 
 // The USDC a vault burns and mints through CCTP: its CCTP events name no
 // token, so the vault's own setting says which one moved.
@@ -178,9 +231,10 @@ async function checkVaults() {
       const isBig = big !== undefined && n.amount >= BigInt(big);
       log(`vault ${addr}: ${n.kind} of ${n.amount} ${n.token} ${n.to ? `to ${n.to} ` : ""}in ${n.tx}`);
       if (n.kind !== "deferred" && (isBig || cfg.announceEveryPayout)) {
-        await alerts.raise(`payout:${n.tx}`, `${isBig ? "LARGE " : ""}${n.kind} from vault ${addr.slice(0, 10)}`, `${n.amount} of ${n.token} in ${n.tx}`, {
-          priority: isBig ? 4 : 2,
-        });
+        // A notice, not a condition: it is sent once and never "resolves".
+        await alerts.post(`${isBig ? "LARGE " : ""}${n.kind} from vault ${addr.slice(0, 10)}`, `${n.amount} of ${n.token} in ${n.tx}`, isBig ? 4 : 2, [
+          "money_with_wings",
+        ]);
       }
     }
     const st = state.vaults[addr];
@@ -270,7 +324,7 @@ async function checkReserves() {
         if (src.chainId === cfg.ethChainId) {
           const token = src.token === "eth" || src.token === "sol" ? ethers.ZeroAddress : src.token;
           units = 0n;
-          for (const v of cfg.vaults) units += (await vaultBalances(v.address, [token]))[token];
+          for (const v of cfg.vaults) units += await backingHeld(v.address, token);
         } else if (cfg.solRpcUrl && src.chainId === cfg.solChainLabel) {
           solOwners ??= [
             cfg.solTreasury,
@@ -278,6 +332,7 @@ async function checkReserves() {
           ];
           units = 0n;
           for (const o of solOwners) units += await solHolding(o, src.token);
+          if (m.unified) units += await verifiedInTransit(m.assetId, src.token);
         } else {
           throw new Error(`no reader for source chain ${src.chainId}`);
         }
