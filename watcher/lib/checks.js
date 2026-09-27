@@ -23,6 +23,7 @@ export function applyEvent(books, name, a) {
       books.deposits += 1;
       return null;
     case "RebalancedIn":
+    case "CctpUnrecognized": // USDC that arrived for no known purpose; the daemon refunds it
       tokenBook(books, a.token).in += a.amount;
       return null;
     case "Released":

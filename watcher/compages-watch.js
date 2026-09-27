@@ -53,6 +53,7 @@ const VAULT_EVENTS = new ethers.Interface([
   "event Claimed(address indexed token, address indexed account, address indexed payTo, uint256 amount)",
   "event Rebalanced(address indexed token, address indexed to, uint256 amount, string destination)",
   "event RebalancedIn(address indexed token, uint256 amount, uint32 indexed sourceDomain, bytes32 sender)",
+  "event CctpUnrecognized(uint32 indexed sourceDomain, bytes32 sender, bytes32 cctpNonce, uint256 amount, bytes hookData)",
   "event LockedStablecoinBurned(address indexed token, uint256 amount)",
   "event ReleasedViaCctp(bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
   "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",

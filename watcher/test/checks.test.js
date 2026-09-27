@@ -75,6 +75,14 @@ test("rebalancing in and out, and the Circle hand-off burn, are booked", () => {
   assert.deepEqual(checkVault(V, b, { [USDC]: 0n }, 1), []);
 });
 
+test("USDC that arrived with an unrecognised purpose is booked as in", () => {
+  const b = books([
+    ["CctpUnrecognized", { token: USDC, amount: 7n }],
+    ["Refunded", { token: USDC, amount: 7n, to: "0xabc" }],
+  ]);
+  assert.deepEqual(checkVault(V, b, { [USDC]: 0n }, 0), []);
+});
+
 test("an unknown event moves nothing", () => {
   const b = emptyBooks();
   assert.equal(applyEvent(b, "SomethingNew", { token: USDC, amount: 5n }), null);
