@@ -371,6 +371,51 @@ Circle supports, not only Ethereum and Solana:
   the mint on Solana itself (creating the recipient's USDC account first when
   it has none).
 
+### USDT0 from other chains
+
+USDT0 is Tether's USDT on LayerZero's Omnichain Fungible Token (OFT)
+standard. On Ethereum its OFT is an adapter that locks native USDT, so USDT0
+sent to Ethereum arrives as ordinary USDT. `CompagesOftReceiver`
+(`contracts/src/CompagesOftReceiver.sol`) takes such arrivals into the vault.
+It is a separate contract so that the vault, which is not upgradeable, can
+take them without being replaced.
+
+- **Sending.** On any chain USDT0 reaches, the sender calls the OFT's `send`
+  with the receiver as recipient, a compose message of
+  `compages:deposit:<Sequentia address>` (or exactly `compages:rebalance` for
+  liquidity), and executor options giving the compose at least 400,000 gas.
+  LayerZero credits the USDT to the receiver, then delivers the compose
+  message to its `lzCompose`; anyone can trigger that delivery.
+- **Arriving.** `lzCompose` accepts a call only from the configured LayerZero
+  endpoint, with a message the configured OFT queued, for an amount the
+  receiver actually holds, and each transfer's guid only once. A deposit goes
+  into the vault through its ordinary `depositToken`, so the vault emits
+  `Deposited` (with `from` the receiver) under its own deposit counter, and
+  the receiver emits `OftDeposit(nonce, srcEid, sender, guid, amount)` under
+  the same number, naming the source chain (its LayerZero endpoint id) and
+  the account the USDT came from. Liquidity goes into the vault by plain
+  transfer, and the receiver emits `RebalancedIn` with the endpoint id as its
+  source. Anything else, a deposit the vault refuses under its deposit rules
+  included, also goes into the vault and is reported with
+  `OftUnrecognized(srcEid, sender, guid, amount, composeMsg)` for refunding.
+  Deposits and unrecognised arrivals wait out a deposit pause, and nothing
+  lands while the receiver is disabled: such a compose stays queued at the
+  endpoint, its USDT waiting in the receiver, and is delivered again later.
+  The amount reported is the vault's measured balance change.
+- **Roles.** The receiver has no keys of its own; it reads the vault's. The
+  vault's owner points it at the endpoint and the OFT with
+  `setOft(endpoint, oft)`, which checks that the OFT names that endpoint and
+  reads the token from it, turns it on with `setEnabled(true)`, and moves
+  anything that reached it without a compose message into the vault with
+  `sweepToVault`. The vault's guardian or owner turns it off. Tokens leave the
+  receiver only into the vault.
+- **Leaving.** USDT held by the vault is paid out like any other token, with
+  `release` and `refund` on Ethereum.
+
+Like every bridged asset, USDT arriving this way is one asset among equals on
+Sequentia, with no special standing. The daemon does not watch a receiver, and
+no USDT0 asset is issued on Sequentia until Tether sets up the asset.
+
 ### The vault contract
 
 `CompagesVault` (`contracts/src/CompagesVault.sol`) holds the Ethereum-side
@@ -853,7 +898,7 @@ compages-watch.js config.json`.
 
 | Path | What it is |
 |---|---|
-| `contracts/` | Foundry project: `src/CompagesVault.sol`, unit tests, deploy script (`forge-std` as a git submodule), and `deployments/sepolia.json`, the deployed vaults |
+| `contracts/` | Foundry project: `src/CompagesVault.sol`, `src/CompagesOftReceiver.sol` (USDT0 and other LayerZero OFT arrivals into the vault), unit tests, deploy script (`forge-std` as a git submodule), and `deployments/sepolia.json`, the deployed vaults |
 | `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
@@ -868,11 +913,13 @@ Contract tests: unit tests for deposits and deposit rules, roles and access
 control, the rate limit and queue, owed payouts and claims against rejecting,
 blocklisting, pausing and non-standard tokens, the stablecoin hand-off and the
 deploy script; CCTP tests against mocks that follow Circle's V2 message layout,
-pinned byte for byte to a real Sepolia message; and an invariant suite that
-drives random sequences of every operation and checks that the vault's
-balance always equals what its events credited in less what they paid out,
-that it always covers everything owed, queued or cancelled, and that no
-outflow ever spends that reserved escrow:
+pinned byte for byte to a real Sepolia message; OFT receiver tests against
+mocks of LayerZero's EndpointV2 compose queue and an OFT adapter, pinned byte
+for byte to a real USDT0 compose message from Ethereum; and an invariant
+suite that drives random sequences of every operation and checks that the
+vault's balance always equals what its events credited in less what they
+paid out, that it always covers everything owed, queued or cancelled, and
+that no outflow ever spends that reserved escrow:
 
 ```
 cd contracts
