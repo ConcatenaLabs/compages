@@ -25,10 +25,15 @@
 // never reads as a shortfall.
 
 import { ethers } from "ethers";
-import { buildTx, ataAddress, TOKEN_PROGRAM } from "./sol.js";
+import { buildTx, ataAddress, ataCreateIdempotent, b58encode, b58decode, TOKEN_PROGRAM } from "./sol.js";
 import { unitsToAtoms } from "./eth.js";
 import {
   depositForBurnWithHookIx,
+  receiveMessageIx,
+  readTokenMessenger,
+  isNonceUsed,
+  estimateReceiveComputeUnits,
+  RECEIVE_CU_LIMIT,
   reclaimEventAccountIx,
   readMessageSent,
   EVENT_ACCOUNT_WINDOW_SECONDS,
@@ -41,6 +46,22 @@ import {
   IRIS_SANDBOX,
 } from "./cctp-sol.js";
 import { sourcesOf, unifiedKeyOf } from "./bridge.js";
+
+/** The CCTP chains the bridge accepts USDC from and pays USDC out to, each
+ *  checked on its own chain: the transmitter's localDomain, and Circle's USDC
+ *  at the address given. Testnets; a deployment on mainnets configures
+ *  `cctp.chains` instead. EVM chains share Circle's contract addresses. */
+export const CCTP_TESTNET_CHAINS = [
+  { domain: 6, name: "Base Sepolia", chainId: 84532, usdc: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", rpc: "https://sepolia.base.org", explorer: "https://sepolia.basescan.org" },
+  { domain: 3, name: "Arbitrum Sepolia", chainId: 421614, usdc: "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d", rpc: "https://sepolia-rollup.arbitrum.io/rpc", explorer: "https://sepolia.arbiscan.io" },
+  { domain: 2, name: "OP Sepolia", chainId: 11155420, usdc: "0x5fd84259d66Cd46123540766Be93DFE6D43130D7", rpc: "https://sepolia.optimism.io", explorer: "https://sepolia-optimism.etherscan.io" },
+  { domain: 1, name: "Avalanche Fuji", chainId: 43113, usdc: "0x5425890298aed601595a70AB815c96711a31Bc65", rpc: "https://api.avax-test.network/ext/bc/C/rpc", explorer: "https://testnet.snowtrace.io" },
+  { domain: 10, name: "Unichain Sepolia", chainId: 1301, usdc: "0x31d0220469e10c4E71834a79b1f276d740d3768F", rpc: "https://sepolia.unichain.org", explorer: "https://sepolia.uniscan.xyz" },
+  { domain: 11, name: "Linea Sepolia", chainId: 59141, usdc: "0xFEce4462D57bD51A6A552365A011b95f0E16d9B7", rpc: "https://rpc.sepolia.linea.build", explorer: "https://sepolia.lineascan.build" },
+  { domain: 14, name: "World Chain Sepolia", chainId: 4801, usdc: "0x66145f38cBAC35Ca6F1Dfb4914dF98F1614aeA88", rpc: "https://worldchain-sepolia.g.alchemy.com/public", explorer: "https://worldchain-sepolia.explorer.alchemy.com" },
+];
+export const CCTP_EVM_TOKEN_MESSENGER = "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA";
+export const CCTP_EVM_MESSAGE_TRANSMITTER = "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275";
 
 const TRANSMITTER_ABI = [
   "function receiveMessage(bytes message, bytes attestation) returns (bool)",
@@ -300,6 +321,228 @@ export class Cctp {
         this.bridge.log(`cctp ${rec.id}: reclaiming the event account's rent (${built.signature})`);
       });
     }
+  }
+
+  // ================= USDC from and to other chains =================
+  //
+  // A user on another CCTP chain burns USDC there naming the deposit vault as
+  // mintRecipient and as destinationCaller, with hookData
+  // "compages:deposit:<Sequentia address>" (the page builds this call). The
+  // page reports the burn here; the daemon fetches Circle's attestation and
+  // relays it through vault.receiveCctp, which emits an ordinary Deposited
+  // event that the deposit scan mints against like any other. A deposit the
+  // bridge cannot deliver, or an arrival for no recognised purpose, is
+  // refunded to its source chain with refundViaCctp.
+  //
+  // Redemptions can be paid out on another CCTP chain the same way in
+  // reverse: the vault burns the USDC (releaseViaCctp), and the recipient
+  // claims it on the destination chain with the attestation this module
+  // fetches (a Solana payout is relayed by the daemon itself).
+
+  get chains() {
+    return this.c.chains ?? CCTP_TESTNET_CHAINS;
+  }
+
+  chain(domain) {
+    return this.chains.find((c) => c.domain === Number(domain)) ?? null;
+  }
+
+  get inbound() {
+    const s = this.bridge.state.data;
+    return (s.cctpInbound ??= {});
+  }
+
+  /** The vault that receives CCTP deposits: the one the page deposits into. */
+  depositVault() {
+    return this.bridge.eth.vaultFor(this.cfg.depositVault ?? this.cfg.vaultAddress);
+  }
+
+  /** Record a burn a user made on another chain, to be relayed. */
+  registerInbound(sourceDomain, txHash) {
+    const d = Number(sourceDomain);
+    if (!this.chain(d)) throw Object.assign(new Error("this chain is not one the bridge accepts USDC from"), { badRequest: true });
+    if (!/^0x[0-9a-fA-F]{64}$/.test(String(txHash))) throw Object.assign(new Error("invalid transaction hash"), { badRequest: true });
+    const key = `${d}:${String(txHash).toLowerCase()}`;
+    this.inbound[key] ??= { key, sourceDomain: d, txHash: String(txHash).toLowerCase(), stage: "attesting", createdAt: new Date().toISOString() };
+    this.bridge.state.save();
+    return this.inbound[key];
+  }
+
+  /** Move every reported burn along: attestation, then the relay. */
+  async advanceInbound() {
+    if (!this.c.enabled) return;
+    for (const rec of Object.values(this.inbound)) {
+      if (!["attesting", "relaying"].includes(rec.stage)) continue;
+      try {
+        await this.bridge.withRecord(`cctpin:${rec.key}`, () => this.stepInbound(rec));
+      } catch (e) {
+        rec.error = e.message;
+        this.bridge.state.save();
+      }
+    }
+  }
+
+  async stepInbound(rec) {
+    const bridge = this.bridge;
+    const vault = this.depositVault();
+    const vaultAddr = (await vault.getAddress()).toLowerCase();
+    if (rec.stage === "attesting") {
+      const msgs = await irisMessages({ sourceDomain: rec.sourceDomain, txHash: rec.txHash, baseUrl: this.iris });
+      const m = msgs.find((x) => x.status === "complete" && x.message && x.attestation);
+      if (!m) {
+        const ageH = (Date.now() - Date.parse(rec.createdAt)) / 3_600_000;
+        rec.waiting = msgs.length ? "waiting for Circle's attestation" : "Circle has not seen this burn yet";
+        if (ageH > (this.c.inboundGiveUpHours ?? 6) && !msgs.length) rec.stage = "not_found";
+        bridge.state.save();
+        return;
+      }
+      const h = parseMessageV2(m.message);
+      const body = parseBurnBodyV2(h.body);
+      const mintRecipient = `0x${Buffer.from(body.mintRecipient).subarray(12).toString("hex")}`.toLowerCase();
+      if (h.destinationDomain !== DOMAIN.ethereum || mintRecipient !== vaultAddr) {
+        rec.stage = "not_for_bridge";
+        rec.error = "this burn does not mint to the bridge's vault on Ethereum";
+        bridge.state.save();
+        return;
+      }
+      rec.message = `0x${m.message.toString("hex")}`;
+      rec.attestation = `0x${m.attestation.toString("hex")}`;
+      rec.nonce = `0x${Buffer.from(h.nonce).toString("hex")}`;
+      rec.amount = body.amount.toString();
+      rec.stage = "relaying";
+      delete rec.waiting;
+      bridge.state.save();
+    }
+    if (rec.stage === "relaying") {
+      if ((await this.transmitter.usedNonces(rec.nonce)) !== 0n) {
+        rec.stage = "relayed";
+        bridge.state.save();
+        return;
+      }
+      if (rec.ethTx && (await bridge.eth.sentTxState(rec.ethTx)) === "pending") return;
+      try {
+        const receipt = await bridge.eth.sendAndWait(vault, "receiveCctp", [rec.message, rec.attestation], (sent) => {
+          rec.ethTx = sent;
+          bridge.state.save();
+        });
+        if (receipt?.status === 1) {
+          rec.relayTx = receipt.hash;
+          rec.stage = "relayed";
+          delete rec.waiting;
+          bridge.state.save();
+          bridge.log(`cctp inbound ${rec.key}: relayed in ${receipt.hash}`);
+        }
+      } catch (e) {
+        if (e?.code !== "CALL_EXCEPTION" || typeof e.data !== "string") throw e;
+        const name = bridge.eth.revertName(e.data) ?? e.data;
+        rec.waiting = name === "DepositsArePaused" ? "deposits are paused on the vault" : `the vault refused it (${name})`;
+        bridge.state.save();
+      }
+    }
+  }
+
+  /** The address a CCTP refund to `sourceDomain` mints to, for a burn made
+   *  by `sender` (bytes32 hex). On an EVM chain that is the sender itself; on
+   *  Solana, CCTP mints into a token account, so it is the sender's USDC
+   *  associated token account. */
+  refundRecipient(sourceDomain, sender) {
+    if (Number(sourceDomain) !== DOMAIN.solana) return sender;
+    const owner = b58encode(Buffer.from(sender.replace(/^0x/, ""), "hex"));
+    const mint = this.solUsdcMint();
+    return `0x${Buffer.from(b58decode(ataAddress(owner, mint, TOKEN_PROGRAM))).toString("hex")}`;
+  }
+
+  solUsdcMint() {
+    for (const { sol } of this.assets()) if (sol) return sol.token;
+    return this.c.solUsdcMint ?? "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+  }
+
+  /** After a payout to another chain, fetch Circle's attestation so the
+   *  recipient can claim it there, and notice once they have. */
+  async advanceOutbound() {
+    if (!this.c.enabled) return;
+    const s = this.bridge.state.data;
+    for (const rec of [...Object.values(s.redemptions), ...Object.values(s.deposits)]) {
+      const o = rec.cctpOut;
+      if (!o || o.stage === "claimed" || !o.burnTx) continue;
+      try {
+        const msgs = await irisMessages({ sourceDomain: DOMAIN.ethereum, txHash: o.burnTx, baseUrl: this.iris });
+        const m = msgs.find((x) => x.status === "complete" && x.message && x.attestation);
+        if (!m) continue;
+        o.message = `0x${m.message.toString("hex")}`;
+        o.attestation = `0x${m.attestation.toString("hex")}`;
+        o.stage = m.destinationMintTxHash ? "claimed" : "claimable";
+        if (m.destinationMintTxHash) o.claimTx = m.destinationMintTxHash;
+        // A payout to Solana is relayed by the daemon; elsewhere the
+        // recipient claims it with the attestation now recorded.
+        if (o.domain === DOMAIN.solana && o.stage !== "claimed" && this.bridge.sol) {
+          if (await this.relayToSolana(o)) {
+            o.stage = "claimed";
+            o.claimTx = o.solTx?.signature ?? null;
+          }
+        }
+        this.bridge.state.save();
+      } catch (e) {
+        o.error = e.message;
+      }
+    }
+  }
+
+  /** Relay a payout the vault burned toward Solana: create the recipient's
+   *  USDC account if needed, then receive_message, paid by the treasury.
+   *  Persist-before-broadcast like every Solana transfer. Returns true once
+   *  the USDC is minted on Solana. */
+  async relayToSolana(o) {
+    const sol = this.bridge.sol;
+    const treasury = sol.treasury;
+    if (!o.message || !o.attestation) return false;
+    const h = parseMessageV2(Buffer.from(o.message.slice(2), "hex"));
+    if (await isNonceUsed(sol, h.nonce)) return true;
+    if (o.solTx) {
+      const fate = await this.bridge.solTransferFate(o.solTx);
+      if (fate === "pending") return false;
+      if (fate === "landed") return true;
+      delete o.solTx;
+    }
+    if (estimateReceiveComputeUnits(Buffer.from(o.message.slice(2), "hex")) > RECEIVE_CU_LIMIT) {
+      o.error = "this message needs more compute than a single legacy Solana transaction allows";
+      return false;
+    }
+    const body = parseBurnBodyV2(h.body);
+    const recipientAta = b58encode(Buffer.from(body.mintRecipient));
+    const mint = this.solUsdcMint();
+    const bh = await sol.latestBlockhash();
+    if (!o.ataReady) {
+      // The program mints only into an existing token account, and creating
+      // one in the same transaction would not fit, so it goes first.
+      const acct = await sol.rpc("getAccountInfo", [recipientAta, { encoding: "base64", commitment: "confirmed" }]);
+      if (!acct?.value) {
+        if (!o.owner) throw new Error("the recipient's USDC account does not exist and its owner is unknown");
+        const built = buildTx({
+          feePayer: treasury,
+          recentBlockhash: bh.blockhash,
+          instructions: [ataCreateIdempotent({ payer: treasury.address, ata: recipientAta, owner: o.owner, mint })],
+        });
+        await sol.send(built.tx);
+        return false; // the next pass relays once the account exists
+      }
+      o.ataReady = true;
+    }
+    const tm = await readTokenMessenger(sol);
+    const ix = receiveMessageIx({
+      payer: treasury.address,
+      caller: treasury.address,
+      message: Buffer.from(o.message.slice(2), "hex"),
+      attestation: Buffer.from(o.attestation.slice(2), "hex"),
+      feeRecipient: tm.feeRecipient,
+      mint,
+    });
+    const built = buildTx({ feePayer: treasury, recentBlockhash: bh.blockhash, instructions: [ix] });
+    o.solTx = { signature: built.signature, lastValidBlockHeight: bh.lastValidBlockHeight };
+    this.bridge.state.save(); // persisted BEFORE broadcast
+    await sol.send(built.tx);
+    this.bridge.log(`cctp: relaying a payout to Solana (${built.signature})`);
+    return false;
   }
 
   /** Atoms of `assetId` burned on one chain and not yet minted on the other.
