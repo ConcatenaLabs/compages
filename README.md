@@ -720,9 +720,11 @@ step is in flight. Every admin action is recorded in the state file's
 run beside the daemon but trusting none of its bookkeeping. It reads the
 chains through its own endpoints and, once a minute:
 
-- **Rebuilds every vault's books from the vault's own events**, up to
-  Ethereum's finalized block: no token may have left a vault in greater
-  amount than entered it, the vault must hold (at that same block) what its
+- **Rebuilds every vault's books**, up to Ethereum's finalized block: what
+  came in (for an ERC-20, every `Transfer` into the vault, which also covers
+  CCTP mints and migrations from another vault that emit no vault event; for
+  ether, the vault's own events) against what the vault's payout events say
+  went out. No token may have left a vault in greater amount than entered it, the vault must hold (at that same block) what its
   events say it holds, and the number of deposit events must equal the
   vault's own deposit counter. Logs come from `ethLogsRpcUrl` and balances and
   counters from `ethRpcUrl`, two different providers, so a log source that

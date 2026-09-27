@@ -12,19 +12,34 @@ function tokenBook(books, token) {
   return (books.tokens[token.toLowerCase()] ??= { in: 0n, out: 0n, owed: 0n });
 }
 
-/** Apply one decoded vault event to the books. Returns a note for events
- *  worth reporting on their own (every payout), or null. Unknown events are
+const ETHER = "0x0000000000000000000000000000000000000000";
+const isEther = (t) => String(t).toLowerCase() === ETHER;
+
+/** Apply one decoded event to the books. Returns a note for events worth
+ *  reporting on their own (every payout), or null. Unknown events are
  *  ignored: a vault version this watcher does not know yet must not be read
- *  as moving funds. */
+ *  as moving funds.
+ *
+ *  What came IN is counted from the most complete source for each kind of
+ *  asset. For an ERC-20 that is the token's own Transfer logs into the vault
+ *  ("TokenIn"): they cover deposits, CCTP mints, migrations from another
+ *  vault and donations alike, some of which emit no vault event at all. For
+ *  ether, which a vault only accepts through its own functions, it is the
+ *  vault's events. What went OUT is always the vault's payout events, so the
+ *  two checks keep their meaning: payouts may not exceed what came in, and
+ *  funds may not leave without a payout event. */
 export function applyEvent(books, name, a) {
   switch (name) {
-    case "Deposited":
+    case "TokenIn":
       tokenBook(books, a.token).in += a.amount;
+      return null;
+    case "Deposited":
+      if (isEther(a.token)) tokenBook(books, a.token).in += a.amount;
       books.deposits += 1;
       return null;
     case "RebalancedIn":
-    case "CctpUnrecognized": // USDC that arrived for no known purpose; the daemon refunds it
-      tokenBook(books, a.token).in += a.amount;
+    case "CctpUnrecognized": // arrived for no known purpose; the daemon refunds it
+      if (isEther(a.token)) tokenBook(books, a.token).in += a.amount;
       return null;
     case "Released":
       tokenBook(books, a.token).out += a.amount;

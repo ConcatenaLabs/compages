@@ -58,6 +58,7 @@ const VAULT_EVENTS = new ethers.Interface([
   "event ReleasedViaCctp(bytes32 indexed redemptionId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
   "event RefundedViaCctp(bytes32 indexed refundId, uint32 indexed destinationDomain, bytes32 mintRecipient, uint256 amount)",
 ]);
+const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
 const VAULT_VIEWS = ["function depositCount() view returns (uint256)", "function cctpUsdc() view returns (address)"];
 
 // The USDC a vault burns and mints through CCTP: its CCTP events name no
@@ -117,6 +118,17 @@ async function scanVault(v, safeHead) {
   for (let from = st.cursor + 1; from <= safeHead; from += chunk) {
     const to = Math.min(from + chunk - 1, safeHead);
     const logs = await logsProvider.getLogs({ address: v.address, fromBlock: from, toBlock: to });
+    // Every ERC-20 transfer INTO the vault, whatever token and whoever sent
+    // it: the complete record of what came in (see applyEvent).
+    const inbound = await logsProvider.getLogs({
+      fromBlock: from,
+      toBlock: to,
+      topics: [TRANSFER_TOPIC, null, ethers.zeroPadValue(v.address, 32)],
+    });
+    for (const l of inbound) {
+      if (l.topics.length !== 3 || l.data.length < 66) continue; // not an ERC-20 Transfer (ERC-721 indexes the id)
+      applyEvent(st.books, "TokenIn", { token: l.address.toLowerCase(), amount: BigInt(l.data.slice(0, 66)) });
+    }
     for (const l of logs) {
       let ev;
       try {
