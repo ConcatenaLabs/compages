@@ -16,7 +16,7 @@ Node and consensus conventions live in the
 
 | Path | What |
 |---|---|
-| `contracts/` | Foundry project. One contract, `src/CompagesVault.sol` (no dependency beyond `forge-std` for tests), with `script/Deploy.s.sol` (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`), `deployments/sepolia.json` (the immutable facts of every deployed vault: address, deploy tx, source commit, compiler settings, constructor args, verification links; add a vault there when you deploy one, never its role holders) and tests in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). `test/fork/HandoverRehearsal.t.sol` rehearses the Circle hand-off against the live Sepolia vault; it is skipped unless `REHEARSAL_RPC_URL` is set, which `contrib/handover-rehearsal.sh` does. `script/SafeOwner.s.sol` moves the owner role to a Safe v1.4.1 in separately run steps (deploy, transferOwnership, print the Safe tx, execute), and `test/fork/SafeOwnerRehearsal.t.sol` drives those same steps on a fork under the same `REHEARSAL_RPC_URL` gate (`contrib/safe-owner-rehearsal.sh`). |
+| `contracts/` | Foundry project. Two contracts, `src/CompagesVault.sol` and `src/CompagesOftReceiver.sol` (takes LayerZero OFT arrivals, USDT0, into the vault as an ordinary depositor), with no dependency beyond `forge-std` for tests. `script/Deploy.s.sol` deploys the vault (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`); `deployments/sepolia.json` holds the immutable facts of every deployed vault: address, deploy tx, source commit, compiler settings, constructor args, verification links (add a vault there when you deploy one, never its role holders); tests are in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesOftReceiver.t.sol` (the OFT receiver, against `mocks/MockLayerZero.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). `test/fork/HandoverRehearsal.t.sol` rehearses the Circle hand-off against the live Sepolia vault; it is skipped unless `REHEARSAL_RPC_URL` is set, which `contrib/handover-rehearsal.sh` does. `script/SafeOwner.s.sol` moves the owner role to a Safe v1.4.1 in separately run steps (deploy, transferOwnership, print the Safe tx, execute), and `test/fork/SafeOwnerRehearsal.t.sol` drives those same steps on a fork under the same `REHEARSAL_RPC_URL` gate (`contrib/safe-owner-rehearsal.sh`). |
 | `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
 | `web/` | `index.html`, `app.js` and `qr.js` (a dependency-free QR encoder), served by the daemon. |
 | `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. |
@@ -26,7 +26,7 @@ Node and consensus conventions live in the
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
 cd daemon && npm test                     # node --test (unit tests)
-cd contracts && forge test                # the vault unit, CCTP and invariant tests
+cd contracts && forge test                # the vault unit, CCTP, OFT receiver and invariant tests
 ```
 
 There is no CI. Deployment is pull-only: the server pulls from GitHub. Never edit source on the
@@ -103,6 +103,13 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   deposits are paused (they stay retryable, and nothing new becomes burnable during a supply lock);
   rebalances and forwards do not. The credited amount is the vault's
   measured USDC balance change, never the message's own figures.
+- **An OFT arrival is never refused for its compose bytes, and the receiver pays only the vault.**
+  The OFT credits `CompagesOftReceiver` before the compose runs, so the compose only decides how
+  the tokens enter the vault: a deposit through `depositToken`, liquidity, or `OftUnrecognized`
+  for a refund, which is also where a deposit the vault's rules refuse goes. A compose reverts
+  only when it can be delivered again later (disabled, deposits paused, too little gas), and the
+  vault call gets a fixed `DEPOSIT_GAS` so a starved call cannot turn a deposit into a refund. The
+  receiver has no keys of its own (it reads the vault's) and no destination but the vault.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
   locked Ethereum funds.
 - **Undeliverable deposits are refunded automatically** — an invalid Sequentia address, or an
