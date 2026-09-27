@@ -16,7 +16,7 @@ Node and consensus conventions live in the
 
 | Path | What |
 |---|---|
-| `contracts/` | Foundry project. One contract, `src/CompagesVault.sol`, with `test/CompagesVault.t.sol` and `script/Deploy.s.sol`. |
+| `contracts/` | Foundry project. One contract, `src/CompagesVault.sol` (no dependency beyond `forge-std` for tests), with `script/Deploy.s.sol` (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`) and tests in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). |
 | `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests whose fixtures were produced by the reference Solana tooling, so they need no dependency. |
 | `web/` | `index.html`, `app.js` and `qr.js` (a dependency-free QR encoder), served by the daemon. |
 | `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. |
@@ -25,7 +25,7 @@ Node and consensus conventions live in the
 ```sh
 cd daemon && npm install && npm start     # node compagesd.js
 cd daemon && npm test                     # node --test (unit tests)
-cd contracts && forge test                # the vault unit tests
+cd contracts && forge test                # the vault unit, CCTP and invariant tests
 ```
 
 There is no CI. Deployment is pull-only: the server pulls from GitHub. Never edit source on the
@@ -78,7 +78,21 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   backing verdict is given only when both sides were actually measured. A reassuring number nobody
   measured is worse than an honest gap.
 - **Releases and refunds are replay-guarded on chain** by deterministic ids, so nothing can be paid
-  twice.
+  twice. The vault marks an id processed when it pays it OR queues it, and a cancelled id stays
+  spent: `processedRedemptions` true means "the vault has taken this on", not "it was paid" —
+  `queuedRelease(id)` and the events say which.
+- **The vault's roles never merge.** The owner (a Safe or cold key) holds every administrative
+  power; the operator (hot) only releases and refunds, rate-limited per token with the rest queued
+  behind `releaseDelay`; the guardian only pauses and cancels, and can never unpause or move funds.
+  Do not give the operator a way around the bucket or the queue, and do not let a payout the
+  recipient refuses revert: it becomes owed (`ReleaseDeferred`) and is claimed, which is what keeps
+  one bad recipient from blocking a redemption forever.
+- **Owed and queued amounts are reserved from the hand-off burn.** `burnLockedUSDC` burns the
+  stablecoin balance minus `owedTotal` and `queuedTotal`: those belong to users whose Sequentia side
+  is already settled. `rebalanceOut` and every payout likewise leave `owedTotal` untouched.
+- **An inbound CCTP message with unknown hookData must revert**, never credit. Only
+  `compages:deposit:<Sequentia address>` and exactly `compages:rebalance` are accepted, and the
+  credited amount is the vault's measured USDC balance change, never the message's own figures.
 - **Redeemed Sequentia amounts are destroyed**, keeping circulating bridged supply equal to the
   locked Ethereum funds.
 - **Undeliverable deposits are refunded automatically** — an invalid Sequentia address, or an

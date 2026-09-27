@@ -31,16 +31,23 @@ tokens involved have no value.
 ## Trust model, stated plainly
 
 **This is a custodial bridge.** Deposited funds are held by the vault contract
-and can only be moved by the bridge operator's key; minting on Sequentia and
-releases on Ethereum are actions the operator performs. If the operator
-disappears or misbehaves, bridged funds are lost. Users trust the operator.
-This is a demonstration of the bridging mechanics, not a trust-minimized
-design.
+and can only be moved by the bridge's keys; minting on Sequentia and releases
+on Ethereum are actions the operator performs. If the operator disappears or
+misbehaves, bridged funds are lost. Users trust the operator. This is a
+demonstration of the bridging mechanics, not a trust-minimized design.
 
 Within that assumption, the design removes every failure mode it can:
 
 - Releases and refunds are keyed by deterministic ids and replay-guarded on
   chain (`processedRedemptions`), so nothing can be paid twice.
+- The vault splits its authority across three keys (see "The vault
+  contract"): a cold owner, a hot operator whose immediate payouts are
+  rate-limited per token, and a guardian that can only stop things. A
+  payout over the limit waits in a timelocked queue where it can be
+  cancelled, so a leaked operator key cannot empty the vault at once.
+- A payout the recipient cannot accept (a contract that rejects ether, a
+  blocklisted address) never blocks a redemption: the vault records the
+  amount as owed and the recipient claims it to any address it chooses.
 - Every deposit of the same ERC-20 mints the **same** Sequentia asset; the
   mapping from token contract to Sequentia asset id is created exactly once
   (on the first deposit for an ordinary token, in the issuance ceremony for a
@@ -286,6 +293,79 @@ burn and the mint the amount is in transit: the reserves page
 (`inTransitAtoms`, with each Solana burn listed) and the supply invariant
 count it as backing, so a move in flight never reads as a shortfall.
 
+### The vault contract
+
+`CompagesVault` (`contracts/src/CompagesVault.sol`) holds the Ethereum-side
+escrow. It is deliberately not upgradeable; a new version is a new
+deployment. Its `VERSION` constant says which one an address runs.
+
+**Roles.** Three keys, set at deployment:
+
+| Role | Intended holder | Can |
+|---|---|---|
+| `owner` | a Safe or a cold key | set the other roles and every limit, unpause, reinstate cancelled releases, move unreserved escrow with `rebalanceOut`, configure CCTP and the stablecoin burner. Transferred in two steps (`transferOwnership`, then `acceptOwnership` by the new owner) |
+| `operator` | the daemon's hot key | `release`, `refund`, `releaseViaCctp` and `refundViaCctp`, nothing else |
+| `guardian` | an incident-response key | `pauseDeposits`, `pauseReleases` and `cancelRelease`; never unpause, never move funds |
+
+**Rate limit and queue.** Each token (address zero for ether) has a token
+bucket set by `setReleaseLimit(token, capacity, refillPerSecond)`. A release
+or refund that fits in the bucket pays at once; one that does not is queued
+for `releaseDelay` seconds (at most 30 days) and emits `ReleaseQueued`. After
+the delay anyone may call `executeRelease(id)`. During it the guardian or
+owner can `cancelRelease(id)`, and only the owner can `reinstateRelease(id)`,
+which queues it again with a fresh delay. A token with no bucket has capacity
+zero, so every payout of it is queued. A newly configured bucket starts empty
+and fills at its refill rate, and reconfiguring one never tops it up. An id is
+marked processed the moment it is paid or queued, and a cancelled id stays
+spent. `availableToRelease(token)` and `queuedRelease(id)` show the current
+state.
+
+**Owed payouts and claims.** Before paying, the vault requires its unreserved
+balance (balance minus what it owes claimants) to cover the amount, and
+otherwise reverts with `InsufficientVaultBalance` so the payout can be retried
+later. If the transfer itself fails, the amount becomes owed to the recipient
+(`ReleaseDeferred`), stays reserved, and the recipient calls
+`claim(token, payTo)` to withdraw it to any address. `Released`, `Refunded` and
+the CCTP payout events are emitted only when funds actually leave.
+
+**Deposit rules.** The owner can set a per-token minimum (`setMinDeposit`), a
+cap on the vault's balance after a deposit (`setDepositCap`, zero for none),
+and refuse a token outright (`setTokenBlocked`). Deposits credit the balance
+actually received, so fee-on-transfer tokens bridge the post-fee amount.
+Rebasing tokens are not supported: a balance that shrinks can leave owed
+amounts unbacked.
+
+**USDC over CCTP.** Once the owner points the vault at Circle's CCTP V2
+contracts (`setCctp(tokenMessenger, messageTransmitter, usdc)`), USDC can
+arrive from and leave to other chains while staying in this one escrow:
+
+- *Inbound.* A burn on the source chain names the vault as `mintRecipient`
+  and as `destinationCaller`, and anyone relays it with
+  `receiveCctp(message, attestation)`. Its hookData decides what it is. The
+  ASCII bytes `compages:deposit:` followed by a Sequentia address (14 to 120
+  bytes) make a deposit, which emits `Deposited` (with `from` zero) and
+  `CctpDeposit(nonce, sourceDomain, sender, cctpNonce, amount)` under the same
+  deposit number. Exactly `compages:rebalance` is liquidity from another
+  escrow and emits `RebalancedIn`. Anything else is refused, which leaves the
+  message unreceived rather than crediting unaccounted funds. The amount
+  credited is the USDC balance change across the mint. A deposit is refused
+  while deposits are paused and can be relayed again afterwards; the
+  deposit minimum, cap and token block do not apply, since the dollars are
+  already minted and the daemon refunds what it cannot bridge.
+- *Outbound.* `releaseViaCctp(amount, destinationDomain, mintRecipient,
+  redemptionId, maxFee)` burns USDC here for minting on another chain, under
+  the same replay map, USDC rate limit, queue and pause as `release`, at
+  Circle's finalized threshold. It emits `ReleasedViaCctp`, and
+  `refundViaCctp` emits `RefundedViaCctp`. The vault approves exactly the
+  amount for each burn and resets the approval afterwards.
+
+**Supply lock and stablecoin hand-off.** Pausing both deposits and releases
+freezes the escrow against the circulating supply. With the supply locked, the
+burner named by `setStablecoinBurner` can call `burnLockedUSDC()`, which burns
+the stablecoin's whole balance except what is committed to individual users:
+amounts owed to claimants and releases still in the queue, which are paid out
+as normal afterwards.
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
 Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
@@ -441,13 +521,25 @@ Ethereum RPC endpoint that supports `eth_getLogs` over block ranges.
 ```
 git clone --recurse-submodules https://github.com/ConcatenaLabs/compages.git
 cd compages/contracts
-forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL \
-  --private-key $BRIDGE_OPERATOR_KEY --broadcast
+OWNER=0x... OPERATOR=0x... GUARDIAN=0x... RELEASE_DELAY=86400 \
+  forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL \
+  --private-key $DEPLOYER_KEY --broadcast
 ```
 
-The deployer becomes both `owner` and `operator`. The owner can later rotate
-the operator (`setOperator`), transfer ownership, and pause new deposits
-(`setDepositsPaused`) while keeping existing funds releasable.
+| Variable | Meaning |
+|---|---|
+| `OWNER` | The owner: a Safe or a cold key. Holds every administrative power |
+| `OPERATOR` | The daemon's hot key, the address of `operator.key` |
+| `GUARDIAN` | The incident key that can pause and cancel queued releases |
+| `RELEASE_DELAY` | Seconds a payout over the rate limit waits before it can be executed (at most 2592000, 30 days) |
+
+The deployer holds no role. Until the owner configures a release limit, every
+payout is queued, so the owner's next steps are `setReleaseLimit` for each
+token the bridge pays out (address zero for ether) and, for USDC over CCTP,
+`setCctp` with Circle's TokenMessengerV2, MessageTransmitterV2 and USDC
+addresses on that chain. The owner can later rotate the operator
+(`setOperator`) and guardian (`setGuardian`), transfer ownership in two steps,
+and pause or unpause deposits and releases (see "The vault contract").
 
 ### 2. Configure and run the daemon
 
@@ -623,8 +715,14 @@ The daemon's only runtime dependency is `ethers`.
 
 ## Testing
 
-Contract unit tests (deposits, fee-on-transfer tokens, pausing, release replay
-protection, access control):
+Contract tests: unit tests for deposits and deposit rules, roles and access
+control, the rate limit and queue, owed payouts and claims against rejecting,
+blocklisting, pausing and non-standard tokens, the stablecoin hand-off and the
+deploy script; CCTP tests against mocks that follow Circle's V2 message layout,
+pinned byte for byte to a real Sepolia message; and an invariant suite that
+drives random sequences of every operation and checks that the vault's
+balance always equals what its events credited in less what they paid out,
+and that it always covers what it owes:
 
 ```
 cd contracts
@@ -674,9 +772,10 @@ keys; they hold nothing on any real network.
 
 ## Limitations
 
-- **Centralized custody.** The operator's key controls the vault; there is no
-  multisig, no threshold scheme, no fraud proofs. Do not use this design to
-  hold funds of value.
+- **Centralized custody.** The vault's keys control it. Its owner can be a
+  multisig and its hot operator is rate-limited, but there is no threshold
+  scheme over releases and no fraud proofs. Do not use this design to hold
+  funds of value.
 - **Testnet only.** Sepolia, Bitcoin testnet4, the Solana devnet and the
   Sequentia public testnet; all tokens are worthless.
 - **Single hot key and single process.** The operator keys (Ethereum,
