@@ -8,9 +8,13 @@ from three chains:
 - **Ethereum**: lock ether or any ERC-20 in a vault contract, receive a
   matching Sequentia asset (`SYMBOL.e`); sending it back releases the
   original funds.
-- **Bitcoin**: send BTC to a bridge address and receive SBTC 1:1 (custody and
-  mint/burn are performed by the sbtc-bridge service; Compages is the public
-  front for it).
+- **Bitcoin**: bitcoin needs no bridge to be used on Sequentia. Every
+  Sequentia wallet holds and spends native bitcoin directly, at the same
+  `tb1...` address it uses for Sequentia assets. For the few uses that need
+  bitcoin on the Sequentia chain itself (confidential transactions, and
+  anything that needs a covenant, such as a resting limit order), BTC sent to
+  a bridge address is wrapped 1:1 as SBTC (custody and mint/burn are performed
+  by the sbtc-bridge service; Compages is the public front for it).
 - **Solana**: send SOL or any SPL token to a bridge address and receive the
   matching Sequentia asset (SOL.s, or the token under its own `.s` ticker);
   sending it back releases the original.
@@ -94,10 +98,10 @@ in the node repository.
 | Sequentia → Ethereum (return, then release) | Releases the locked funds against a returned bridged asset; live redemptions wait for 100 Bitcoin-anchor confirmations first (see "Finality") |
 | Vault contract | `CompagesVault` on Sepolia at [`0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41`](https://sepolia.etherscan.io/address/0xd72AF53b4F0551A25072cC72A29F699Ed9d8Ed41) (primary) and [`0x15b3c97ed82c62b7828a775456bd75e67a8ec42c`](https://sepolia.etherscan.io/address/0x15b3c97ed82c62b7828a775456bd75e67a8ec42c); the daemon watches both |
 | Unified stablecoins | `USDC.e` and `EURC.e`, precision 6, fed from Sepolia and the Solana devnet, node-level supervised (see "Unified stablecoins") |
-| Bitcoin ↔ SBTC (wrap, unwrap) | Address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`) |
+| Bitcoin ↔ SBTC (wrap, unwrap) | Address-based, proxied to the sbtc-bridge custody service (`/api/btc/*`); only for uses that need bitcoin on the Sequentia chain, since Sequentia wallets hold native bitcoin directly |
 | Solana ↔ Sequentia (wrap, sweep, unwrap; SOL and any SPL token) | Implemented natively in the daemon (`daemon/lib/sol.js`, no extra dependency) |
 | Asset Registry integration | Bridged assets are registered with origin-suffixed tickers (`SYMBOL.e` Ethereum, `SOL.s` Solana), bound on-chain via the issuance contract hash |
-| Web front-end | Served by the daemon itself at https://sequentiatestnet.com/bridge/ |
+| Web front-end | Served by the daemon itself at https://sequentiatestnet.com/bridge/: `web/index.html`, `web/app.js`, and `web/qr.js` (the page's own QR encoder) |
 
 Every leg is exercised end to end by `e2e/run-e2e.sh`.
 
@@ -115,30 +119,51 @@ code pins it to a particular network. It has only ever run on testnets.
    contract address. The page tells you whether this would be the **first
    bridge** of that token (your deposit issues a brand-new Sequentia asset) or
    whether it **mints more of an existing asset**.
-3. Enter the amount and your Sequentia address (the default `tb1...` address
-   from any Sequentia wallet works). A preview shows the exact amount you will
-   receive before you commit.
-4. Confirm the deposit (for ERC-20s the page first requests an `approve`).
-   Once Ethereum finalizes the block holding your deposit (about 15 minutes),
-   the daemon mints on Sequentia and sends the asset to your address; the page tracks each stage. If you close the page,
-   the "Track an existing deposit" box resumes tracking from the Ethereum
-   transaction hash.
+3. Enter the amount and your Sequentia address. The default `tb1...` address
+   from any Sequentia wallet works; a confidential (blinded) `tsqb1...`
+   address works too and hides the amount received on chain. The page checks
+   the address with the bridge's node as you type and keeps the deposit
+   button disabled while it is invalid. When a Sequentia wallet is installed
+   in the browser, "Use my Sequentia wallet" fills it in. A preview shows the
+   exact amount and ticker you will receive (`SYMBOL.e`) and the expected
+   wait before you commit.
+4. Confirm the deposit. For an ERC-20 the page first requests an `approve`,
+   and resets an existing non-zero allowance to zero first for tokens that
+   require it. Once Ethereum finalizes the block holding your deposit (about
+   15 minutes), the daemon mints on Sequentia and sends the asset to your
+   address. The page tracks each stage with a progress bar and the time left.
+   It remembers the last deposit and resumes tracking when you come back; the
+   "Track a deposit" box follows any deposit by its Ethereum transaction hash.
+   If your wallet speeds up or replaces the transaction, the page says so and
+   asks for the new hash.
 
 ### Sequentia → Ethereum
 
 1. On the "Sequentia → Ethereum" tab, enter the Ethereum address that should
-   receive the released funds and click "Create redemption address". The
-   bridge returns a fresh Sequentia address bound to your Ethereum address.
+   receive the released funds and click "Get my redemption address". The
+   bridge returns the Sequentia address bound to that Ethereum address; each
+   Ethereum address has one, and asking again returns the same one. With an
+   Ethereum wallet connected, the page shows its redemption address and
+   redemptions without asking.
 2. Send the bridged asset to that address from any Sequentia wallet. No
    special transaction format is needed.
 3. Once the transfer is **final under Bitcoin anchoring** (100 Bitcoin-anchor
    confirmations on the live deployment, roughly 17 hours at the 10-minute
    block target), the vault releases
    the locked ether or tokens to your Ethereum address, and the returned
-   Sequentia amount is destroyed. The page shows each redemption's progress;
-   "Resume a redemption" looks a redemption up again by its address.
+   Sequentia amount is destroyed. The page shows each redemption's progress
+   toward finality with the time left, remembers the address for your next
+   visit, and "Look up a redemption address" finds one again by the
+   redemption address or by the Ethereum address it pays.
 
 ### Bitcoin ↔ SBTC and Solana ↔ SOL.s
+
+Bitcoin needs no bridge to be used on Sequentia: every Sequentia wallet holds
+and spends native bitcoin directly, at the same `tb1...` address it uses for
+Sequentia assets. SBTC, bitcoin pegged 1:1 on Sequentia, is only needed
+for confidential (blinded) transactions and for anything that needs a
+covenant, such as a limit order that rests on chain until it is filled. The
+page says this before it shows the Bitcoin forms.
 
 Both legs are address-based; no wallet extension is involved. Pick the chain
 in the "Bridge from" selector:
@@ -150,11 +175,24 @@ in the "Bridge from" selector:
    minted once it is finalized and picked up by the bridge, usually under a
    minute: SOL as SOL.s, a token under its own origin-suffixed ticker, with
    the first deposit issuing the asset and later deposits by anyone minting
-   more of the same one, exactly like the Ethereum leg's ERC-20s.
+   more of the same one, exactly like the Ethereum leg's ERC-20s. The page
+   checks the Sequentia address before it requests a deposit address, and
+   shows the deposit address with a QR code and a payment link
+   (`bitcoin:<address>`, or `solana:<address>` with `spl-token=<mint>` when
+   you pick a token).
 2. **Unwrap**: enter the Bitcoin or Solana address that should receive the
    released funds; the bridge returns a Sequentia address. Send SBTC or SOL.s
    to it from any wallet, and once the burn is final under Bitcoin anchoring
-   the original BTC or SOL is released.
+   the original BTC or SOL is released. A Sequentia wallet's `tb1...`
+   address also receives bitcoin, so "Use my Sequentia wallet" can fill the
+   Bitcoin destination too.
+
+The page lists every transfer to a wrap or unwrap address with its status:
+confirmations so far with the time left, then crediting or releasing, then
+the transaction that paid you. It remembers the last address it gave you on
+each leg and shows it again when you come back, and the "Track" box on the
+Bitcoin leg looks up any Bitcoin deposit address or SBTC return address. A banner at the top names any asset whose minting the operator has
+paused.
 
 SOL amounts should be at least 0.001 in both directions (below Solana's
 rent-exempt minimum a lamport transfer cannot create the destination account;
