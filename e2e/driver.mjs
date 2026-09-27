@@ -54,7 +54,10 @@ const API = `http://127.0.0.1:${process.env.API_PORT}/api`;
 const SEQ = `http://127.0.0.1:${process.env.SEQ_RPC}`;
 const SEQ_AUTH = "Basic " + Buffer.from("e2e:e2e").toString("base64");
 
-const provider = new ethers.JsonRpcProvider(ANVIL, 31337, { staticNetwork: true });
+// No request cache: ethers otherwise answers an identical request made within
+// 250 ms from the cache, so the nonce for a send right after another one's
+// wait() can be the stale one ("nonce too low").
+const provider = new ethers.JsonRpcProvider(ANVIL, 31337, { staticNetwork: true, cacheTimeout: -1 });
 const user = new ethers.Wallet(process.env.USER_KEY, provider);
 const RECEIVER = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"; // anvil #2, untouched
 
