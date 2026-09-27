@@ -119,6 +119,7 @@ export function sourcesOf(mapping) {
       token: mapping.token,
       decimals: mapping.decimals,
       tokenProgram: mapping.tokenProgram,
+      ...(mapping.vault ? { vault: mapping.vault } : {}),
     },
   };
 }
@@ -780,6 +781,7 @@ export class Bridge {
     mapping = await this.ensureMintedMapping(dep, dep.tokenKey, sats, {
       chainId: this.cfg.ethChainId,
       token: dep.token,
+      vault: dep.vault ?? null,
       meta: { symbol: meta.symbol, name: meta.name, decimals: meta.decimals },
       chainName: this.cfg.ethChainName,
       tickerSuffix: ".e",
@@ -858,7 +860,7 @@ export class Bridge {
         sats: sats.toString(),
         mappingKey,
         tokenKey,
-        origin: { chainId: origin.chainId, token: origin.token, meta: origin.meta },
+        origin: { chainId: origin.chainId, token: origin.token, meta: origin.meta, vault: origin.vault ?? null },
         contract,
         contractHash: ch,
       };
@@ -923,6 +925,9 @@ export class Bridge {
       symbol: c.origin.meta.symbol,
       name: c.origin.meta.name,
       decimals: c.origin.meta.decimals,
+      // The vault that took this token's first deposit holds its escrow, and
+      // its payouts come from there.
+      ...(c.origin.vault ? { vault: c.origin.vault } : {}),
       assetId: c.asset,
       reissuanceToken: c.token,
       entropy: c.entropy,
@@ -1834,7 +1839,7 @@ export class Bridge {
     }
     // Pin the vault holding this source's escrow now, so a later config change
     // cannot redirect an in-flight release to a vault that never held it.
-    rec.vault = src.vault ?? this.cfg.vaultAddress ?? null;
+    rec.vault = src.vault ?? mapping.vault ?? this.cfg.vaultAddress ?? null;
     rec.symbol = mapping.symbol;
 
     const units = atomsToUnits(rec.sats, src.decimals, mapping.precision);

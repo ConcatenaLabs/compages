@@ -439,7 +439,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           app: "Compages",
           ethChainId: cfg.ethChainId,
           ethChainName: cfg.ethChainName,
-          vaultAddress: cfg.vaultAddress,
+          // The vault the page sends deposits to. `vaultAddress` stays the
+          // oldest vault, which anchors how deposit records are keyed.
+          vaultAddress: cfg.depositVault ?? cfg.vaultAddress,
           // Every vault, not just the primary one. More than one can hold
           // escrow at a time, and naming only the first understates where user
           // funds actually sit.

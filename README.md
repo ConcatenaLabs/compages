@@ -604,6 +604,7 @@ Configuration reference (`daemon/config.example.json`):
 | `ethRpcUrl` | Ethereum JSON-RPC endpoint (must support `eth_getLogs`) |
 | `vaultAddress`, `vaultDeployBlock` | The primary `CompagesVault` and the block to start scanning from |
 | `vaults` | Optional list of `{address, deployBlock}`; the daemon watches every vault in it (`vaultAddress` stays the primary). Omit to watch `vaultAddress` alone |
+| `depositVault` | The vault the web page sends new deposits to, when it is not `vaultAddress`. `vaultAddress` never changes once deposits exist: deposit records of the primary vault are keyed by their bare number. A token's first deposit fixes which vault holds its escrow and pays its redemptions |
 | `ethFinality` | `finalized` (default): a deposit mints once Ethereum finalizes its block, so no Ethereum reorg can undo a deposit that was already minted. `confirmations`: after `ethConfirmations` blocks instead, for local test chains |
 | `ethConfirmations` | Confirmations before a deposit is processed when `ethFinality` is `confirmations` |
 | `ethLogChunk` | Max block range per `eth_getLogs` call |
