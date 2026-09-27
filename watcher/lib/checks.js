@@ -122,6 +122,48 @@ export function reserveShortfall(supplyAtoms, escrowAtoms) {
   return supplyAtoms > escrowAtoms ? supplyAtoms - escrowAtoms : 0n;
 }
 
+/** What a vault's balance of a token contributes as backing: the balance
+ *  less what a version-3 vault has set aside for claimants and for queued or
+ *  cancelled payouts. Those already belong to users whose Sequentia side is
+ *  settled, so counting them would hide a shortfall of that size. Never
+ *  negative. */
+export function backingFrom(held, { owed = 0n, queued = 0n, cancelled = 0n } = {}) {
+  const reserved = BigInt(owed) + BigInt(queued) + BigInt(cancelled);
+  const h = BigInt(held);
+  return h > reserved ? h - reserved : 0n;
+}
+
+/** Whether a shortfall has lasted long enough to count as a breach: a brief
+ *  gap (a redemption paid out a few seconds before its burn) never does. */
+export function reserveBreached(shortfall, heldMs, breachMinutes = 10) {
+  return Boolean(shortfall) && shortfall > 0n && heldMs >= breachMinutes * 60_000;
+}
+
+/** Whether a problem pulls the brake: only a critical one about the bridge
+ *  itself, never a fault of the watcher's own data source. */
+export function shouldBrake(p) {
+  return p.severity === "critical" && !p.noBrake;
+}
+
+/** What the brake acts on for problem `p`: the vaults to pause (the one
+ *  named, or every vault when a whole asset is short) and the daemon assets
+ *  to halt (the one named, or every asset a vault-level fault's token backs).
+ *  `assets` is the daemon's /api/assets list. The daemon names ether "eth"
+ *  where the vault's books name it by the zero address; both mean ether. */
+export function brakeTargets(p, vaults, assets) {
+  const pause = new Set();
+  if (p.vault) pause.add(p.vault);
+  if (p.assetId) for (const v of vaults) pause.add(v.address);
+  let halt = [];
+  if (p.assetId) halt = [p.assetId];
+  else if (p.token) {
+    const want = String(p.token).toLowerCase();
+    const tokenOf = (s) => (s.token === "eth" ? ETHER : String(s.token).toLowerCase());
+    halt = assets.filter((m) => (m.sources ?? []).some((s) => tokenOf(s) === want)).map((m) => m.assetId);
+  }
+  return { pause, halt };
+}
+
 /** Tracks how long each condition has held, so a brief, explainable gap (a
  *  redemption paid out a few seconds before its burn) never raises an
  *  alarm, while one that persists does. */

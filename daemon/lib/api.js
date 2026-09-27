@@ -23,6 +23,136 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
+/** The /64 an IPv6 address belongs to, as "a:b:c:d::/64", or null when `ip`
+ *  is not an IPv6 address this can read. The address is expanded first:
+ *  a compressed zero run inside the first four groups ("2001:db8::1") must
+ *  not make every host of that /64 look like a network of its own. */
+export function ipv6Prefix64(ip) {
+  const addr = String(ip).split("%")[0].toLowerCase();
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const groupsOf = (s) => (s ? s.split(":") : []);
+  const head = groupsOf(halves[0]);
+  const tail = halves.length === 2 ? groupsOf(halves[1]) : [];
+  // A trailing dotted IPv4 part stands for the last two groups.
+  const width = (gs) => gs.length + (gs.length && gs[gs.length - 1].includes(".") ? 1 : 0);
+  const fill = 8 - width(head) - width(tail);
+  if (halves.length === 1 ? fill !== 0 : fill < 1) return null;
+  const groups = [...head, ...Array(fill).fill("0"), ...tail].slice(0, 4);
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return null;
+  return groups.map((g) => parseInt(g, 16).toString(16)).join(":") + "::/64";
+}
+
+/** The client a request counts against: the socket peer, or the first
+ *  X-Forwarded-For hop when the daemon sits behind a reverse proxy it trusts
+ *  (`trustProxy`). One IPv6 client owns a whole /64, so it counts as one. */
+export function clientIpOf(req, trustProxy = false) {
+  let ip = req.socket?.remoteAddress ?? "unknown";
+  if (trustProxy) {
+    const fwd = String(req.headers?.["x-forwarded-for"] ?? "").split(",")[0].trim();
+    if (fwd) ip = fwd;
+  }
+  if (ip.includes(":") && !ip.toLowerCase().startsWith("::ffff:")) ip = ipv6Prefix64(ip) ?? ip;
+  return ip;
+}
+
+/** Fixed one-hour windows per key ("bucket:client"). */
+export class RateLimiter {
+  constructor({ windowMs = 3_600_000, maxKeys = 50_000 } = {}) {
+    this.windowMs = windowMs;
+    this.maxKeys = maxKeys;
+    this.hits = new Map(); // key -> { windowStart, count }
+  }
+  /** Count one call against `key`; true once it exceeds `limit` in the window. */
+  over(key, limit, now = Date.now()) {
+    let h = this.hits.get(key);
+    if (!h || now - h.windowStart > this.windowMs) {
+      h = { windowStart: now, count: 0 };
+      this.hits.set(key, h);
+    }
+    h.count++;
+    if (this.hits.size > this.maxKeys) this.hits.clear(); // bounded memory under a flood
+    return h.count > limit;
+  }
+}
+
+export const RECORD_GROUPS = ["deposits", "solDeposits", "redemptions", "solRedemptions"];
+
+/** An operator's decision about a record that stopped for a person.
+ *  Every action is appended to the state's admin log. */
+export function resolveRecord(state, log, group, key, action, body) {
+  const list = state.data[group];
+  if (!RECORD_GROUPS.includes(group) || !list || !Object.hasOwn(list, key)) {
+    throw Object.assign(new Error("no such record"), { status: 404 });
+  }
+  const r = list[key];
+  const before = r.status;
+  const isDeposit = group === "deposits" || group === "solDeposits";
+  if (action === "retire") {
+    r.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
+  } else if (action === "mark_delivered" && isDeposit) {
+    if (!/^[0-9a-f]{64}$/.test(String(body.txid ?? ""))) throw Object.assign(new Error("txid required"), { status: 400 });
+    r.steps ??= {};
+    delete r.steps.pendingSend;
+    delete r.steps.sendCandidate;
+    r.steps.sendTxid = body.txid;
+    r.status = "minted";
+  } else if (action === "retry") {
+    // The operator asserts that nothing from the stopped step is in flight
+    // (they checked the chain), so the step may run again.
+    delete r.error;
+    delete r.nextAttemptAt;
+    r.firstFailureAt = undefined;
+    r.attempts = 0;
+    if (isDeposit) {
+      const st = (r.steps ??= {});
+      if (r.status === "delivery_reorged") {
+        delete st.sendTxid;
+        delete r.deliveryFinal;
+      }
+      for (const k of ["pendingIssue", "pendingMint", "pendingSend", "issueCandidate", "mintCandidate", "sendCandidate"]) delete st[k];
+      // A record on its way back to its depositor stays on that path: sending
+      // it to minting while a refund may still be reinstated on the vault
+      // would pay the depositor on both chains.
+      r.status = String(before).startsWith("refund")
+        ? "refund_pending"
+        : st.issueTxid || st.mintTxid
+          ? "send_retry"
+          : "mint_retry";
+    } else if (r.status === "destroy_manual") {
+      delete r.pendingDestroy;
+      delete r.burn;
+      r.status = "destroy_pending";
+    } else {
+      r.status = "new";
+    }
+  } else {
+    throw Object.assign(new Error("unknown action"), { status: 400 });
+  }
+  state.data.adminLog ??= [];
+  state.data.adminLog.push({ at: new Date().toISOString(), group, key, action, from: before, to: r.status, note: body.note ?? null });
+  state.save();
+  log(`admin: ${action} ${group}/${key} (${before} -> ${r.status})`);
+  return r;
+}
+
+// Error text can carry an RPC endpoint, API key included (ethers puts the
+// request URL into its messages). What the public API returns is scrubbed
+// of URLs in every error-like field.
+const ERROR_FIELDS = new Set(["error", "lastError", "detail", "waiting", "reason", "finality"]);
+export function scrub(v, key = null) {
+  if (typeof v === "string") {
+    return key && ERROR_FIELDS.has(key) ? v.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>,;)]+/gi, "<url>") : v;
+  }
+  if (Array.isArray(v)) return v.map((x) => scrub(x, key));
+  if (v && typeof v === "object") {
+    const out = {};
+    for (const [k, x] of Object.entries(v)) out[k] = scrub(x, k);
+    return out;
+  }
+  return v;
+}
+
 export function startApi(cfg, eth, seq, state, bridge, log) {
   const metaCache = new Map(); // token address -> metadata promise
 
@@ -83,115 +213,16 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
   }
 
   // Per-client limits on the calls that make the bridge do work: every intent
-  // is watched, and every redemption address is a wallet key. The client is
-  // the socket peer, or the first X-Forwarded-For hop when the daemon sits
-  // behind a reverse proxy it trusts (`trustProxy`).
-  const hits = new Map(); // ip -> { windowStart, count }
-  function clientIp(req) {
-    let ip = req.socket.remoteAddress ?? "unknown";
-    if (cfg.trustProxy) {
-      const fwd = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
-      if (fwd) ip = fwd;
-    }
-    // One IPv6 client owns a whole /64; count it as one.
-    if (ip.includes(":") && !ip.startsWith("::ffff:")) ip = ip.split(":").slice(0, 4).join(":") + "::/64";
-    return ip;
-  }
-  function overLimit(req, bucket = "intent", limit = cfg.intentLimitPerHour ?? 30) {
-    const ip = `${bucket}:${clientIp(req)}`;
-    const now = Date.now();
-    let h = hits.get(ip);
-    if (!h || now - h.windowStart > 3_600_000) {
-      h = { windowStart: now, count: 0 };
-      hits.set(ip, h);
-    }
-    h.count++;
-    if (hits.size > 50_000) hits.clear(); // bounded memory under a flood
-    return h.count > limit;
-  }
+  // is watched, and every redemption address is a wallet key.
+  const limiter = new RateLimiter();
+  const overLimit = (req, bucket = "intent", limit = cfg.intentLimitPerHour ?? 30) =>
+    limiter.over(`${bucket}:${clientIpOf(req, cfg.trustProxy)}`, limit);
 
   function adminAuthorized(req) {
     if (!cfg.adminToken) return false;
     const got = String(req.headers.authorization ?? "");
     const want = `Bearer ${cfg.adminToken}`;
     return got.length === want.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want));
-  }
-
-  const RECORD_GROUPS = ["deposits", "solDeposits", "redemptions", "solRedemptions"];
-
-  /** An operator's decision about a record that stopped for a person.
-   *  Every action is appended to the state's admin log. */
-  function resolveRecord(group, key, action, body) {
-    const list = state.data[group];
-    if (!RECORD_GROUPS.includes(group) || !list || !Object.hasOwn(list, key)) {
-      throw Object.assign(new Error("no such record"), { status: 404 });
-    }
-    const r = list[key];
-    const before = r.status;
-    const isDeposit = group === "deposits" || group === "solDeposits";
-    if (action === "retire") {
-      r.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
-    } else if (action === "mark_delivered" && isDeposit) {
-      if (!/^[0-9a-f]{64}$/.test(String(body.txid ?? ""))) throw Object.assign(new Error("txid required"), { status: 400 });
-      r.steps ??= {};
-      delete r.steps.pendingSend;
-      delete r.steps.sendCandidate;
-      r.steps.sendTxid = body.txid;
-      r.status = "minted";
-    } else if (action === "retry") {
-      // The operator asserts that nothing from the stopped step is in flight
-      // (they checked the chain), so the step may run again.
-      delete r.error;
-      delete r.nextAttemptAt;
-      r.firstFailureAt = undefined;
-      r.attempts = 0;
-      if (isDeposit) {
-        const st = (r.steps ??= {});
-        if (r.status === "delivery_reorged") {
-          delete st.sendTxid;
-          delete r.deliveryFinal;
-        }
-        for (const k of ["pendingIssue", "pendingMint", "pendingSend", "issueCandidate", "mintCandidate", "sendCandidate"]) delete st[k];
-        // A record on its way back to its depositor stays on that path: sending
-        // it to minting while a refund may still be reinstated on the vault
-        // would pay the depositor on both chains.
-        r.status = String(before).startsWith("refund")
-          ? "refund_pending"
-          : st.issueTxid || st.mintTxid
-            ? "send_retry"
-            : "mint_retry";
-      } else if (r.status === "destroy_manual") {
-        delete r.pendingDestroy;
-        delete r.burn;
-        r.status = "destroy_pending";
-      } else {
-        r.status = "new";
-      }
-    } else {
-      throw Object.assign(new Error("unknown action"), { status: 400 });
-    }
-    state.data.adminLog ??= [];
-    state.data.adminLog.push({ at: new Date().toISOString(), group, key, action, from: before, to: r.status, note: body.note ?? null });
-    state.save();
-    log(`admin: ${action} ${group}/${key} (${before} -> ${r.status})`);
-    return r;
-  }
-
-  // Error text can carry an RPC endpoint, API key included (ethers puts the
-  // request URL into its messages). What the public API returns is scrubbed
-  // of URLs in every error-like field.
-  const ERROR_FIELDS = new Set(["error", "lastError", "detail", "waiting", "reason", "finality"]);
-  function scrub(v, key = null) {
-    if (typeof v === "string") {
-      return key && ERROR_FIELDS.has(key) ? v.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>,;)]+/gi, "<url>") : v;
-    }
-    if (Array.isArray(v)) return v.map((x) => scrub(x, key));
-    if (v && typeof v === "object") {
-      const out = {};
-      for (const [k, x] of Object.entries(v)) out[k] = scrub(x, k);
-      return out;
-    }
-    return v;
   }
 
   function publicDeposit(d) {
@@ -405,7 +436,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           const body = parseJson(await readBody(req));
           if (!body) return send(400, { error: "invalid JSON body" });
           try {
-            return send(200, resolveRecord(String(body.group), String(body.key), String(body.action), body));
+            return send(200, resolveRecord(state, log, String(body.group), String(body.key), String(body.action), body));
           } catch (e) {
             return send(e.status ?? 500, { error: e.message });
           }
@@ -433,20 +464,8 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(404, { error: "not found" });
       }
 
-      if (req.method === "GET" && parts[1] === "health") {
-        const h = await bridge.health();
-        return send(h.status === "failing" ? 503 : 200, h);
-      }
-
-      if (req.method === "GET" && parts[1] === "seqaddress" && parts[2]) {
-        try {
-          return send(200, await bridge.checkSeqAddress(decodeURIComponent(parts[2])));
-        } catch (e) {
-          return send(502, { error: `the Sequentia node could not check the address: ${e.message}` });
-        }
-      }
-
-      // The reads that cost the bridge RPC calls get a limit of their own.
+      // The reads that cost the bridge RPC calls get a limit of their own,
+      // checked before any of them is answered.
       const isHeavyRead =
         req.method === "GET" && ["por", "seqaddress", "token", "health"].includes(parts[1]);
       if (isHeavyRead && overLimit(req, "read", cfg.readLimitPerHour ?? 1200)) {
@@ -459,6 +478,19 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           (["sol", "btc"].includes(parts[1]) && ["wrap", "unwrap"].includes(parts[2])));
       if (isIntent && overLimit(req)) {
         return send(429, { error: "too many requests from this address; try again in an hour" });
+      }
+
+      if (req.method === "GET" && parts[1] === "health") {
+        const h = await bridge.health();
+        return send(h.status === "failing" ? 503 : 200, h);
+      }
+
+      if (req.method === "GET" && parts[1] === "seqaddress" && parts[2]) {
+        try {
+          return send(200, await bridge.checkSeqAddress(decodeURIComponent(parts[2])));
+        } catch (e) {
+          return send(502, { error: `the Sequentia node could not check the address: ${e.message}` });
+        }
       }
 
       if (req.method === "GET" && parts[1] === "status") {

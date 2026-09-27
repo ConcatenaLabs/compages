@@ -36,7 +36,18 @@ import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { Alerts } from "../daemon/lib/alerts.js";
 import { ataAddress, TOKEN_PROGRAM, TOKEN_2022_PROGRAM } from "../daemon/lib/sol.js";
-import { emptyBooks, applyEvent, checkVault, reserveShortfall, Streaks, unitsToAtoms } from "./lib/checks.js";
+import {
+  emptyBooks,
+  applyEvent,
+  checkVault,
+  reserveShortfall,
+  Streaks,
+  unitsToAtoms,
+  backingFrom,
+  reserveBreached,
+  shouldBrake,
+  brakeTargets,
+} from "./lib/checks.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgPath = process.argv[2] ?? path.join(here, "config.json");
@@ -77,15 +88,15 @@ const VAULT_VIEWS = [
 async function backingHeld(address, token) {
   const held = (await vaultBalances(address, [token]))[token];
   const v = new ethers.Contract(address, VAULT_VIEWS, provider);
-  let reserved = 0n;
+  let reserved = {};
   try {
     if (Number(await v.VERSION()) >= 3) {
-      reserved = BigInt(await v.owedTotal(token)) + BigInt(await v.queuedTotal(token)) + BigInt(await v.cancelledTotal(token));
+      reserved = { owed: await v.owedTotal(token), queued: await v.queuedTotal(token), cancelled: await v.cancelledTotal(token) };
     }
   } catch (e) {
     if (e.code !== "CALL_EXCEPTION") throw e; // an older vault reserves nothing
   }
-  return held > reserved ? held - reserved : 0n;
+  return backingFrom(held, reserved);
 }
 
 /** USDC burned on Solana by the bridge's CCTP consolidation and not yet
@@ -342,7 +353,7 @@ async function checkReserves() {
       row.supply = `${supply}`;
       row.escrow = `${escrow}`;
       const held = streaks.observe(`reserve:${m.assetId}`, short !== null && short > 0n, now);
-      if (short && held >= (cfg.breachMinutes ?? 10) * 60_000) {
+      if (reserveBreached(short, held, cfg.breachMinutes ?? 10)) {
         problems.push({
           key: `reserve:${m.assetId}`,
           severity: "critical",
@@ -416,19 +427,11 @@ async function pauseVault(address, why) {
 async function brake(p) {
   // Which vaults the finding concerns: the one named, or every vault that
   // escrows the affected asset.
-  const vaults = new Set();
-  if (p.vault) vaults.add(p.vault);
-  if (p.assetId) for (const v of cfg.vaults) vaults.add(v.address);
-  for (const v of vaults) await pauseVault(v, p.title);
+  for (const v of brakeTargets(p, cfg.vaults, []).pause) await pauseVault(v, p.title);
   if (!cfg.daemonAdminToken) return;
   const assets = await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/assets`).catch(() => []);
-  let ids = [];
-  if (p.assetId) ids = [p.assetId];
-  else if (p.token) {
-    // A vault-level fault: halt every asset backed by that token.
-    ids = assets.filter((m) => m.sources.some((s) => String(s.token).toLowerCase() === p.token)).map((m) => m.assetId);
-  }
-  for (const assetId of ids) {
+  // A vault-level fault halts every asset backed by that token.
+  for (const assetId of brakeTargets(p, cfg.vaults, assets).halt) {
     try {
       await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/admin/halt`, {
         method: "POST",
@@ -467,7 +470,7 @@ async function pass() {
   for (const p of problems) {
     active.add(p.key);
     await alerts.raise(p.key, p.title, p.detail, { priority: p.severity === "critical" ? 5 : 4 });
-    if (p.severity === "critical" && !p.noBrake) await brake(p);
+    if (shouldBrake(p)) await brake(p);
   }
   await alerts.settle(active);
   report = { ...report, lastRun: new Date().toISOString(), problems };
