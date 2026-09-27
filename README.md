@@ -434,6 +434,8 @@ rebuilding its source commit reproduces the deployed bytecode exactly.
 | `operator` | the daemon's hot key | `release`, `refund`, `releaseViaCctp` and `refundViaCctp`, nothing else |
 | `guardian` | an incident-response key | `pauseDeposits`, `pauseReleases` and `cancelRelease`; never unpause, never move funds |
 
+[`contrib/safe-owner.md`](contrib/safe-owner.md) moves the owner role to a Safe multisig (and back), and explains why the guardian stays a single key and the operator a hot one.
+
 **Rate limit and queue.** Each token (address zero for ether) has a token
 bucket set by `setReleaseLimit(token, capacity, refillPerSecond)`. A release
 or refund that fits in the bucket pays at once; one that does not is queued
@@ -898,12 +900,12 @@ compages-watch.js config.json`.
 
 | Path | What it is |
 |---|---|
-| `contracts/` | Foundry project: `src/CompagesVault.sol`, `src/CompagesOftReceiver.sol` (USDT0 and other LayerZero OFT arrivals into the vault), unit tests, deploy script (`forge-std` as a git submodule), and `deployments/sepolia.json`, the deployed vaults |
+| `contracts/` | Foundry project: `src/CompagesVault.sol`, `src/CompagesOftReceiver.sol` (USDT0 and other LayerZero OFT arrivals into the vault), unit tests, the deploy script, `script/SafeOwner.s.sol` (moves the owner role to a Safe), `forge-std` as a git submodule, and `deployments/sepolia.json`, the deployed vaults |
 | `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
-| `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle") |
+| `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle"); `safe-owner.md`, the runbook for moving the vault owner to a Safe, and `safe-owner-rehearsal.sh`, its rehearsal on a Sepolia fork |
 
 The daemon's only runtime dependency is `ethers`.
 
