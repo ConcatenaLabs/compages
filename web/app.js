@@ -65,7 +65,7 @@ const store = {
 // ---------- state ----------
 let status = null; // /api/status
 let assets = []; // /api/assets
-let porAssets = []; // /api/por rows: also names retired assets, which /api/assets omits
+let porAssets = []; // /api/por rows: also names retired assets, which /api/assets omits, so old records can still name their asset
 let haltedAssets = new Map(); // assetId -> "mint" | "all", from /api/health
 let account = null;
 let walletChainId = null;
@@ -207,7 +207,6 @@ function bridgedTicker(symbol, suffix) {
   const base = String(symbol || "").toUpperCase().replace(/[^A-Z0-9.-]/g, "") || "TOKEN";
   return `${base.slice(0, 10)}${suffix}`;
 }
-const retiredNote = (a) => (a?.retired ? a.retired.note || "no longer bridged" : null);
 
 // ---------- links ----------
 const seqSite = () => SEQ_SITES[status?.seqChainLabel] ?? null;
@@ -629,22 +628,17 @@ function tokenEntries() {
       t: "eth",
       title: "ETH",
       sub: `Ether, ${ethName()}'s own coin → ${eth ? tickerOf(eth) : "ETH.e"}`,
-      retired: retiredNote(eth),
     },
   ];
   for (const a of legAssets(ETH_CHAIN())) {
     const s = sourceOn(a, ETH_CHAIN());
     if (!s || s.token === "eth") continue;
-    entries.push({ t: s.token.toLowerCase(), title: a.symbol, sub: `${a.name} → ${tickerOf(a)}`, retired: retiredNote(a) });
+    entries.push({ t: s.token.toLowerCase(), title: a.symbol, sub: `${a.name} → ${tickerOf(a)}` });
   }
   for (const e of entries) {
     const hay = `${e.title} ${e.sub} ${e.t}`.toLowerCase();
     if (q && !hay.includes(q)) continue;
-    items.push(
-      e.retired
-        ? { title: e.title, sub: `retired: ${e.retired}`, disabled: true }
-        : { title: e.title, sub: e.sub, pick: () => pickToken(e.t, e.title) }
-    );
+    items.push({ title: e.title, sub: e.sub, pick: () => pickToken(e.t, e.title) });
   }
   return items;
 }
@@ -767,7 +761,6 @@ async function selectToken(t) {
         exists: true,
         unified: a.unified,
         supervised: isSupervised(a),
-        retired: retiredNote(a),
       }
     : {
         ticker: info.bridged && info.ticker ? info.ticker : bridgedTicker(info.symbol, ".e"),
@@ -776,7 +769,6 @@ async function selectToken(t) {
         exists: Boolean(info.bridged),
         unified: false,
         supervised: false,
-        retired: null,
       };
   token = info;
   seqFields.dep?.renote();
@@ -785,16 +777,12 @@ async function selectToken(t) {
   const idLine = isEth
     ? `ether, ${escapeHtml(ethName())}'s own coin`
     : `<span class="mono">${escapeHtml(info.token)}</span>`;
-  const badge = r.retired
-    ? '<span class="badge retired">retired</span>'
-    : r.exists
-      ? '<span class="badge known">already bridged</span>'
-      : '<span class="badge new">first bridge</span>';
+  const badge = r.exists
+    ? '<span class="badge known">already bridged</span>'
+    : '<span class="badge new">first bridge</span>';
   const tick = `<strong>${escapeHtml(r.ticker)}</strong>`;
   let note;
-  if (r.retired) {
-    note = `The operator has retired ${tick}: ${escapeHtml(r.retired)}. It cannot be bridged.`;
-  } else if (r.exists) {
+  if (r.exists) {
     note =
       `You receive ${tick} on Sequentia. It already exists there` +
       (r.assetId ? ` (asset <span class="mono">${escapeHtml(short(r.assetId))}</span>)` : "") +
@@ -838,7 +826,6 @@ function updateDepositButton() {
     !depositBusy &&
     walletReady() &&
     token &&
-    !token.receive.retired &&
     amt &&
     !amt.error &&
     seqFields.dep?.ok();
@@ -1683,15 +1670,12 @@ function renderAssetList(boxId, searchId, list, emptyText) {
   for (const a of list) {
     const hay = `${a.symbol} ${a.name} ${a.ticker ?? ""} ${a.assetId}`.toLowerCase();
     if (q && !hay.includes(q)) continue;
-    const retired = retiredNote(a);
     const el = document.createElement("div");
-    el.className = "event" + (retired ? " retired" : "");
+    el.className = "event";
     el.innerHTML =
       `<div><div>${escapeHtml(tickerOf(a))} <span class="note">${escapeHtml(a.name)}</span></div>` +
       `<div class="mono">asset ${escapeHtml(a.assetId)}</div></div>` +
-      (retired
-        ? `<div class="state muted">retired: ${escapeHtml(retired)}</div>`
-        : `<div class="state muted">${escapeHtml(formatAtoms(a.mintedSats, precisionOf(a)))} in circulation</div>`);
+      `<div class="state muted">${escapeHtml(formatAtoms(a.mintedSats, precisionOf(a)))} in circulation</div>`;
     box.appendChild(el);
   }
   if (!box.children.length) box.innerHTML = `<span class="note">no match</span>`;
@@ -2920,7 +2904,9 @@ async function refreshReserves() {
     return;
   }
   porAssets = (por.assets ?? []).filter((a) => a.assetId);
-  const rows = (por.assets ?? []).filter((a) => a.escrowTracked || a.chainCirculatingAtoms !== null || a.retired);
+  // Retired assets (issued before a chain reset, their escrow already
+  // returned) back nothing and circulate nowhere, so they are not listed.
+  const rows = (por.assets ?? []).filter((a) => !a.retired && (a.escrowTracked || a.chainCirculatingAtoms !== null));
   if (!rows.length) {
     box.innerHTML = `<div class="center">No bridged assets yet.</div>`;
     return;
@@ -2931,11 +2917,9 @@ async function refreshReserves() {
     const supply = formatAtoms(a.chainCirculatingAtoms, precision);
     const locked = formatAtoms(a.escrowedAtoms, precision);
     const label = a.ticker ?? a.symbol ?? (a.assetId ? short(a.assetId) : "unknown asset");
-    const retired = a.retired ? a.retired.note || "no longer bridged" : null;
     let verdict;
     let vcls = "";
-    if (retired) verdict = "retired";
-    else if (a.backed === true) {
+    if (a.backed === true) {
       verdict = "fully backed";
       vcls = "ok";
     } else if (a.backed === false) {
@@ -2945,16 +2929,13 @@ async function refreshReserves() {
     else verdict = "locked amount not measured";
 
     const row = document.createElement("div");
-    row.className = "porrow" + (retired ? " retired" : "");
+    row.className = "porrow";
     const lines = [];
-    if (!retired || supply !== null || locked !== null) {
-      lines.push(
-        `${supply === null ? "amount in circulation unknown" : `${supply} in circulation`} · ` +
-          `${locked === null ? "locked amount not measured" : `${locked} locked`}`
-      );
-    }
-    if (retired) lines.push(`Retired by the operator: ${retired}.`);
-    else if (a.backed === null && a.chainSupplyError) lines.push(`Cannot be checked: ${plainSupplyError(a.chainSupplyError)}.`);
+    lines.push(
+      `${supply === null ? "amount in circulation unknown" : `${supply} in circulation`} · ` +
+        `${locked === null ? "locked amount not measured" : `${locked} locked`}`
+    );
+    if (a.backed === null && a.chainSupplyError) lines.push(`Cannot be checked: ${plainSupplyError(a.chainSupplyError)}.`);
     if (Array.isArray(a.sources) && a.sources.length) {
       const per = a.sources.map((s) => {
         const where = s.chainName ?? `chain ${s.chainId}`;
