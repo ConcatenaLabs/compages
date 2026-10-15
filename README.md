@@ -94,8 +94,7 @@ merely share a symbol.
   asset is built this way: so the issuer can adopt it in place.
 
 The specification is
-[`bridged-usdc-standard.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md)
-in the node repository.
+[`docs/bridged-usdc-standard.md`](docs/bridged-usdc-standard.md).
 
 ## What the bridge does
 
@@ -1340,7 +1339,7 @@ this order, once the supply lock is in place and reconciled:
 
 The full sequence, including the reconciliation that makes the escrow equal
 the circulating supply, is in
-[`bridged-usdc-standard.md`](https://github.com/ConcatenaLabs/Sequentia/blob/master/doc/sequentia/bridged-usdc-standard.md).
+[`docs/bridged-usdc-standard.md`](docs/bridged-usdc-standard.md).
 
 ## Limitations
 

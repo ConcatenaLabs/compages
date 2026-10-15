@@ -67,7 +67,7 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   (token, decimals, escrow, vault, token program) live in `mapping.sources`. Never model it as one
   mapping per chain sharing an asset id: supply increments and decrements would land on different
   records. It is issued in a ceremony before any deposit, with zero supply and one reissuance
-  token. Spec: `doc/sequentia/bridged-usdc-standard.md` in the node repo.
+  token. Spec: `docs/bridged-usdc-standard.md`.
 - **Never lowercase a non-EVM token key.** Ethereum addresses are case-insensitive hex; Solana
   mints are base58, where case is significant. Lowercasing one yields a key no deposit can match,
   so a configured source silently fails to route and the next deposit mints a duplicate asset.

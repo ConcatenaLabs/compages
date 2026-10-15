@@ -380,7 +380,7 @@ export class Eth {
 // so the remainder stays locked in escrow forever and escrow quietly exceeds
 // circulating supply. Matching an asset's precision to its source decimals
 // makes the shift zero, which is why the unified USDC asset is precision 6
-// (doc/sequentia/bridged-usdc-standard.md in the node repo): 1 atom is exactly
+// (docs/bridged-usdc-standard.md): 1 atom is exactly
 // 1 micro-USDC on Ethereum and on Solana, so neither direction can lose value.
 
 export const DEFAULT_ASSET_PRECISION = 8;
