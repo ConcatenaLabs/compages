@@ -13,7 +13,7 @@ from three chains:
   `tb1...` address it uses for Sequentia assets. For the few uses that need
   bitcoin on the Sequentia chain itself (confidential transactions, and
   anything that needs a covenant, such as a resting limit order), BTC sent to
-  a bridge address is wrapped 1:1 as SBTC (custody and mint/burn are performed
+  a bridge address is wrapped 1:1 as SBTC (custody, issuance and redemption are performed
   by the sbtc-bridge service; Compages is the public front for it).
 - **Solana**: send SOL or any SPL token to a bridge address and receive the
   matching Sequentia asset (SOL.s, or the token under its own `.s` ticker);
