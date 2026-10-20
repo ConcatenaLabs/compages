@@ -25,6 +25,7 @@ import crypto from "node:crypto";
 import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
 import { MintLimiter, mintNext } from "./limiter.js";
+import { LeafDeposits } from "./leaves.js";
 import { unitsToSats, satsToUnits, unitsToAtoms, atomsToUnits } from "./eth.js";
 import {
   transferTx,
@@ -190,6 +191,17 @@ export class Bridge {
     // Every reissuance through a mint limiter covenant, when one is configured
     // (see limiter.js): the wallet then never holds a reissuance token.
     this.limiter = cfg.mintLimiter ? new MintLimiter(cfg, seq, log) : null;
+    // Deposits paid as Arca leaves, when the bridge has a leaf wallet (see
+    // leaves.js).
+    this.leaves = cfg.leafWallet ? new LeafDeposits(this) : null;
+  }
+
+  /** The token key of an Ethereum token named by address or "eth", or null. */
+  normalizedEthTokenKey(token) {
+    const t = String(token).trim();
+    if (t.toLowerCase() === "eth") return tokenKeyOf(this.cfg.ethChainId, "eth");
+    if (!ethers.isAddress(t)) return null;
+    return tokenKeyOf(this.cfg.ethChainId, t.toLowerCase());
   }
 
   /** Run `fn` unless the record `key` is already being driven elsewhere. */
@@ -845,6 +857,25 @@ export class Bridge {
     dep.sats = sats.toString();
     if (mapping && this.haltedReason(mapping.assetId, "mint")) return this.holdForHalt(dep, mapping.assetId);
 
+    // A deposit to a leaf intent's address: paid as an Arca leaf, or, when
+    // its receive request can no longer be paid, the intent's fallback. The
+    // decision is made once, before anything is minted.
+    const leafIntent = this.state.data.leafIntents?.[dep.seqAddress];
+    if (leafIntent && !dep.leaf?.route) {
+      if (this.leaves) {
+        await this.leaves.decide(dep, mapping);
+      } else {
+        dep.leaf = { intent: dep.seqAddress, route: "fallback", fallbackReason: "the bridge has no leaf wallet configured" };
+        if (leafIntent.fallback?.kind === "address") dep.seqAddress = leafIntent.fallback.address;
+        else {
+          dep.status = "refund_pending";
+          dep.refundReason = "the bridge has no leaf wallet configured, and the intent names no fallback address";
+        }
+        this.state.save();
+      }
+      if (dep.status === "refund_pending") return;
+    }
+
     // 3. First bridge of this token: issue a brand-new reissuable asset with
     //    exactly the deposit amount. Later deposits: reissue the same asset.
     mapping = await this.ensureMintedMapping(dep, dep.tokenKey, sats, {
@@ -861,6 +892,9 @@ export class Bridge {
     this.creditEscrow(mapping, dep.tokenKey, dep.amountUnits, dep);
     this.state.save();
 
+    // A leaf deposit's mint went to the leaf wallet: the leaf phase boards
+    // and pays it from there.
+    if (dep.leaf?.route === "leaf") return this.leaves.minted(dep);
     await this.sendMinted(dep, mapping);
   }
 
@@ -1140,11 +1174,13 @@ export class Bridge {
         const blockMs = this.cfg.seqBlockMs ?? 60_000;
         return wait(verdict.refused, Math.max(15_000, (verdict.waitBlocks ?? 1) * blockMs));
       }
+      // A leaf deposit is minted straight into the leaf wallet.
+      const mintTo = dep.leaf?.route === "leaf" ? await this.leaves.mintTo(dep) : null;
       dep.steps.pendingMint = true;
       this.state.save();
       let built;
       try {
-        built = await this.limiter.buildMint(mapping, now.confirmations, sats);
+        built = await this.limiter.buildMint(mapping, now.confirmations, sats, mintTo);
       } catch (e) {
         this.deferMint(dep, "pendingMint", e);
         return null;
@@ -2465,6 +2501,9 @@ export class Bridge {
     if (!v.isvalid) {
       throw Object.assign(new Error("invalid Sequentia address"), { badRequest: true });
     }
+    if (this.state.data.leafIntents?.[seqAddress]) {
+      throw Object.assign(new Error("that is a leaf deposit address of this bridge, not a destination"), { badRequest: true });
+    }
     const s = this.state.data;
     for (const [addr, it] of Object.entries(s.solWrapIntents)) {
       if (it.seqAddress === seqAddress) {
@@ -3526,6 +3565,8 @@ export class Bridge {
         });
       }
     }
+
+    if (this.leaves) problems.push(...this.leaves.problems());
 
     const ATTENTION = new Set([
       "failed_manual",

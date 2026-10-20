@@ -16,3 +16,4 @@ watcher/*.key
 reserves/config.json
 reserves/state/
 reserves/*.key
+e2e/run-leaf/

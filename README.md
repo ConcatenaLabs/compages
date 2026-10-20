@@ -275,7 +275,9 @@ operator, never released on the wrong chain.
    mapping. Every later deposit of that token, by anyone, reissues the same
    asset. A token declared under `unified` is routed to the asset issued in
    the start-up ceremony instead, which already exists before any deposit.
-4. The minted amount is sent to the user's Sequentia address.
+4. The minted amount is sent to the user's Sequentia address, or, for a
+   deposit to a leaf intent's address, paid into an Arca receive request
+   (below).
 
 Amounts convert 1:1 with decimal normalization at the asset's precision: an
 ordinary bridged asset has 8 decimal places, so a token with more than 8
@@ -283,6 +285,52 @@ decimals bridges at a granularity of `10^(d-8)` base units (the web app
 limits inputs accordingly, and the daemon refunds a deposit too small to
 represent); a unified stablecoin converts at its issuer's precision (6 for
 USDC and EURC).
+
+### Deposits paid as Arca leaves
+
+A deposit can arrive as a leaf of an Arca operator instead of an on-chain
+coin: the depositor's Arca wallet hands out a receive request, and the bridge
+pays the minted amount into it out of round. This route is reachable through
+the API and the wallets' developer mode; the web page does not offer it.
+
+1. The depositor asks the bridge to bind the request to an address
+   (`POST /api/leaf/intent`, with the request and the token). A request is
+   refused before anything is locked when it is for another operator or
+   chain, names an amount, asks for another asset, is for a token not
+   bridged yet or an asset the operator does not serve, or lapses within
+   `leafWallet.intentLapseSeconds` (two days by default). The answer is a
+   fresh Sequentia address of the bridge's wallet and the fallback the
+   deposit takes if the request cannot be paid when it lands: an on-chain
+   delivery to the `fallbackAddress` the depositor named, or else a refund
+   on Ethereum.
+2. The depositor deposits with that address as the Sequentia address. The
+   vault's event carries the short address, and the daemon maps it to the
+   request.
+3. When the deposit lands, the request is checked again: the bridge's leaf
+   wallet still on its operator and chain, the asset served, the request
+   unused and not lapsing within `leafWallet.landingLapseSeconds` (six hours
+   by default), the amount above the operator's smallest leaf. A request
+   that fails takes the stated fallback, with the reason on the record. A
+   request is paid once; a later deposit to its address takes the fallback.
+4. The mint limiter mints exactly what the deposit credits, straight into
+   the bridge's own leaf wallet (an `arca` wallet on the operator, driven
+   through its command line), which boards it, paying the board's fee in
+   `leafWallet.feeAsset`.
+5. Once the board is final (its block certified and its anchor buried two
+   Bitcoin blocks), the wallet pays the request out of round from that coin
+   alone. The leaf holds the deposit's credit less the transfer's margins,
+   the few atoms every out-of-round payment leaves in the asset moved for
+   the fees of its pre-signed transactions; the record states both
+   (`leaf.paid`).
+
+The leaf is minted per deposit, never ahead of one, so circulating supply
+never exceeds escrow and the reserves read from the two chains alone stay
+the whole proof. One asset's leaf deposits pass through the wallet one at a
+time, from board to payment, so each is paid from its own coin. A deposit
+whose request lapses, or is refused by the operator, after its board is
+`leaf_held`: its leaf stays in the bridge's wallet, counted as owed to the
+deposit, until an operator pays a new request of the depositor's
+(`admin.js leaf-pay`). The runbook is [`docs/leaf-deposits.md`](docs/leaf-deposits.md).
 
 ### Sequentia → Ethereum (return, then release)
 
@@ -674,7 +722,9 @@ their progress toward finality as numbers (`finalityProgress`:
 |---|---|
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
 | `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`), and whether the asset is `supervised` (freezable by its issuer and never blinded) |
-| `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero. A unified asset also lists its CCTP consolidations in flight (`inTransit`) and those of the last week (`recentTransfers`, each with its Solana burn and CCTP nonce) |
+| `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero. A unified asset also lists its CCTP consolidations in flight (`inTransit`) and those of the last week (`recentTransfers`, each with its Solana burn and CCTP nonce). `reconciliation` says where the supply is: what the bridge holds (`nodeWalletAtoms`, and `leafWalletAtoms`: its leaf wallet on the chain, in boards and in leaves, with a leaf mint still in the mempool), what users hold, what is owed to deposits not delivered yet (`owedAtoms`) and what users returned that is not released yet (`returnedAtoms`); `reconciles` is true when escrow equals users' holdings plus owed plus returned, and `leaves` lists the boards in flight and the leaves paid out with their margins |
+| `POST /api/leaf/intent` `{"request": "arca:...", "token": "0x...", "fallbackAddress": "..."}` | Bind an Arca receive request to a fresh Sequentia address for a deposit paid as a leaf (see "Deposits paid as Arca leaves"); `token` (or the request's asset) names what is deposited, `fallbackAddress` is optional. Asking again with the same request answers the same address |
+| `GET /api/leaf/intent/<seqAddress>` | A leaf intent: its asset, operator, the request's key and lapse, its fallback, and every deposit made to it |
 | `GET /api/por/history` | The index of signed reserve snapshots (see "Signed reserve snapshots"): every snapshot's height, payload hash and link. 404 before the first snapshot, and when `porHistoryDir` is not set |
 | `GET /api/por/history/<height>` | One signed reserve snapshot, byte for byte as it was signed; the height is a plain decimal number |
 | `GET /api/token/<address\|eth>` | Metadata for a token and whether it is already bridged (used by the front-end's token lookup) |
@@ -694,7 +744,7 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/redeem/by-eth/<ethAddress>` (optionally `?domain=<cctpDomain>`) | The redemption address bound to an Ethereum address, and its redemptions. Each Ethereum (or Solana) destination has one redemption address: asking again returns the same one. An address can have one per payout chain; `?domain=` picks the one paying out on that CCTP domain (0 is the vault's own chain) |
 | `GET /api/seqaddress/<address>` | Whether an address is a valid Sequentia address, whether it is a blinded one, and for a blinded one its `unconfidential` form (where supervised assets are delivered); checked before any funds move |
 | `GET /api/health` | The operator's health report (see "Watch it and act on what it reports"); HTTP 503 while anything critical is wrong |
-| `/api/admin/*` | Operator actions (records, resolve, halt, unhalt, retire-asset); exists only with `adminToken`, and answers 404 without it |
+| `/api/admin/*` | Operator actions (records, resolve, halt, unhalt, retire-asset, the mint limiter's moves, leaf-pay); exists only with `adminToken`, and answers 404 without it |
 
 Deposit records move through the statuses `minting`, `mint_retry` and
 `send_retry` (a safe retry, with backoff), `unresolved` (a chain write whose
@@ -707,7 +757,11 @@ delay), `refunded`, `refund_cancelled` (a queued refund the guardian
 cancelled), `refund_discarded` (a cancelled refund the owner discarded on the
 vault; an operator decides), `refund_failed_manual`, and `failed_manual` (paused
 for operator review; Solana deposits use `dust_manual` instead of the refund
-states). A deposit of a halted asset waits in `mint_retry` with a `waiting`
+states). A deposit paid as a leaf goes from `minting` through `leaf_minted`
+(in the leaf wallet, waiting its turn to board), `leaf_boarding` (the board
+in flight) and `leaf_paying` to `minted` with `leaf.paid`, or rests in
+`leaf_held` (its request can no longer take the leaf; an operator pays a new
+one). A deposit of a halted asset waits in `mint_retry` with a `waiting`
 reason; a refund that comes due while its asset is halted stays
 `refund_pending`. Redemption records move through `awaiting_finality`,
 `awaiting_liquidity` (the payout chain's treasury is short; a `waiting`
@@ -796,6 +850,7 @@ Configuration reference (`daemon/config.example.json`):
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
 | `mintLimiter` | Every reissuance through a mint limiter (see "The mint limiter" and [`docs/mint-limiter.md`](docs/mint-limiter.md)): `tool` (the `mint-limiter` binary, in the sequentia-contracts checkout it was built in), `operatorMnemonicFile`, `coldKey` (the cold key's x-only public key), `windowBlocks`, `recoveryDelay` (units of 512 seconds), `defaultAllowance` and `allowances` (atoms per window, by ticker, symbol or mapping key). Unset, the daemon reissues from its wallet |
+| `leafWallet` | Deposits paid as Arca leaves (see "Deposits paid as Arca leaves" and [`docs/leaf-deposits.md`](docs/leaf-deposits.md)): `arca` (the `arca` command line), `datadir` (the bridge's own leaf wallet, made with `arca create` on the operator), `feeAsset` (the accepted asset its boards pay fees in, held on the chain by the leaf wallet; default `seqFeeAsset`), `intentLapseSeconds` (default 172800), `landingLapseSeconds` (default 21600), `syncMinMs`, `syncMaxMs`, `syncBusyMs`, `timeoutMs`. Needs `mintLimiter`. Unset, `/api/leaf/*` answers 404 |
 | `seqBlockMs` | The Sequentia block interval in milliseconds (default 60000), used to time a mint that waits for the next window |
 | `sbtcBridgeUrl`, `sbtcBridgeToken` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg); it decides when a deposit is credited, and reports it per address |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |
@@ -923,6 +978,16 @@ chains through its own endpoints and, once a minute:
   else could mint without limit. A braked or recovered limiter is reported;
   a limiter coin spent while the daemon still names it is reported after
   `limiterSpentMinutes` (default 15).
+- **Checks deposits paid as leaves**: the daemon's reserve report names
+  every board in flight and what its leaf wallet holds; the watcher finds
+  each board on its own indexer, holding the asset and amount the daemon
+  says, and reconciles the escrow and supply it read itself against what
+  the bridge says it holds, owes and was returned. A board missing or
+  holding another amount, or an escrow that does not reconcile, for
+  `leafMinutes` (default 15) is reported; escrow short of users' holdings
+  plus what the bridge owes is critical. Neither pulls the brake by itself:
+  the bridge's holdings are the daemon's figures, and the supply check above
+  brakes on its own.
 - **Checks the daemon**: its `/api/health` must answer, and not "failing",
   within `daemonDownMinutes`.
 
@@ -1005,6 +1070,16 @@ A snapshot describes one Sequentia height H:
   could not be read, never zero), the in-transit total, and `backed`: true or
   false when the supply is exact and every source was measured, `null`
   otherwise.
+- **Deposits paid as leaves** (`leaves`, for an asset the bridge pays as Arca
+  leaves). What the bridge held of the asset (`bridgeHeldAtoms`,
+  `leafWalletAtoms`) and owed to deposits not delivered (`owedAtoms`), every
+  board in flight with its deposit, amount and block height and whether that
+  block is at or below H (`atOrBelowH`), and the leaves paid out
+  (`paidCount`, `paidAtoms`, with their `marginsAtoms`). The leaf wallet
+  cannot be read at a past height, so these are the bridge's figures when the
+  snapshot was taken (`reportedAt`), labelled so; each board's block is read
+  from the chain, and `verify.mjs --seq-rpc` reads it again. A leaf is minted
+  per deposit, never ahead of one, so `backed` needs none of these figures.
 - **Provenance.** The tool's name, version, repository and commit, the
   attester's address, when the snapshot was taken, and `previous`: the height
   and payload hash of the snapshot before it (`null` for the first).
@@ -1198,11 +1273,12 @@ Solana read close to H. A failed run shows as a failed unit
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, `src/CompagesOftReceiver.sol` (USDT0 and other LayerZero OFT arrivals into the vault), unit tests, the deploy script, `script/SafeOwner.s.sol` (moves the owner role to a Safe), `forge-std` as a git submodule, and `deployments/sepolia.json`, the deployed vaults |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/limiter.js` (the mint limiter), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/porhistory.js` (serves the reserve snapshot history), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI and `limiter-move.js` moves tokens into their mint limiters with the daemon stopped |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/limiter.js` (the mint limiter), `lib/leaves.js` (deposits paid as Arca leaves), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/porhistory.js` (serves the reserve snapshot history), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI and `limiter-move.js` moves tokens into their mint limiters with the daemon stopped |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `reserves/` | The signed reserve snapshots (see "Signed reserve snapshots"): `snapshot.mjs` takes one, `verify.mjs` checks them, `keygen.mjs` creates the attestation key; `lib/format.mjs` is the format itself (canonical JSON, hashing, signature and chain checks), with unit tests and an end-to-end test against stand-in nodes |
-| `e2e/` | Full-stack end-to-end test: anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts |
+| `e2e/` | Full-stack end-to-end tests: `run-e2e.sh` (anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts) and `run-leaf-e2e.sh` (deposits paid as Arca leaves, on an anchored proof-of-stake regtest chain with an Arca operator; `leaf-chain.mjs` produces its blocks) |
+| `docs/` | Runbooks: [`mint-limiter.md`](docs/mint-limiter.md), [`leaf-deposits.md`](docs/leaf-deposits.md), and the bridged USDC standard |
 | `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle"); `safe-owner.md`, the runbook for moving the vault owner to a Safe, and `safe-owner-rehearsal.sh`, its rehearsal on a Sepolia fork |
 
 The daemon's only runtime dependency is `ethers`.
@@ -1233,6 +1309,9 @@ simulation; the record state machines (what a paid, owed, queued, cancelled,
 discarded or CCTP payout does to a redemption or refund, and how a payout
 the vault already took on is read back from its queue and events); the
 Bitcoin-anchor finality gate; an operator's retry and resolve decisions;
+deposits paid as leaves (receive requests, the landing check and its
+fallbacks, and a board or payment whose answer was lost, found in the wallet
+rather than made twice, against a stand-in wallet);
 per-client rate limits, including IPv6 /64 grouping and trusted proxies; the
 redaction of RPC URLs from API errors; alert cooldowns; and the mint
 limiter's window rule, as the covenant computes it:
@@ -1245,8 +1324,8 @@ npm test
 
 Watcher unit tests: rebuilding a vault's books from its events, backing net
 of owed, queued and cancelled reservations, how long a reserve gap must last
-before it is a breach, what the brake pauses and halts, and the mint limiter
-checks, with the vendored descriptor reproducing every golden vector:
+before it is a breach, what the brake pauses and halts, the leaf route's
+boards and reconciliation, and the mint limiter checks, with the vendored descriptor reproducing every golden vector:
 
 ```
 cd watcher
@@ -1315,6 +1394,34 @@ takes about a quarter of an hour.
 ```
 SEQ_BIN_DIR=~/sequentia-core-<version>/bin e2e/run-e2e.sh
 ```
+
+Deposits paid as Arca leaves have a suite of their own:
+
+```
+SEQUENTIAD_EXEC=~/sequentia-core-<version>/bin/sequentiad ARCA_BIN_DIR=<dir holding arca, arcad, arca-signer> \
+  PG_BIN_DIR=/usr/lib/postgresql/16/bin MINT_LIMITER=<mint-limiter> e2e/run-leaf-e2e.sh
+```
+
+It brings up anvil and the vault, a Sequentia proof-of-stake regtest chain
+anchored to a Bitcoin regtest parent (its blocks certified by the test
+committee, so an Arca operator's finality holds), PostgreSQL, an Arca
+operator (`arca-signer` and `arcad` from
+[ConcatenaLabs/arca](https://github.com/ConcatenaLabs/arca)), the bridge's
+leaf wallet and a depositor's `arca` wallet, then checks that: an asset
+bridged on the chain is served once the operator reloads; requests for
+another operator or chain, naming an amount or another asset, or for a token
+not bridged are refused before any deposit; a deposit for the depositor's
+fresh request arrives in that wallet as a leaf of the deposit's credit less
+the transfer's margins, through the daemon killed once with the mint not
+boarded and once with the board in flight, the reserves reconciling exactly
+before, during and after; the daemon killed right after the wallet paid and
+before it recorded the payment finds the payment on restart and pays nothing
+twice; a second deposit to a used request is refunded on Ethereum; and a
+request that has lapsed when its deposit lands is delivered on the chain to
+the intent's fallback address. With `AUDIT_SCRIPT` set to the node
+repository's `contrib/asset-supply-audit/audit.py` it also takes a reserve
+snapshot (a dry run) and checks its leaf figures. Every port is chosen free;
+the run lives in `e2e/run-leaf` and takes about two minutes.
 
 GitHub Actions runs all of the above on every pull request and every push to
 `main` (`.github/workflows/ci.yml`): `forge build` and `forge test`, the

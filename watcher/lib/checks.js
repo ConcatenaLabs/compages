@@ -267,3 +267,58 @@ export function limiterProblems(assetId, symbol, view, { coin = null, expectedSc
   }
   return p;
 }
+
+/** Escrow against where the asset is, as the daemon's reserve report breaks
+ *  it down (`reconciliation` in /api/por) but with escrow and supply the
+ *  watcher read itself: users hold the supply less what the bridge holds,
+ *  and escrow must equal what users hold plus what the bridge owes to
+ *  deposits not delivered yet plus what users returned that is not released
+ *  yet. Returns { usersHold, diff } in atoms (diff = escrow - accounted), or
+ *  null when a figure is missing. */
+export function leafReconciliation({ escrow, supply, bridgeHeld, owed, returned }) {
+  if ([escrow, supply, bridgeHeld, owed, returned].some((x) => x === null || x === undefined)) return null;
+  const usersHold = BigInt(supply) - BigInt(bridgeHeld);
+  return { usersHold, diff: BigInt(escrow) - (usersHold + BigInt(owed) + BigInt(returned)) };
+}
+
+/** What is wrong with the leaf route of one asset.
+ *
+ *  `leaves` is the daemon's `reconciliation.leaves` for the asset; `boards`
+ *  maps each board txid it names to what the watcher's own indexer shows of
+ *  it ({ found, asset, value } of the output paying the asset, or { found:
+ *  false }), with `missingForMs`, how long it has been missing; `recon` is
+ *  leafReconciliation() and `offForMs` how long its diff has not been zero.
+ *  A board the chain does not show, or an escrow that does not reconcile,
+ *  for longer than `minutes` is reported. Escrow short of what users hold
+ *  plus what the bridge owes is critical; it pulls no brake by itself, since
+ *  the owed figure is the daemon's and the hard check (supply against
+ *  escrow) brakes on its own. */
+export function leafProblems(assetId, symbol, leaves, { boards = {}, recon = null, offForMs = 0 } = {}, minutes = 15) {
+  const p = [];
+  if (!leaves) return p;
+  for (const b of leaves.boardsInFlight ?? []) {
+    if (!b.txid) continue;
+    const seen = boards[b.txid];
+    if (!seen || (seen.missingForMs ?? 0) < minutes * 60_000) continue;
+    if (!seen.found) {
+      p.push({ key: `leafboard:${assetId}:${b.txid}`, severity: "warning", title: `${symbol}: a board the daemon names is not on the chain`,
+        detail: `deposit ${b.deposit}, board ${b.txid}, ${b.atoms} atoms`, assetId });
+    } else if (seen.asset !== assetId || String(seen.value) !== String(b.atoms)) {
+      p.push({ key: `leafboard:${assetId}:${b.txid}`, severity: "critical", title: `${symbol}: a board the daemon names does not hold what it says`,
+        detail: `board ${b.txid} pays ${seen.value} of ${seen.asset}, the daemon says ${b.atoms} of ${assetId}`, assetId, noBrake: true });
+    }
+  }
+  if (recon && recon.diff !== 0n && offForMs >= minutes * 60_000) {
+    p.push({
+      key: `leafrecon:${assetId}`,
+      severity: recon.diff < 0n ? "critical" : "warning",
+      title: recon.diff < 0n
+        ? `${symbol}: escrow is short of what users hold plus what the bridge owes`
+        : `${symbol}: escrow exceeds what users hold plus what the bridge owes`,
+      detail: `escrow less users' holdings, owed and returned is ${recon.diff} atoms, for ${Math.round(offForMs / 60_000)} min`,
+      assetId,
+      noBrake: true,
+    });
+  }
+  return p;
+}

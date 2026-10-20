@@ -119,6 +119,18 @@ async function main() {
     );
   }
 
+  if (bridge.leaves) {
+    try {
+      const i = await bridge.leaves.wallet.info(true);
+      log(
+        `leaf wallet ${cfg.leafWallet.datadir}: operator ${i.operator}, chain ${i.genesis}, ` +
+          `serving ${[...i.served.keys()].length} asset(s); board fees in ${bridge.leaves.feeAsset}`
+      );
+    } catch (e) {
+      log(`WARNING: the leaf wallet cannot be read; leaf deposits wait until it can: ${e.message}`);
+    }
+  }
+
   if (!state.data.lastEthBlock) {
     state.data.lastEthBlock = cfg.vaultDeployBlock - 1;
   }
@@ -171,6 +183,7 @@ async function main() {
       ["ethDeposits", () => bridge.processDeposits()],
       ["depositRetries", () => bridge.retryDeposits()],
       ["deliveries", () => bridge.watchDeliveries()],
+      ["leafDeposits", () => (bridge.leaves ? bridge.leaves.advance() : null)],
       ["registry", () => bridge.registerPendingAssets()],
       ["refunds", () => bridge.processRefunds()],
       ["seqRedemptions", () => bridge.processRedemptions()],

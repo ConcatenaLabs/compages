@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { payloadHash, signSnapshot, verifyChain } from "./format.mjs";
 import { readAll, writeSnapshotOnce, writeIndex } from "./store.mjs";
-import { chooseHeight, unitsToAtoms, supplyFromAudit, backedVerdict, lastBlockAtOrBefore } from "./figures.mjs";
+import { chooseHeight, unitsToAtoms, supplyFromAudit, backedVerdict, lastBlockAtOrBefore, leafFigures } from "./figures.mjs";
 import { runAudit, fileSha256, gitCommitOf } from "./audit.mjs";
 import { seqClient, ethProvider, vaultFigures, solClient, escrowAccounts, readSolanaAccounts, heldUnits, checkTransfer } from "./chains.mjs";
 
@@ -187,6 +187,19 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
       sources.push(src);
     }
     const escrow = escrowMeasured ? escrowAtoms.toString() : null;
+    // Deposits paid as Arca leaves: what the bridge held and owed, every
+    // board in flight (its block checked against H) and every leaf paid out.
+    let leaves = null;
+    const rc = (await daemonJson(cfg, `/api/por?asset=${m.assetId}`)).assets?.[0]?.reconciliation;
+    if (rc?.leaves) {
+      const heights = {};
+      for (const b of rc.leaves.boardsInFlight ?? []) {
+        if (!b.txid) continue;
+        const tx = await seq.call("getrawtransaction", [b.txid, true]).catch(() => null);
+        heights[b.txid] = tx?.blockhash ? (await seq.call("getblockheader", [tx.blockhash])).height : null;
+      }
+      leaves = leafFigures(rc, heights, height, now().toISOString());
+    }
     out.push({
       assetId: m.assetId,
       symbol: m.symbol ?? null,
@@ -199,6 +212,7 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
       inTransitAtoms: inTransitAtoms.toString(),
       inTransit,
       backed: backedVerdict({ supply, escrowAtoms: escrow, inTransitAtoms: inTransitAtoms.toString() }),
+      ...(leaves ? { leaves } : {}),
     });
   }
 
