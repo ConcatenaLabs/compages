@@ -377,8 +377,62 @@ export class LeafDeposits {
 
   // ------------------------------------------------------------ the phase
 
-  /** One pass: sync the wallet when due, then move each asset's head deposit
-   *  one step. */
+  /** The fee asset's id: the configured id, or the node's label for it. */
+  async feeAssetId() {
+    if (this._feeId) return this._feeId;
+    const f = String(this.feeAsset ?? "");
+    if (/^[0-9a-f]{64}$/.test(f)) return (this._feeId = f);
+    const id = (await this.bridge.seq.node("dumpassetlabels"))?.[f];
+    if (!id) throw new Error(`the node has no asset labelled ${f}`);
+    return (this._feeId = id);
+  }
+
+  /** Keeps the leaf wallet's on-chain fee coins at about `feeTopUpBoards`
+   *  boards' worth (1,000 vbytes each at the node's fee rate now, about three
+   *  boards apiece), from the node wallet's own stock of the fee asset, which
+   *  pays every Sequentia fee of the bridge: when they fall below a quarter of
+   *  that, the wallet is topped up to it. Only when the leaf wallet's fee
+   *  asset is the bridge's own (`seqFeeAsset`); otherwise its operator funds
+   *  it. A top-up that has not confirmed yet is waited for. Every top-up is
+   *  recorded (`leafFeeTopUps`). */
+  async topUpFees() {
+    const boards = BigInt(this.c.feeTopUpBoards ?? 50);
+    if (!boards || !this.bridge.limiter) return;
+    if (Date.now() - (this._feeCheckedAt ?? 0) < (this.c.feeCheckMs ?? 300_000)) return;
+    this._feeCheckedAt = Date.now();
+    try {
+      const id = await this.feeAssetId();
+      const own = this.cfg.seqFeeAsset;
+      const ownId = /^[0-9a-f]{64}$/.test(String(own)) ? own : (await this.bridge.seq.node("dumpassetlabels"))?.[own];
+      if (id !== ownId) return;
+      const last = this.s.leafFeeTopUps?.at(-1);
+      if (last) {
+        const t = await this.bridge.seq.call("gettransaction", { txid: last.txid }).catch(() => null);
+        if (!t || (t.confirmations ?? 0) < 1) return;
+      }
+      const target = BigInt(await this.bridge.limiter.feeAtoms(1000)) * boards;
+      const have = holdingOf(await this.wallet.balance(), id).onchain;
+      if (have * 4n >= target) return;
+      const amount = target - have;
+      const address = await this.wallet.address();
+      const txid = await this.bridge.seq.call("sendtoaddress", {
+        address,
+        amount: satsToAmount(amount),
+        assetlabel: id,
+        fee_asset_label: own,
+      });
+      (this.s.leafFeeTopUps ??= []).push({ txid, atoms: amount.toString(), address, at: new Date().toISOString() });
+      this.bridge.state.save();
+      delete this.feeTopUpError;
+      this.log(`leaf wallet: topped up its fee coins with ${satsToAmount(amount)} of ${own} (${txid}); it held ${have} atoms`);
+    } catch (e) {
+      this.feeTopUpError = e.message;
+      this.log(`leaf wallet: fee top-up failed: ${e.message}`);
+    }
+  }
+
+  /** One pass: sync the wallet when due, keep its fee coins, then move each
+   *  asset's head deposit one step. */
   async advance() {
     const deps = Object.values(this.s.deposits).filter((d) => LEAF_STATES.includes(d.status));
     const now = Date.now();
@@ -386,6 +440,7 @@ export class LeafDeposits {
     if (busy ? now - this.lastSync >= (this.c.syncBusyMs ?? 5_000) : now >= this.nextSyncAt) {
       await this.syncNow();
     }
+    await this.topUpFees();
     const byAsset = new Map();
     for (const d of deps.sort((a, b) => String(a.leaf.mintedAt ?? a.createdAt).localeCompare(String(b.leaf.mintedAt ?? b.createdAt)))) {
       if (!byAsset.has(d.assetId)) byAsset.set(d.assetId, []);
@@ -732,6 +787,9 @@ export class LeafDeposits {
         title: `${held.length} deposit(s) hold a leaf the receive request can no longer take`,
         detail: `${held.map((d) => d.key).join(", ")}: pay a new request of the depositor's (admin.js leaf-pay)`,
       });
+    }
+    if (this.feeTopUpError) {
+      out.push({ key: "leaf:fees", severity: "warning", title: "the leaf wallet's fee coins could not be topped up", detail: this.feeTopUpError });
     }
     if (this.lastSyncError) {
       out.push({ key: "leaf:sync", severity: "warning", title: "the leaf wallet's sync failed", detail: this.lastSyncError });

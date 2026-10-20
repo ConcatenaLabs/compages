@@ -315,7 +315,8 @@ the API and the wallets' developer mode; the web page does not offer it.
 4. The mint limiter mints exactly what the deposit credits, straight into
    the bridge's own leaf wallet (an `arca` wallet on the operator, driven
    through its command line), which boards it, paying the board's fee in
-   `leafWallet.feeAsset`.
+   `leafWallet.feeAsset` (the daemon keeps those fee coins topped up from
+   its own stock of `seqFeeAsset`).
 5. Once the board is final (its block certified and its anchor buried two
    Bitcoin blocks), the wallet pays the request out of round from that coin
    alone. The leaf holds the deposit's credit less the transfer's margins,
@@ -850,7 +851,7 @@ Configuration reference (`daemon/config.example.json`):
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
 | `mintLimiter` | Every reissuance through a mint limiter (see "The mint limiter" and [`docs/mint-limiter.md`](docs/mint-limiter.md)): `tool` (the `mint-limiter` binary, in the sequentia-contracts checkout it was built in), `operatorMnemonicFile`, `coldKey` (the cold key's x-only public key), `windowBlocks`, `recoveryDelay` (units of 512 seconds), `defaultAllowance` and `allowances` (atoms per window, by ticker, symbol or mapping key). Unset, the daemon reissues from its wallet |
-| `leafWallet` | Deposits paid as Arca leaves (see "Deposits paid as Arca leaves" and [`docs/leaf-deposits.md`](docs/leaf-deposits.md)): `arca` (the `arca` command line), `datadir` (the bridge's own leaf wallet, made with `arca create` on the operator), `feeAsset` (the accepted asset its boards pay fees in, held on the chain by the leaf wallet; default `seqFeeAsset`), `intentLapseSeconds` (default 172800), `landingLapseSeconds` (default 21600), `syncMinMs`, `syncMaxMs`, `syncBusyMs`, `timeoutMs`. Needs `mintLimiter`. Unset, `/api/leaf/*` answers 404 |
+| `leafWallet` | Deposits paid as Arca leaves (see "Deposits paid as Arca leaves" and [`docs/leaf-deposits.md`](docs/leaf-deposits.md)): `arca` (the `arca` command line), `datadir` (the bridge's own leaf wallet, made with `arca create` on the operator), `feeAsset` (the accepted asset its boards pay fees in, held on the chain by the leaf wallet; default `seqFeeAsset`), `feeTopUpBoards` (when `feeAsset` is `seqFeeAsset`, the daemon keeps the leaf wallet's fee coins at this many 1,000-vbyte fees at the node's rate, about three boards each, from the node wallet's own stock, topping up when they fall below a quarter of it; default 50, 0 to fund it by hand) and `feeCheckMs` (default 300000), `intentLapseSeconds` (default 172800), `landingLapseSeconds` (default 21600), `syncMinMs`, `syncMaxMs`, `syncBusyMs`, `timeoutMs`. Needs `mintLimiter`. Unset, `/api/leaf/*` answers 404 |
 | `seqBlockMs` | The Sequentia block interval in milliseconds (default 60000), used to time a mint that waits for the next window |
 | `sbtcBridgeUrl`, `sbtcBridgeToken` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg); it decides when a deposit is credited, and reports it per address |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |

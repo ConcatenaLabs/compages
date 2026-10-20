@@ -190,10 +190,8 @@ for W in leaf alice; do
   "$ARCA" --datadir "$RUN/arca/$W" create --server "http://127.0.0.1:$ARCAD_PORT" --node-url "http://127.0.0.1:$SEQ_RPC/" \
     --node-user e2e --node-password-file "$RUN/arca/node.password" > "$RUN/arca/$W.create.json"
 done
-LEAF_ADDR=$("$ARCA" --datadir "$RUN/arca/leaf" address | python3 -c "import json,sys;v=json.load(sys.stdin);print(v if isinstance(v,str) else v['address'])")
-seqcli -rpcwallet=miner -named sendtoaddress address="$LEAF_ADDR" amount=1000 assetlabel="$FEEX" fee_asset_label="$FEEX" >/dev/null
-chain produce 1
-echo "   leaf wallet funded with FEEX for board fees at $LEAF_ADDR"
+# The leaf wallet's board fees: the daemon tops its fee coins up from the
+# bridge wallet's FEEX by itself (leafWallet.feeTopUpBoards).
 
 echo "== daemon config"
 cat > "$RUN/config.json" <<EOF
@@ -228,6 +226,7 @@ cat > "$RUN/config.json" <<EOF
     "arca": "${ARCA_WRAPPER:-$ARCA}",
     "datadir": "$RUN/arca/leaf",
     "feeAsset": "$FEEX",
+    "feeCheckMs": 2000,
     "syncMinMs": 3000,
     "syncBusyMs": 2000
   },

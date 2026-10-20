@@ -163,6 +163,8 @@ try {
   process.kill(Number(E.ARCAD_PID), "SIGHUP");
   await waitFor("the operator to serve the asset", async () => (arca("leaf", "info").server_info?.assets ?? []).some((a) => a.asset === A) || null, 30_000);
   check("the operator serves the bridged asset after its reload", true);
+  const topped = await waitFor("the leaf wallet's fee coins topped up", async () => (stateNow().leafFeeTopUps?.length ? stateNow().leafFeeTopUps : null), 60_000);
+  check("the daemon topped up the leaf wallet's fee coins from the bridge wallet's fee asset", topped.length === 1, `${topped[0].atoms} atoms in ${topped[0].txid}`);
   await reconciles("before any leaf deposit", A, { owedAtoms: 0, leafWalletAtoms: 0 });
 
   // ---------------- 2. refused before any deposit
@@ -324,6 +326,7 @@ try {
     Boolean(fb.steps.sendTxid) && fb.leaf.route === "fallback" && got6 - before6 === 500_000_000, `${fb.leaf.fallbackReason}; received ${got6 - before6}`);
   await reconciles("after the fallback delivery", A, { owedAtoms: 0, leafWalletAtoms: 0 });
 
+  check("the fee coins were topped up once over the whole run", stateNow().leafFeeTopUps.length === 1, `${stateNow().leafFeeTopUps.length}`);
   const st = await api("health");
   check("health names no leaf problem", !(st.body.problems ?? []).some((p) => String(p.key).startsWith("leaf:")), JSON.stringify((st.body.problems ?? []).map((p) => p.key)));
 } catch (e) {

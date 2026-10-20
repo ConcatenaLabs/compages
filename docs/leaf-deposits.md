@@ -19,8 +19,11 @@ web page does not offer it.
   operator can serve.
 - **The bridge's own leaf wallet.** An `arca` wallet on that operator, made
   for the bridge alone: never the bridge's node wallet, a reserve, the
-  treasury or another service's wallet. Its on-chain side holds a coin of the
-  accepted fee asset the boards pay in (`leafWallet.feeAsset`); it holds a
+  treasury or another service's wallet. Its on-chain side holds coins of the
+  accepted fee asset the boards pay in (`leafWallet.feeAsset`, by default the
+  bridge's `seqFeeAsset`), which the daemon tops up from the node wallet's own
+  stock of it, the stock that pays every Sequentia fee of the bridge
+  (`leafWallet.feeTopUpBoards`, recorded in `leafFeeTopUps`); it holds a
   bridged asset only between a deposit's mint and its payment.
 - **No float.** Nothing is minted ahead of a deposit, so circulating supply
   never exceeds escrow. What the leaf wallet holds at any moment is owed to
@@ -37,8 +40,9 @@ web page does not offer it.
          --node-user <rpc user> --node-password-file <file holding the password>
 
    Compare the operator key it prints with the one the operator publishes.
-3. Fund its on-chain side with the fee asset, from a wallet you name:
-   `arca --datadir … address` gives the address.
+3. Leave its fee coins to the daemon, which tops them up from its own fee
+   asset once it runs; with a `feeAsset` other than `seqFeeAsset`, fund them
+   from a wallet you name (`arca --datadir … address` gives the address).
 4. Configure the daemon (`leafWallet` in the configuration reference: `arca`,
    `datadir`, `feeAsset`) and restart it. The start-up log names the leaf
    wallet's operator, chain and the assets the operator serves.
@@ -120,9 +124,12 @@ its height.
 - **`leaf:sync`**: the leaf wallet's sync failed (its operator or node
   unreachable). Deposits wait; nothing is lost. `arca --datadir … sync` by
   hand says why.
+- **`leaf:fees`**: the daemon could not top up the leaf wallet's fee coins;
+  the node wallet is short of `seqFeeAsset`, which every Sequentia fee of
+  the bridge needs anyway. Fund the node wallet.
 - **A deposit waiting in `leaf_minted`** with `waiting` saying the board was
   refused: the leaf wallet has no fee coin, or the operator no longer serves
-  the asset. Fund the fee asset, or have the operator serve the asset again.
+  the asset. See `leaf:fees`, or have the operator serve the asset again.
 - **The wallet's own coins.** The daemon runs `arca sync` on the schedule the
   wallet gives, which keeps any coin it holds alive; between deposits it
   holds none of a bridged asset.

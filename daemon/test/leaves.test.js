@@ -246,3 +246,40 @@ test("an operator pays a held leaf into a new request of the depositor's, checke
   assert.equal(dep.leaf.owner, "4".repeat(64));
   assert.equal(dep.leaf.paid.value, "2499999996");
 });
+
+test("the leaf wallet's fee coins are topped up from the bridge's own fee asset, waiting for a top-up to confirm", async () => {
+  const h = harness();
+  const FEE = "f".repeat(64);
+  const sent = [];
+  let confirmations = 0;
+  h.bridge.cfg.leafWallet.feeCheckMs = 0;
+  h.bridge.limiter = { feeAtoms: async (v) => v }; // 1 atom a vbyte
+  h.bridge.seq = {
+    node: async () => ({}),
+    call: async (m, p) => {
+      if (m === "sendtoaddress") {
+        sent.push(p);
+        return `tx${sent.length}`;
+      }
+      if (m === "gettransaction") return { confirmations };
+      throw new Error(m);
+    },
+  };
+  h.wallet.balance = async () => ({ sequentia_onchain: { [FEE]: "10000" } });
+  await h.leaves.topUpFees(); // 10,000 < a quarter of 50 x 1,000: topped up to 50,000
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].amount, "0.00040000");
+  assert.equal(sent[0].assetlabel, FEE);
+  await h.leaves.topUpFees(); // the top-up is not confirmed: waits
+  assert.equal(sent.length, 1);
+  confirmations = 1;
+  h.wallet.balance = async () => ({ sequentia_onchain: { [FEE]: "50000" } });
+  await h.leaves.topUpFees(); // enough now
+  assert.equal(sent.length, 1);
+  h.bridge.cfg.leafWallet.feeAsset = "e".repeat(64);
+  const other = new LeafDeposits(h.bridge, h.wallet);
+  other.c.feeCheckMs = 0;
+  h.wallet.balance = async () => ({ sequentia_onchain: {} });
+  await other.topUpFees(); // another fee asset than the bridge's: its operator funds it
+  assert.equal(sent.length, 1);
+});
