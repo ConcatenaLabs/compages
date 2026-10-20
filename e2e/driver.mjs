@@ -1192,7 +1192,11 @@ if (process.env.REGISTRY_URL) {
   // The cold key lifts it, paying the fee from a wallet of its own.
   const v = (await limiters())[musdKey];
   const fees = await seqRpc("listunspent", { minconf: 1, query_options: { asset: process.env.FEEX } }, "user");
-  const fc = fees.sort((x, y) => y.amount - x.amount)[0];
+  // An explicit coin: the covenant spend shows every amount, and the wallet blinds some change.
+  const zero = (h) => !h || /^0+$/.test(h);
+  const fc = fees
+    .filter((u) => !u.amountcommitment && zero(u.amountblinder) && zero(u.assetblinder))
+    .sort((x, y) => y.amount - x.amount)[0];
   const change = await seqRpc("getaddressinfo", { address: await seqRpc("getnewaddress", {}, "user") }, "user");
   const lift = tool(["build", "--instance", instFile, "--mnemonic-file", process.env.COLD_WORDS], {
     path: "disarm",
