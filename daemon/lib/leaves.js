@@ -258,10 +258,16 @@ export class LeafDeposits {
       if (this.s.leafIntents?.[fallbackAddress]) throw refuse(400, "fallbackAddress is a leaf deposit address, not a destination");
       fallback = { kind: "address", address: String(fallbackAddress), note: `delivered on the chain to ${fallbackAddress}` };
     }
-    // One intent per request: asking again answers the same address.
+    // Asking again with the same request and the same fallback answers the
+    // same address. Another fallback makes another intent: a request is
+    // public, and whoever binds it first must not choose where someone
+    // else's deposit falls back to. The request is still paid once, whichever
+    // intent's deposit lands first (decide()).
     this.s.leafIntents ??= {};
     for (const [addr, it] of Object.entries(this.s.leafIntents)) {
-      if (it.request === String(request).trim()) return { seqAddress: addr, ...this.publicIntent(it) };
+      if (it.request === String(request).trim() && JSON.stringify(it.fallback) === JSON.stringify(fallback)) {
+        return { seqAddress: addr, ...this.publicIntent(it) };
+      }
     }
     const seqAddress = await this.bridge.seq.call("getnewaddress", { label: "compages-leaf" });
     const it = {
@@ -309,8 +315,11 @@ export class LeafDeposits {
     const intentAddress = dep.seqAddress;
     dep.leaf = { intent: intentAddress, owner: it.owner, until: it.until, assetId: it.assetId };
     let why = null;
-    if (it.usedBy && it.usedBy !== dep.key) {
-      why = `the receive request was already used by ${it.usedBy}; a request is paid once`;
+    // A request is paid once, through whichever of its intents a deposit
+    // reaches first: every intent naming its key counts.
+    const used = Object.values(this.s.leafIntents).find((i) => i.owner === it.owner && i.usedBy && i.usedBy !== dep.key);
+    if (used) {
+      why = `the receive request was already used by ${used.usedBy}; a request is paid once`;
     } else if (!mapping || mapping.assetId !== it.assetId) {
       why = `the deposit's token is not the asset the request was bound to (${it.symbol})`;
     } else if (!this.bridge.limiter) {

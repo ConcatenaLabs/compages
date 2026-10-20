@@ -283,3 +283,30 @@ test("the leaf wallet's fee coins are topped up from the bridge's own fee asset,
   await other.topUpFees(); // another fee asset than the bridge's: its operator funds it
   assert.equal(sent.length, 1);
 });
+
+test("whoever binds a request first does not choose another depositor's fallback, and the request is still paid once", async () => {
+  const h = harness();
+  let n = 0;
+  h.bridge.seq = {
+    node: async () => ({ isvalid: true }),
+    call: async (m) => {
+      if (m === "getnewaddress") return `ert1qintent${++n}`;
+      throw new Error(m);
+    },
+  };
+  h.wallet.medianTime = 1_000;
+  const req = request({ asset: ASSET });
+  const thief = await h.leaves.createIntent({ request: req, fallbackAddress: "ert1qthief" });
+  const victim = await h.leaves.createIntent({ request: req });
+  assert.notEqual(victim.seqAddress, thief.seqAddress);
+  assert.equal(victim.fallback.kind, "refund");
+  assert.equal((await h.leaves.createIntent({ request: req })).seqAddress, victim.seqAddress);
+  // The victim's deposit lands first and takes the leaf; a deposit to the
+  // other intent of the same request then takes that intent's fallback.
+  const mapping = h.data.mappings["31337:0xmusd"];
+  const d1 = { key: "1", tag: "deposit #1", seqAddress: victim.seqAddress, sats: "2500000000", status: "minting", steps: {} };
+  assert.equal(await h.leaves.decide(d1, mapping), "leaf");
+  const d2 = { key: "2", tag: "deposit #2", seqAddress: thief.seqAddress, sats: "2500000000", status: "minting", steps: {} };
+  assert.equal(await h.leaves.decide(d2, mapping), "fallback");
+  assert.match(d2.leaf.fallbackReason, /already used by 1/);
+});

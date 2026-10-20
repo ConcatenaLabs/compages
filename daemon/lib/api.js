@@ -988,7 +988,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
                 `Deposit ${r.symbol}'s token with ${r.seqAddress} as the Sequentia address. Once the deposit is final on ` +
                 `${cfg.ethChainName}, its amount is minted into the bridge's leaf wallet, boarded, and paid to this receive ` +
                 `request out of round, less the transfer's margins (a few atoms the payment leaves for the fees of its ` +
-                `pre-signed transactions). The request is paid once: a later deposit to this address takes the fallback. ` +
+                `pre-signed transactions). The request is paid once: a later deposit for it takes its fallback. ` +
                 `If the request can no longer be paid when the deposit lands, the deposit is ${r.fallback.note}.`,
             });
           } catch (e) {

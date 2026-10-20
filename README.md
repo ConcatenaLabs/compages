@@ -311,7 +311,8 @@ the API and the wallets' developer mode; the web page does not offer it.
    unused and not lapsing within `leafWallet.landingLapseSeconds` (six hours
    by default), the amount above the operator's smallest leaf. A request
    that fails takes the stated fallback, with the reason on the record. A
-   request is paid once; a later deposit to its address takes the fallback.
+   request is paid once, through whichever of its intents a deposit reaches
+   first; a later deposit takes its own intent's fallback.
 4. The mint limiter mints exactly what the deposit credits, straight into
    the bridge's own leaf wallet (an `arca` wallet on the operator, driven
    through its command line), which boards it, paying the board's fee in
@@ -724,7 +725,7 @@ their progress toward finality as numbers (`finalityProgress`:
 | `GET /api/status` | Bridge configuration and counters: chain ids, vault address, confirmation depths, number of bridged assets, deposits, redemptions |
 | `GET /api/assets` | All bridged assets: token, symbol, decimals, Sequentia asset id, ticker, contract hash, circulating amount (`mintedSats`), and whether the asset is `supervised` (freezable by its issuer and never blinded) |
 | `GET /api/por` (optionally `?asset=<id\|symbol>`) | Proof of reserves per bridged asset: escrow on each source chain against circulating Sequentia supply, read from the chains rather than the daemon's ledger; an unmeasured side is `null`, never zero. A unified asset also lists its CCTP consolidations in flight (`inTransit`) and those of the last week (`recentTransfers`, each with its Solana burn and CCTP nonce). `reconciliation` says where the supply is: what the bridge holds (`nodeWalletAtoms`, and `leafWalletAtoms`: its leaf wallet on the chain, in boards and in leaves, with a leaf mint still in the mempool), what users hold, what is owed to deposits not delivered yet (`owedAtoms`) and what users returned that is not released yet (`returnedAtoms`); `reconciles` is true when escrow equals users' holdings plus owed plus returned, and `leaves` lists the boards in flight and the leaves paid out with their margins |
-| `POST /api/leaf/intent` `{"request": "arca:...", "token": "0x...", "fallbackAddress": "..."}` | Bind an Arca receive request to a fresh Sequentia address for a deposit paid as a leaf (see "Deposits paid as Arca leaves"); `token` (or the request's asset) names what is deposited, `fallbackAddress` is optional. Asking again with the same request answers the same address |
+| `POST /api/leaf/intent` `{"request": "arca:...", "token": "0x...", "fallbackAddress": "..."}` | Bind an Arca receive request to a fresh Sequentia address for a deposit paid as a leaf (see "Deposits paid as Arca leaves"); `token` (or the request's asset) names what is deposited, `fallbackAddress` is optional. Asking again with the same request and fallback answers the same address; another fallback makes another intent, and the request is paid once through whichever intent a deposit reaches first |
 | `GET /api/leaf/intent/<seqAddress>` | A leaf intent: its asset, operator, the request's key and lapse, its fallback, and every deposit made to it |
 | `GET /api/por/history` | The index of signed reserve snapshots (see "Signed reserve snapshots"): every snapshot's height, payload hash and link. 404 before the first snapshot, and when `porHistoryDir` is not set |
 | `GET /api/por/history/<height>` | One signed reserve snapshot, byte for byte as it was signed; the height is a plain decimal number |
