@@ -1191,12 +1191,20 @@ if (process.env.REGISTRY_URL) {
   check("a deposit waits while the brake is on", held3.status === "mint_retry", held3.waiting);
   // The cold key lifts it, paying the fee from a wallet of its own.
   const v = (await limiters())[musdKey];
-  const fees = await seqRpc("listunspent", { minconf: 1, query_options: { asset: process.env.FEEX } }, "user");
-  // An explicit coin: the covenant spend shows every amount, and the wallet blinds some change.
+  // The fee is paid from an explicit coin, since the covenant spend shows every
+  // amount. A custom chain's wallet receives on confidential addresses by
+  // default, so the user wallet first pays itself one at an unconfidential address.
   const zero = (h) => !h || /^0+$/.test(h);
-  const fc = fees
-    .filter((u) => !u.amountcommitment && zero(u.amountblinder) && zero(u.assetblinder))
-    .sort((x, y) => y.amount - x.amount)[0];
+  const feeAddr = await seqRpc("getaddressinfo", { address: await seqRpc("getnewaddress", {}, "user") }, "user");
+  const feeTxid = await seqRpc(
+    "sendtoaddress",
+    { address: feeAddr.unconfidential ?? feeAddr.address, amount: 0.01, assetlabel: process.env.FEEX, fee_asset_label: process.env.FEEX },
+    "user"
+  );
+  const fc = await waitFor("an explicit fee coin for the cold key", async () => {
+    const us = await seqRpc("listunspent", { minconf: 1, query_options: { asset: process.env.FEEX } }, "user");
+    return us.find((u) => u.txid === feeTxid && !u.amountcommitment && zero(u.amountblinder) && zero(u.assetblinder)) ?? null;
+  });
   const change = await seqRpc("getaddressinfo", { address: await seqRpc("getnewaddress", {}, "user") }, "user");
   const lift = tool(["build", "--instance", instFile, "--mnemonic-file", process.env.COLD_WORDS], {
     path: "disarm",

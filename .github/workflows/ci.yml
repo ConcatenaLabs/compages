@@ -20,7 +20,7 @@ env:
   SEQ_CORE_VERSION: 24.7.12
   SEQ_CORE_SHA256: 610210a38f02da204301c8158da05bfdd941b65db04640f57e3122fa70a54d86
   # The mint limiter's tool: sequentia-contracts at this commit, built here.
-  CONTRACTS_REF: 9d20d96cae5af6465afdba4618a8ff9c32b64b7c
+  CONTRACTS_REF: bc0ee3ea6948aae634fc279cab863aa5a9e52f5f
 
 jobs:
   contracts:
