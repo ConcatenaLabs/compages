@@ -49,6 +49,8 @@ cleanup() {
   set +e
   [ -f "$RUN/daemon.pid" ] && kill "$(cat "$RUN/daemon.pid")" 2>/dev/null
   [ -n "${ARCAD_PID:-}" ] && kill -INT "$ARCAD_PID" 2>/dev/null
+  # A driver that starts arcad again records its pid here.
+  [ -f "$RUN/arcad.pid" ] && kill -INT "$(cat "$RUN/arcad.pid")" 2>/dev/null
   [ -n "${SIGNER_PID:-}" ] && kill -TERM "$SIGNER_PID" 2>/dev/null
   seqcli stop >/dev/null 2>&1
   parcli stop >/dev/null 2>&1
@@ -263,7 +265,7 @@ VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX GENESIS=$GENESIS OPERATOR_
 ANVIL_PORT=$ANVIL_PORT API_PORT=$API_PORT ARCAD_PORT=$ARCAD_PORT ARCAD_PID=$ARCAD_PID \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" ARCA="$ARCA" ARCA_BIN_DIR="$ARCA_BIN_DIR" \
 SEQ_RPC=$SEQ_RPC REPO_DIR="$REPO" AUDIT_SCRIPT="${AUDIT_SCRIPT:-}" \
-node "$HERE/leaf-driver.mjs"
+node "${LEAF_DRIVER:-$HERE/leaf-driver.mjs}"
 RC=$?
 echo "== daemon log tail"
 tail -20 "$RUN/daemon.log" || true
