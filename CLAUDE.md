@@ -17,9 +17,9 @@ Node and consensus conventions live in the
 | Path | What |
 |---|---|
 | `contracts/` | Foundry project. Two contracts, `src/CompagesVault.sol` and `src/CompagesOftReceiver.sol` (takes LayerZero OFT arrivals, USDT0, into the vault as an ordinary depositor), with no dependency beyond `forge-std` for tests. `script/Deploy.s.sol` deploys the vault (roles and delay from `OWNER`, `OPERATOR`, `GUARDIAN`, `RELEASE_DELAY`); `deployments/sepolia.json` holds the immutable facts of every deployed vault: address, deploy tx, source commit, compiler settings, constructor args, verification links (add a vault there when you deploy one, never its role holders); tests are in `test/`: `CompagesVault.t.sol` (unit), `CompagesVaultCctp.t.sol` (CCTP, against `mocks/MockCctp.sol`), `CompagesOftReceiver.t.sol` (the OFT receiver, against `mocks/MockLayerZero.sol`), `CompagesVaultInvariant.t.sol` (a handler-driven invariant suite, about a minute). `test/fork/HandoverRehearsal.t.sol` rehearses the Circle hand-off against the live Sepolia vault; it is skipped unless `REHEARSAL_RPC_URL` is set, which `contrib/handover-rehearsal.sh` does. `script/SafeOwner.s.sol` moves the owner role to a Safe v1.4.1 in separately run steps (deploy, transferOwnership, print the Safe tx, execute), and `test/fork/SafeOwnerRehearsal.t.sol` drives those same steps on a fork under the same `REHEARSAL_RPC_URL` gate (`contrib/safe-owner-rehearsal.sh`). |
-| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state,porhistory}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests that need no network: the Solana CCTP encoders against fixtures produced by the reference Solana tooling, and the record state machines, finality gate, rate limits, redaction and alerts through exported functions or `Bridge.prototype.method.call(fake, …)` with small fakes. |
+| `daemon/` | `compagesd.js` plus `lib/{api,bridge,eth,sol,cctp,cctp-sol,alerts,seqrpc,state,porhistory,limiter}.js` and `admin.js`. Node with one dependency, `ethers` (`lib/sol.js` hand-rolls the Solana wire format and `lib/cctp-sol.js` the Circle CCTP V2 instructions on top of it; keep both dependency-free). It also serves the web front-end. `test/` holds `node --test` unit tests that need no network: the Solana CCTP encoders against fixtures produced by the reference Solana tooling, and the record state machines, finality gate, rate limits, redaction and alerts through exported functions or `Bridge.prototype.method.call(fake, …)` with small fakes. |
 | `web/` | `index.html`, `app.js` and `qr.js` (a dependency-free QR encoder), served by the daemon. |
-| `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. Its judgements live in `lib/checks.js`, free of network access, and are unit-tested in `test/`. |
+| `watcher/` | `compages-watch.js`: an independent checker with its own RPC endpoints and package. Keep it independent: it may import pure helpers (address derivation, alert delivery) from `daemon/lib`, never the daemon's state or its view of the chains. Its judgements live in `lib/checks.js`, free of network access, and are unit-tested in `test/`. `vendor/` holds sequentia-contracts' address mirror and the mint limiter's descriptor and vectors, pinned by `vendor/PIN.json` (commit and SHA-256 of each file): re-copy all three together and update the pin when the template or the mirror changes. |
 | `reserves/` | Signed proof-of-reserves snapshots: `snapshot.mjs` (run from a timer on the operator host), `verify.mjs` (for anyone), `keygen.mjs`, and `lib/format.mjs`, the format itself. Its own package like the watcher, reading the chains itself; it may import pure helpers from `daemon/lib` and asks the daemon only for the asset list, the Solana deposit addresses and the CCTP burns in transit. `lib/format.mjs` depends on nothing but `ethers` and is copied verbatim into the `compages-reserves` mirror: change the format there too, in the same sitting. |
 | `contrib/` | `handover-rehearsal.sh`: runs the hand-off rehearsal on a Sepolia fork. `safe-owner.md`: the runbook for moving the vault owner to a Safe; `safe-owner-rehearsal.sh` rehearses it on a fork. |
 | `e2e/` | `run-e2e.sh`, `driver.mjs`, `mock-solana.mjs` (an in-memory Solana RPC that independently decodes and signature-checks submitted transactions), and `fault-proxy.mjs` (sits between the daemon and the node and fails chosen calls on command). |
@@ -125,6 +125,13 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
 - **Undeliverable deposits are refunded automatically** — an invalid Sequentia address, or an
   amount too small to represent. Sequentia amounts carry 8 decimals, so a token with more decimals
   bridges at a granularity of `10^(d-8)`.
+- **Every reissuance goes through the asset's mint limiter once `mintLimiter` is configured.** The
+  token sits whole in a `sequentia/mint-limiter` covenant (sequentia-contracts), and a deposit of an
+  asset whose token is still in the wallet waits; never fall back to a bare `reissueasset`. The
+  daemon holds only the operator key's mnemonic: the cold key, which brakes, lifts the brake and
+  recovers, never reaches this host. A limiter mint's txid is final before broadcast (the
+  covenant signs every input and output) and is recorded first; a mint the covenant would refuse
+  waits rather than fails. `docs/mint-limiter.md` is the runbook.
 - **Every Sequentia fee is paid in the configured asset, never the policy asset by default.** This
   was a specific fix; Sequentia has an open fee market and no privileged unit.
 - Chain ids, RPC endpoints, the vault address and confirmation depths are all configuration, and
@@ -145,8 +152,8 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
 
 ## Secrets
 
-`daemon/config.json`, `daemon/operator.key`, `daemon/*.key`, `daemon/state/` and `e2e/run/` are
-gitignored, and a working checkout has real ones on disk. **Never `git add -A` in this repo.**
+`daemon/config.json`, `daemon/operator.key`, `daemon/*.key`, mnemonic files (`*.words`, such as the
+mint limiter's operator mnemonic), `daemon/state/` and `e2e/run/` are gitignored, and a working checkout has real ones on disk. **Never `git add -A` in this repo.**
 The repository is public; a committed operator key is a total loss of the vault.
 
 ## Working in this repo

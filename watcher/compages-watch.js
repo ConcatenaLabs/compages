@@ -17,7 +17,11 @@
 //      the explorer's indexer counts it) may not exceed what the source chains
 //      hold for it. A gap has to persist for `breachMinutes` before it counts,
 //      because a redemption is paid out a few seconds before its burn.
-//   3. The daemon itself: its health endpoint must answer, and not "failing",
+//   3. The mint limiters: each asset's reissuance token must sit, whole, in
+//      the mint limiter coin the daemon names, and that coin must be the
+//      limiter in the state the daemon reports, by a script derived here from
+//      the vendored descriptor. A braked or recovered limiter is reported.
+//   4. The daemon itself: its health endpoint must answer, and not "failing",
 //      for more than `daemonDownMinutes`.
 //
 // Anything critical is pushed to `alertUrl` and, when `daemonAdminToken` is
@@ -47,7 +51,17 @@ import {
   reserveBreached,
   shouldBrake,
   brakeTargets,
+  limiterProblems,
+  limiterSlots,
 } from "./lib/checks.js";
+import { parseDescriptor, derive } from "./vendor/sequentia-address.mjs";
+
+// The mint limiter's descriptor, vendored from sequentia-contracts with its
+// address mirror (vendor/PIN.json), so the coin the daemon names is checked
+// against a script derived here.
+const LIMITER = parseDescriptor(
+  fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "vendor", "mint_limiter.descriptor.json"), "utf8")
+);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgPath = process.argv[2] ?? path.join(here, "config.json");
@@ -369,6 +383,49 @@ async function checkReserves() {
   return problems;
 }
 
+// ---- the mint limiters --------------------------------------------------------
+
+// Each bridged asset's reissuance token sits in a mint limiter covenant. The
+// daemon names its coin and state; this reads the coin from the indexer,
+// derives the instance's script for that state, and asks the indexer what
+// spent it and how many token units exist.
+async function checkLimiters() {
+  const problems = [];
+  const now = Date.now();
+  const esplora = cfg.esploraUrl.replace(/\/$/, "");
+  const assets = await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/assets`);
+  for (const m of assets) {
+    if (m.retired || !m.mintLimiter) continue;
+    const v = m.mintLimiter;
+    const row = (report.assets[m.assetId] ??= { symbol: m.ticker ?? m.symbol, assetId: m.assetId });
+    const seen = {};
+    try {
+      if (v.coin && v.state) {
+        const tx = await json(`${esplora}/tx/${v.coin.txid}`);
+        seen.coin = tx.vout?.[v.coin.vout] ?? null;
+        if (v.instance.template_hash !== LIMITER.template_hash) throw new Error(`limiter template ${v.instance.template_hash} is not the vendored one`);
+        seen.expectedScript = derive(LIMITER, v.instance.params, limiterSlots(v.state)).script_pubkey;
+        const out = await json(`${esplora}/tx/${v.coin.txid}/outspend/${v.coin.vout}`);
+        const k = `limiterspent:${m.assetId}:${v.coin.txid}`;
+        seen.spentForMs = streaks.observe(k, Boolean(out.spent), now);
+        if (out.spent) seen.spentBy = out.txid;
+      }
+      const a = await json(`${esplora}/asset/${m.assetId}`);
+      const c = a.chain_stats ?? {};
+      if (c.reissuance_tokens !== undefined) {
+        const mm = a.mempool_stats ?? {};
+        seen.tokenSupply =
+          BigInt(c.reissuance_tokens ?? 0) + BigInt(mm.reissuance_tokens ?? 0) - BigInt(c.burned_reissuance_tokens ?? 0) - BigInt(mm.burned_reissuance_tokens ?? 0);
+      }
+      row.limiter = { coin: v.coin, state: v.state, braked: v.braked, tokenSupply: seen.tokenSupply === undefined ? null : `${seen.tokenSupply}` };
+    } catch (e) {
+      row.limiterError = e.message;
+    }
+    problems.push(...limiterProblems(m.assetId, row.symbol, v, seen, cfg.limiterSpentMinutes ?? 15));
+  }
+  return problems;
+}
+
 // ---- the daemon --------------------------------------------------------------
 
 async function checkDaemon() {
@@ -452,6 +509,7 @@ async function pass() {
   for (const [name, fn] of [
     ["vaults", checkVaults],
     ["reserves", checkReserves],
+    ["limiters", checkLimiters],
     ["daemon", checkDaemon],
   ]) {
     try {

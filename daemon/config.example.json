@@ -73,6 +73,17 @@
     }
   },
 
+  "_mintLimiter_note": "Every reissuance through a mint limiter covenant (docs/mint-limiter.md). `tool` is mint-limiter built in a sequentia-contracts checkout; the operator mnemonic stays on this host, the cold key's words never do, only its public key goes here. windowBlocks in blocks, recoveryDelay in units of 512 seconds, allowances in each asset's atoms per window.",
+  "mintLimiter": {
+    "tool": "/path/to/sequentia-contracts/tools/mint-limiter/target/release/mint-limiter",
+    "operatorMnemonicFile": "limiter-operator.words",
+    "coldKey": "<the cold key's 32-byte x-only public key, from `mint-limiter key` on the machine that holds it>",
+    "windowBlocks": 1440,
+    "recoveryDelay": 5063,
+    "defaultAllowance": "<atoms per window for a newly bridged asset>",
+    "allowances": { "USDC.e": "<atoms per window>" }
+  },
+
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
   "porHistoryDir": "/var/lib/compages-reserves",

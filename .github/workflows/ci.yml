@@ -19,6 +19,8 @@ env:
   # release, pinned by version and by the SHA-256 of its tarball.
   SEQ_CORE_VERSION: 24.7.12
   SEQ_CORE_SHA256: 610210a38f02da204301c8158da05bfdd941b65db04640f57e3122fa70a54d86
+  # The mint limiter's tool: sequentia-contracts at this commit, built here.
+  CONTRACTS_REF: 9d20d96cae5af6465afdba4618a8ff9c32b64b7c
 
 jobs:
   contracts:
@@ -104,6 +106,16 @@ jobs:
           bin="$RUNNER_TEMP/sequentia-core-${SEQ_CORE_VERSION}/bin"
           "$bin/sequentiad" --version | head -1
           echo "SEQ_BIN_DIR=$bin" >> "$GITHUB_ENV"
+      - name: Check out sequentia-contracts for the mint limiter's tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ConcatenaLabs/sequentia-contracts
+          ref: ${{ env.CONTRACTS_REF }}
+          path: sequentia-contracts
+      - name: Build mint-limiter
+        run: |
+          cargo build --release --locked --manifest-path sequentia-contracts/tools/mint-limiter/Cargo.toml
+          echo "MINT_LIMITER=$GITHUB_WORKSPACE/sequentia-contracts/tools/mint-limiter/target/release/mint-limiter" >> "$GITHUB_ENV"
       - name: Run the end-to-end suite
         run: e2e/run-e2e.sh
       - name: Keep the logs of a failed run

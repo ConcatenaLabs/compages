@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ConcatenaLabs/sequentia-contracts",
+  "commit": "686d8bae7201132a2853fbcd4215687ad38ac658",
+  "files": {
+    "sequentia-address.mjs": { "from": "mirrors/js/sequentia-address.mjs", "sha256": "0df324a859419037d0498415ef5d9f0e6de1d54709f9c0c6c261a776041517cc" },
+    "mint_limiter.descriptor.json": { "from": "templates/mint_limiter/descriptor.json", "sha256": "b49309440a0b5022b5255b84ccad1a275942c954584c32c92039e5ec8fc306b3" },
+    "mint_limiter.vectors.json": { "from": "templates/mint_limiter/vectors.json", "sha256": "0fd9c01ca54bfade5522da0fcb465e3bc8eaa62181f2dbd876364f930d8a4aab" }
+  }
+}

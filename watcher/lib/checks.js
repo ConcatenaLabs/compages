@@ -197,3 +197,73 @@ function short(x) {
   const s = String(x);
   return s.length > 14 ? `${s.slice(0, 8)}…${s.slice(-4)}` : s;
 }
+
+/** The mint limiter's slots for a state, as the descriptor's data leaf holds
+ *  them: big-endian hex at each slot's width. */
+export function limiterSlots(state) {
+  const hex = (n, w) => BigInt(n).toString(16).padStart(w, "0");
+  return { MINTED: hex(state.minted, 16), ELAPSED: hex(state.elapsed, 4), ARMED: hex(state.armed, 2) };
+}
+
+/** What is wrong with an asset's mint limiter, read from the chain rather
+ *  than taken from the daemon.
+ *
+ *  `view` is what the daemon reports (`mintLimiter` in /api/assets). Then,
+ *  each read through the watcher's own indexer and null when unread:
+ *    coin            the output the daemon names: { scriptpubkey, asset, value }
+ *    expectedScript  the instance's script in the state the daemon names,
+ *                    derived here from the descriptor
+ *    tokenSupply     every unit of the reissuance token the chain has issued
+ *    spentBy, spentForMs  who spent the coin, and for how long the daemon has
+ *                    named a spent coin
+ *  The limiter holds the asset's mint authority only if the coin is the
+ *  instance in that state, holds the token, and holds all of it: a token
+ *  unit anywhere else can still mint without limit. */
+export function limiterProblems(assetId, symbol, view, { coin = null, expectedScript = null, tokenSupply = null, spentBy = null, spentForMs = 0 } = {}, spentMinutes = 15) {
+  const p = [];
+  const key = (k) => `limiter:${k}:${assetId}`;
+  if (!view) return p;
+  if (view.recovered) {
+    // The cold key's own act, not a fault of the bridge: it alerts and pulls no brake.
+    p.push({ key: key("recovered"), severity: "critical", title: `${symbol}: the cold key recovered the token from its mint limiter`, detail: `recovery ${view.recovered.txid}`, assetId, noBrake: true });
+    return p;
+  }
+  if (!view.coin) {
+    p.push({ key: key("none"), severity: "warning", title: `${symbol}: its token is in no mint limiter`, detail: "the daemon names no limiter coin", assetId });
+    return p;
+  }
+  if (view.braked) {
+    p.push({ key: key("brake"), severity: "critical", title: `${symbol}: the mint limiter's brake is on`, detail: "no mint until the cold key lifts it", assetId, noBrake: true });
+  }
+  if (coin && expectedScript && coin.scriptpubkey !== expectedScript) {
+    p.push({
+      key: key("script"),
+      severity: "critical",
+      title: `${symbol}: the coin the daemon names is not the mint limiter in the state it reports`,
+      detail: `coin ${view.coin.txid}:${view.coin.vout} pays ${coin.scriptpubkey.slice(0, 20)}…, the instance in that state is ${expectedScript.slice(0, 20)}…`,
+      assetId,
+    });
+  }
+  if (coin && coin.asset !== view.tokenId) {
+    p.push({ key: key("asset"), severity: "critical", title: `${symbol}: the limiter coin does not hold the reissuance token`, detail: `it holds ${coin.asset}`, assetId });
+  }
+  if (coin && tokenSupply !== null && BigInt(coin.value) !== BigInt(tokenSupply)) {
+    p.push({
+      key: key("outside"),
+      severity: "critical",
+      title: `${symbol}: reissuance token units exist outside the mint limiter`,
+      detail: `the limiter holds ${coin.value} of ${tokenSupply}; the rest can mint without limit`,
+      assetId,
+    });
+  }
+  if (spentBy && spentForMs >= spentMinutes * 60_000) {
+    p.push({
+      key: key("stale"),
+      severity: "warning",
+      title: `${symbol}: the mint limiter's coin was spent and the daemon still names it`,
+      detail: `spent by ${spentBy} ${Math.round(spentForMs / 60_000)} min ago`,
+      assetId,
+    });
+  }
+  return p;
+}

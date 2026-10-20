@@ -16,6 +16,14 @@
 //                                   before a chain reset)
 //   halt <assetId> [mint|all] [reason]
 //   unhalt <assetId>
+//   limiters                        every bridged asset's mint limiter
+//   limiter-move <mappingKey> [allowance]
+//                                   move the asset's reissuance token from the
+//                                   wallet into a new mint limiter (allowance in
+//                                   atoms per window; default from the config)
+//   limiter-arm <mappingKey> <armSignature>
+//                                   apply the limiter's brake with the cold key's
+//                                   arm signature: no mint until it is lifted
 //
 // Groups: deposits, solDeposits, redemptions, solRedemptions. The admin API
 // is enabled by setting `adminToken` in the daemon config; this tool reads the
@@ -89,7 +97,16 @@ switch (cmd) {
   case "unhalt":
     print(await call("POST", "admin/unhalt", { assetId: a[0] }));
     break;
+  case "limiters":
+    print(await call("GET", "admin/limiters"));
+    break;
+  case "limiter-move":
+    print(await call("POST", "admin/limiter-move", { mappingKey: a[0], ...(a[1] ? { allowance: a[1] } : {}) }));
+    break;
+  case "limiter-arm":
+    print(await call("POST", "admin/limiter-arm", { mappingKey: a[0], armSignature: a[1] }));
+    break;
   default:
-    console.error(fs.readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 22).join("\n"));
+    console.error(fs.readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 30).join("\n"));
     process.exit(2);
 }

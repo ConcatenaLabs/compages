@@ -2,6 +2,7 @@
 daemon/config.json
 daemon/operator.key
 daemon/*.key
+*.words
 daemon/state/
 e2e/run/
 

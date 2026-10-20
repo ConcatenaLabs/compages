@@ -104,6 +104,21 @@ async function main() {
     }
   }
 
+  if (bridge.limiter) {
+    // Every reissuance goes through a mint limiter. The tool must run, the
+    // operator's mnemonic must be readable, and the cold key must be another
+    // key: an operator that held both could lift its own brake.
+    const op = (await bridge.limiter.tool(["key", "--mnemonic-file", cfg.mintLimiter.operatorMnemonicFile])).key;
+    if (op === cfg.mintLimiter.coldKey) throw new Error("mintLimiter.coldKey is the operator's own key");
+    const unlimited = Object.entries(state.data.mappings).filter(([, m]) => !m.retired && !m.limiter?.coin);
+    log(
+      `mint limiter: operator key ${op}, cold key ${cfg.mintLimiter.coldKey}, window ${cfg.mintLimiter.windowBlocks} blocks; ` +
+        (unlimited.length
+          ? `WARNING: ${unlimited.length} asset(s) still hold their token outside a limiter and do not mint until moved in (admin: limiter-move)`
+          : "every asset mints through its limiter")
+    );
+  }
+
   if (!state.data.lastEthBlock) {
     state.data.lastEthBlock = cfg.vaultDeployBlock - 1;
   }
@@ -165,6 +180,7 @@ async function main() {
       ["cctpInbound", () => cctp.advanceInbound()],
       ["cctpOutbound", () => cctp.advanceOutbound()],
       ["invariants", () => bridge.checkInvariants()],
+      ["limiters", () => bridge.limiterTick()],
     ],
     interval
   );

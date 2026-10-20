@@ -1,0 +1,274 @@
+{
+  "descriptor": 2,
+  "template": {
+    "budget": {
+      "max": 4000050,
+      "offset": 50,
+      "per_witness_byte": 4
+    },
+    "internal_key": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+    "name": "sequentia/mint-limiter",
+    "params": [
+      {
+        "label": "Asset the token mints",
+        "name": "ASSET",
+        "role": "asset",
+        "type": "u256"
+      },
+      {
+        "label": "Reissuance token held by the covenant",
+        "name": "TOKEN",
+        "role": "asset",
+        "type": "u256"
+      },
+      {
+        "label": "Operator key, which signs mints",
+        "name": "OPERATOR_KEY",
+        "role": "pubkey",
+        "type": "Pubkey"
+      },
+      {
+        "label": "Cold key, which applies and lifts the brake and recovers",
+        "name": "COLD_KEY",
+        "role": "pubkey",
+        "type": "Pubkey"
+      },
+      {
+        "label": "Window, in blocks",
+        "name": "WINDOW",
+        "role": "number",
+        "type": "u16"
+      },
+      {
+        "label": "Most minted in one window, in the asset",
+        "name": "ALLOWANCE",
+        "role": "amount",
+        "type": "u64"
+      },
+      {
+        "label": "Time the brake holds before recovery, in units of 512 seconds",
+        "name": "RECOVERY_DELAY",
+        "role": "number",
+        "type": "u16"
+      }
+    ],
+    "paths": [
+      {
+        "effect": "Reissues ASSET on input 0, explicitly, and re-creates the covenant at output 0 with the token's whole amount. The coin must be at least two blocks old, by a relative lock in blocks on its own input, and the brake off. Its age is added to ELAPSED; once ELAPSED reaches WINDOW the mint opens a new window and MINTED restarts from its amount and ELAPSED from zero, else MINTED grows by its amount. MINTED may not exceed ALLOWANCE. Signed by OPERATOR_KEY over the whole transaction.",
+        "leaf": "limiter",
+        "name": "mint",
+        "who": "the holder of OPERATOR_KEY"
+      },
+      {
+        "effect": "Applies the brake: re-creates the covenant at output 0 with ARMED set to 1, MINTED and ELAPSED unchanged and no issuance on input 0, after which no mint is possible. ARM_SIG is COLD_KEY's BIP340 signature over SHA256(T || T || genesis hash || leaf hash || ASSET || TOKEN || OPERATOR_KEY || COLD_KEY || WINDOW || ALLOWANCE || RECOVERY_DELAY), with T = SHA256(\"sequentia/mint-limiter/arm\"); it names no coin and no state, so one signature made in advance applies to whichever coin is current.",
+        "leaf": "limiter",
+        "name": "arm",
+        "who": "anyone holding COLD_KEY's signature over the arm message"
+      },
+      {
+        "effect": "Lifts the brake: re-creates the covenant at output 0 with ARMED set to 0, MINTED and ELAPSED unchanged and no issuance on input 0. Signed by COLD_KEY over the whole transaction.",
+        "leaf": "limiter",
+        "name": "disarm",
+        "who": "the holder of COLD_KEY"
+      },
+      {
+        "effect": "Spends the token into any transaction COLD_KEY signs, once the brake has held for RECOVERY_DELAY units of 512 seconds, a BIP68 relative lock on input 0. Only COLD_KEY can spend a braked coin, so nothing restarts that delay.",
+        "leaf": "limiter",
+        "name": "recover",
+        "who": "the holder of COLD_KEY"
+      }
+    ],
+    "slots": [
+      {
+        "label": "Minted in the current window",
+        "name": "MINTED",
+        "role": "amount",
+        "type": "u64"
+      },
+      {
+        "label": "Blocks of the current window behind this coin",
+        "name": "ELAPSED",
+        "role": "number",
+        "type": "u16"
+      },
+      {
+        "label": "1 while the brake is on, else 0",
+        "name": "ARMED",
+        "role": "number",
+        "type": "u8"
+      }
+    ],
+    "summary": "Holds an asset's reissuance token: the operator mints at most an allowance per window of blocks, and a cold key can apply a brake that stops every mint, lift it, or take the token once the brake has held for a long delay.",
+    "tree": {
+      "branch": [
+        {
+          "leaf": "limiter",
+          "simplicity": {
+            "cmr": "1238d68052662f890d4290c9c97d64ca964bf733a5771ba9821425a5473b09b9",
+            "compiler": {
+              "name": "simplicityhl",
+              "version": "0.7.2"
+            },
+            "max_cost_wu": 959,
+            "source": "mint_limiter.simf",
+            "source_sha256": "2b66818a05a2b74c3dde34ce192893afe6432e2343b3c9fe98381fb86973f68d",
+            "witness": [
+              {
+                "name": "ASSET",
+                "source": "param:ASSET",
+                "type": "u256"
+              },
+              {
+                "name": "TOKEN",
+                "source": "param:TOKEN",
+                "type": "u256"
+              },
+              {
+                "name": "OPERATOR_KEY",
+                "source": "param:OPERATOR_KEY",
+                "type": "Pubkey"
+              },
+              {
+                "name": "COLD_KEY",
+                "source": "param:COLD_KEY",
+                "type": "Pubkey"
+              },
+              {
+                "name": "WINDOW",
+                "source": "param:WINDOW",
+                "type": "u16"
+              },
+              {
+                "name": "ALLOWANCE",
+                "source": "param:ALLOWANCE",
+                "type": "u64"
+              },
+              {
+                "name": "RECOVERY_DELAY",
+                "source": "param:RECOVERY_DELAY",
+                "type": "u16"
+              },
+              {
+                "name": "MINTED",
+                "source": "slot:MINTED",
+                "type": "u64"
+              },
+              {
+                "name": "ELAPSED",
+                "source": "slot:ELAPSED",
+                "type": "u16"
+              },
+              {
+                "name": "ARMED",
+                "source": "slot:ARMED",
+                "type": "u8"
+              },
+              {
+                "name": "PATH",
+                "source": "spender",
+                "type": "Either<(), Either<(), Either<(), ()>>>"
+              },
+              {
+                "name": "OPERATOR_SIG",
+                "source": "signature:sig_all_hash:OPERATOR_KEY",
+                "type": "Signature"
+              },
+              {
+                "name": "ARM_SIG",
+                "source": "spender",
+                "type": "Signature"
+              },
+              {
+                "name": "COLD_SIG",
+                "source": "signature:sig_all_hash:COLD_KEY",
+                "type": "Signature"
+              },
+              {
+                "name": "RECOVER_SIG",
+                "source": "signature:sig_all_hash:COLD_KEY",
+                "type": "Signature"
+              }
+            ]
+          }
+        },
+        {
+          "data": [
+            "ASSET",
+            "TOKEN",
+            "OPERATOR_KEY",
+            "COLD_KEY",
+            "WINDOW",
+            "ALLOWANCE",
+            "RECOVERY_DELAY",
+            "MINTED",
+            "ELAPSED",
+            "ARMED"
+          ],
+          "leaf": "state"
+        }
+      ]
+    },
+    "version": 1
+  },
+  "template_hash": "77218080daacd33cb636f1411920eb5f2d6ee805cb94d8d0651ce1808c0b557b",
+  "chains": [
+    {
+      "name": "sequentia-testnet",
+      "genesis": "ddd11d54c87a2bd94400fd31ce05d8e1110bb4b78e7103f738342086fc4ea92e",
+      "bech32_hrp": "tb"
+    },
+    {
+      "name": "elementsregtest",
+      "genesis": null,
+      "bech32_hrp": "ert"
+    }
+  ],
+  "measured": {
+    "source": "harness/records/m1.json",
+    "mint": {
+      "transaction": "the covenant as input 0 reissuing within a window, one wallet coin paying the fee in an issued asset; the successor, the minted output, the change and the fee",
+      "vsize": 867,
+      "weight": 3468,
+      "program_bytes": 1339,
+      "witness_bytes": 216,
+      "cost_bound_wu": 797,
+      "budget_wu": 6686
+    },
+    "mint_opening_a_window": {
+      "transaction": "the same, a mint that ends the window and opens the next",
+      "vsize": 857,
+      "weight": 3425,
+      "program_bytes": 1296,
+      "witness_bytes": 216,
+      "cost_bound_wu": 792,
+      "budget_wu": 6514
+    },
+    "arm": {
+      "transaction": "the covenant as input 0 and a third party's fee coin; the braked successor, the change and the fee",
+      "vsize": 719,
+      "weight": 2873,
+      "program_bytes": 1310,
+      "witness_bytes": 216,
+      "cost_bound_wu": 959,
+      "budget_wu": 6570
+    },
+    "disarm": {
+      "transaction": "the covenant as input 0 and a fee coin; the successor with the brake off, the change and the fee",
+      "vsize": 661,
+      "weight": 2643,
+      "program_bytes": 1080,
+      "witness_bytes": 216,
+      "cost_bound_wu": 725,
+      "budget_wu": 5650
+    },
+    "recover": {
+      "transaction": "the braked covenant as input 0 and a fee coin; the whole token to one output, the change and the fee",
+      "vsize": 563,
+      "weight": 2249,
+      "program_bytes": 734,
+      "witness_bytes": 216,
+      "cost_bound_wu": 337,
+      "budget_wu": 4266
+    }
+  }
+}

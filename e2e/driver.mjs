@@ -790,7 +790,9 @@ if (process.env.REGISTRY_URL) {
 
   console.log("\n-- fault: the node goes silent right after a reissuance is broadcast");
   await fault({ clear: true });
-  await fault({ after: "reissueasset", fail: VISIBILITY, seconds: 12 });
+  // A mint is a spend of the asset's mint limiter, broadcast as a raw
+  // transaction: the fault opens right after that broadcast.
+  await fault({ after: "sendrawtransaction", fail: VISIBILITY, seconds: 12 });
   let bal0 = await seqAssetBalance("user", musdAssetId);
   const f1 = await (await vault.depositToken(process.env.MUSD, 5_000_000n, userSeqAddr)).wait();
   const sawUnresolved = await waitFor(
@@ -859,7 +861,7 @@ if (process.env.REGISTRY_URL) {
   const { spawn } = await import("node:child_process");
   const fs = await import("node:fs");
   const pidFile = `${process.env.RUN_DIR}/daemon.pid`;
-  await fault({ after: "reissueasset", fail: VISIBILITY, seconds: 60 });
+  await fault({ after: "sendrawtransaction", fail: VISIBILITY, seconds: 60 });
   bal0 = await seqAssetBalance("user", musdAssetId);
   const f3 = await (await vault.depositToken(process.env.MUSD, 4_000_000n, userSeqAddr)).wait();
   await waitFor(
@@ -1109,6 +1111,108 @@ if (process.env.REGISTRY_URL) {
   );
   const status = await api("status");
   check("the page is told which chains and contracts CCTP uses", status.cctp?.chains?.[0]?.domain === Number(process.env.REMOTE_DOMAIN));
+}
+
+// ---------------- test 13: the mint limiter ----------------
+{
+  console.log("\n-- the mint limiter holds every reissuance token");
+  const { execFileSync } = await import("node:child_process");
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const ADMIN = { authorization: "Bearer e2e-admin", "content-type": "application/json" };
+  const tool = (args, input) =>
+    JSON.parse(execFileSync(process.env.MINT_LIMITER, args, { input: input === undefined ? "" : JSON.stringify(input) }).toString());
+  const limiters = async () => (await fetch(`${API}/admin/limiters`, { headers: ADMIN })).json();
+  for (const a of (await api("assets")).filter((x) => !x.retired)) {
+    const L = a.mintLimiter;
+    const name = a.ticker ?? a.symbol;
+    check(`${name}: its reissuance token is in a mint limiter`, !!L?.coin, JSON.stringify(L?.coin ?? null));
+    if (!L?.coin) continue;
+    const out = await seqRpc("gettxout", { txid: L.coin.txid, n: L.coin.vout, include_mempool: true });
+    check(
+      `${name}: the limiter's coin holds the token's whole supply`,
+      out && out.asset === L.tokenId && Math.round(Number(out.value) * 1e8) === Number(L.tokenAtoms),
+      `${out?.asset?.slice(0, 12)} ${out?.value} of ${L.tokenAtoms}`
+    );
+    const held = await seqRpc("listunspent", { minconf: 0, include_unsafe: true, query_options: { asset: L.tokenId } }, "compages");
+    check(`${name}: the bridge wallet holds none of its token`, held.length === 0, `${held.length} coin(s)`);
+  }
+
+  console.log("\n-- two MUSD deposits in one window: the second waits for the next");
+  const lims = await limiters();
+  const musdKey = Object.keys(lims).find((k) => k.endsWith(process.env.MUSD.toLowerCase()));
+  const minted = async (hash) => {
+    const r = (await api(`deposit/tx/${hash}`))[0];
+    return r?.status === "minted" ? r : null;
+  };
+  check("MUSD.e has its own allowance, 200 a window", lims[musdKey]?.allowanceAtoms === "20000000000", lims[musdKey]?.allowanceAtoms);
+  await (await musd.approve(process.env.VAULT, 260_000_000n)).wait();
+  const d1 = await (await vault.depositToken(process.env.MUSD, 150_000_000n, userSeqAddr)).wait();
+  await waitFor("150 MUSD minted", () => minted(d1.hash), 120_000);
+  const after1 = (await limiters())[musdKey].state;
+  check("the first opened a new window: its count is 150", after1.minted === "15000000000", JSON.stringify(after1));
+  const d2 = await (await vault.depositToken(process.env.MUSD, 100_000_000n, userSeqAddr)).wait();
+  let waited = null;
+  const r2 = await waitFor(
+    "100 MUSD minted once the window ends",
+    async () => {
+      const r = (await api(`deposit/tx/${d2.hash}`))[0];
+      if (r?.waiting && /allowance/.test(r.waiting)) waited = r.waiting;
+      return r?.status === "minted" ? r : null;
+    },
+    180_000
+  );
+  check("the second waited: 150 + 100 is over the window's allowance of 200", !!waited, waited ?? "it never waited");
+  const after2 = (await limiters())[musdKey].state;
+  check("then it minted in the next window, whose count is its own 100", after2.minted === "10000000000" && !!r2, JSON.stringify(after2));
+
+  console.log("\n-- the brake: a signature the cold key made in advance; lifted by the cold key");
+  const dir = fs.mkdtempSync(path.join(process.env.RUN_DIR, "limiter-"));
+  const instFile = path.join(dir, "instance.json");
+  fs.writeFileSync(instFile, JSON.stringify(lims[musdKey].instance));
+  const sig = tool(["arm-signature", "--instance", instFile, "--mnemonic-file", process.env.COLD_WORDS]);
+  const braked = await (
+    await fetch(`${API}/admin/limiter-arm`, { method: "POST", headers: ADMIN, body: JSON.stringify({ mappingKey: musdKey, armSignature: sig.arm_signature }) })
+  ).json();
+  check("the brake is applied from the admin API with that signature", braked.state?.armed === 1, JSON.stringify(braked));
+  // A braked limiter is critical, so /api/health answers 503 while it lasts.
+  const healthRes = await fetch(`${API}/health`);
+  const health = await healthRes.json();
+  check(
+    "health reports the braked limiter as critical",
+    healthRes.status === 503 && health.problems.some((p) => p.key === `limiter:brake:${minted1.assetId}` && p.severity === "critical"),
+    `HTTP ${healthRes.status}`
+  );
+  const d3 = await (await vault.depositToken(process.env.MUSD, 1_000_000n, userSeqAddr)).wait();
+  const held3 = await waitFor("the deposit waits on the brake", async () => {
+    const r = (await api(`deposit/tx/${d3.hash}`))[0];
+    return r?.waiting && /brake/.test(r.waiting) ? r : null;
+  });
+  check("a deposit waits while the brake is on", held3.status === "mint_retry", held3.waiting);
+  // The cold key lifts it, paying the fee from a wallet of its own.
+  const v = (await limiters())[musdKey];
+  const fees = await seqRpc("listunspent", { minconf: 1, query_options: { asset: process.env.FEEX } }, "user");
+  const fc = fees.sort((x, y) => y.amount - x.amount)[0];
+  const change = await seqRpc("getaddressinfo", { address: await seqRpc("getnewaddress", {}, "user") }, "user");
+  const lift = tool(["build", "--instance", instFile, "--mnemonic-file", process.env.COLD_WORDS], {
+    path: "disarm",
+    coin: { tx: await seqRpc("getrawtransaction", { txid: v.coin.txid }), vout: v.coin.vout },
+    state: { minted: Number(v.state.minted), elapsed: v.state.elapsed, armed: v.state.armed },
+    fee: { coins: [{ tx: await seqRpc("getrawtransaction", { txid: fc.txid }), vout: fc.vout }], atoms: 20000, change_to: change.scriptPubKey },
+  });
+  const signed = await seqRpc("signrawtransactionwithwallet", { hexstring: lift.hex }, "user");
+  const liftTxid = await seqRpc("sendrawtransaction", { hexstring: signed.hex });
+  check("the cold key's release of the brake is broadcast", liftTxid === lift.txid);
+  await waitFor("the deposit mints once the brake is lifted", () => minted(d3.hash), 120_000);
+  const after3 = (await limiters())[musdKey];
+  check(
+    "the daemon followed the release it did not make, and the count stood",
+    after3.state.armed === 0 && after3.coin.txid !== v.coin.txid && BigInt(after3.state.minted) >= 10000000000n,
+    JSON.stringify(after3.state)
+  );
+  const por = (await api(`por?asset=${minted1.assetId}`)).assets?.[0] ?? (await api(`por?asset=${minted1.assetId}`))[0];
+  check("the reserves page names the mint limiter", !!por?.mintLimiter?.coin, JSON.stringify(por?.mintLimiter?.state ?? null));
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 // ---------------- summary ----------------
