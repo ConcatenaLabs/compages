@@ -13,6 +13,7 @@ import { ethers } from "ethers";
 import { tokenKeyOf, sourcesOf, SEQ_MAX_SATS } from "./bridge.js";
 import { unitsToAtoms } from "./eth.js";
 import { porHistory } from "./porhistory.js";
+import { limiterView } from "./limiter.js";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -208,6 +209,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       contractHash: m.contractHash ?? null,
       issueTxid: m.issueTxid,
       mintedSats: m.mintedSats,
+      // Who can mint more: the mint limiter that holds the token, its
+      // allowance per window and where its count stands.
+      mintLimiter: limiterView(m),
       createdAt: m.createdAt,
     };
   }
@@ -448,6 +452,26 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           bridge.halt(String(body.assetId), body.scope === "mint" ? "mint" : "all", String(body.reason ?? "halted by the operator"));
           return send(200, { halted: state.data.halted[body.assetId] });
         }
+        if (req.method === "POST" && (parts[2] === "limiter-move" || parts[2] === "limiter-arm")) {
+          const body = parseJson(await readBody(req));
+          if (!body?.mappingKey) return send(400, { error: "mappingKey required" });
+          if (!bridge.limiter) return send(400, { error: "no mintLimiter is configured" });
+          try {
+            const r =
+              parts[2] === "limiter-move"
+                ? await bridge.limiterHandover(String(body.mappingKey), body.allowance === undefined ? undefined : BigInt(body.allowance))
+                : await bridge.limiterArm(String(body.mappingKey), String(body.armSignature ?? ""));
+            state.data.adminLog ??= [];
+            state.data.adminLog.push({ at: new Date().toISOString(), mappingKey: body.mappingKey, action: parts[2] });
+            state.save();
+            return send(200, parts[2] === "limiter-move" ? limiterView(state.data.mappings[body.mappingKey]) : r);
+          } catch (e) {
+            return send(e.status ?? 500, { error: e.message });
+          }
+        }
+        if (req.method === "GET" && parts[2] === "limiters") {
+          return send(200, Object.fromEntries(Object.entries(state.data.mappings).map(([k, m]) => [k, limiterView(m)])));
+        }
         if (req.method === "POST" && parts[2] === "retire-asset") {
           const body = parseJson(await readBody(req));
           if (!body?.mappingKey) return send(400, { error: "mappingKey required" });
@@ -672,6 +696,8 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             // with the reason rather than hidden.
             retired: m.retired ?? null,
             ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
+            // The mint authority: the limiter coin, its state and its limits.
+            mintLimiter: limiterView(m),
           });
         }
 

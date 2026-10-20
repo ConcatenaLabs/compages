@@ -47,18 +47,18 @@ ELD="$(node_bin_in "$SEQ_BIN")"
 if [ -x "$SEQ_BIN/sequentia-cli" ]; then ELC="$SEQ_BIN/sequentia-cli"; else ELC="$SEQ_BIN/elements-cli"; fi
 [ -n "$ELD" ] || { echo "no sequentiad (or elementsd) found under $SEQ_REPO; set SEQ_REPO" >&2; exit 1; }
 
-ANVIL_PORT=8545
-SEQ_RPC=18892
-SEQ_P2P=18893
-API_PORT=9950
-SOL_PORT=18999
-FAULT_PORT=18894
-IRIS_PORT=18995
+ANVIL_PORT=${ANVIL_PORT:-8545}
+SEQ_RPC=${SEQ_RPC:-18892}
+SEQ_P2P=${SEQ_P2P:-18893}
+API_PORT=${API_PORT:-9950}
+SOL_PORT=${SOL_PORT:-18999}
+FAULT_PORT=${FAULT_PORT:-18894}
+IRIS_PORT=${IRIS_PORT:-18995}
 # The remote chain the CCTP checks pretend to bridge from and pay out to.
 REMOTE_DOMAIN=6
 REMOTE_MESSENGER=0x0000000000000000000000008fe6b999dc680ccfdd5bf7eb0974218be2542daa
 REMOTE_USDC=0x036CbD53842c5426634e7929541eC2318f3dCF7e
-REGISTRY_PORT=13005
+REGISTRY_PORT=${REGISTRY_PORT:-13005}
 REGISTRY_REPO="${REGISTRY_REPO:-$HOME/sequentia-registry}"
 REGISTRY_TOKEN=e2e-admin-token
 
@@ -95,6 +95,21 @@ trap cleanup EXIT
 
 rm -rf "$RUN"
 mkdir -p "$RUN/seq"
+
+# The mint limiter: every reissuance goes through a covenant that holds the
+# asset's reissuance token (sequentia-contracts, tools/mint-limiter builds its
+# spends). MINT_LIMITER names the tool; else it is looked for in a
+# sequentia-contracts checkout at CONTRACTS_REPO.
+CONTRACTS_REPO="${CONTRACTS_REPO:-$HOME/sequentia-contracts}"
+MINT_LIMITER="${MINT_LIMITER:-$CONTRACTS_REPO/tools/mint-limiter/target/release/mint-limiter}"
+[ -x "$MINT_LIMITER" ] || {
+  echo "no mint-limiter tool at $MINT_LIMITER: build it in sequentia-contracts with" >&2
+  echo "  cargo build --release --manifest-path tools/mint-limiter/Cargo.toml   (or set MINT_LIMITER)" >&2
+  exit 1
+}
+"$MINT_LIMITER" key --new --mnemonic-file "$RUN/limiter-operator.words" >/dev/null
+COLD_KEY=$("$MINT_LIMITER" key --new --mnemonic-file "$RUN/limiter-cold.words" | python3 -c "import json,sys;print(json.load(sys.stdin)['key'])")
+echo "   mint limiter: $MINT_LIMITER, cold key $COLD_KEY"
 
 echo "== starting anvil"
 anvil --port $ANVIL_PORT --block-time 1 --silent &
@@ -166,7 +181,7 @@ echo "== starting Sequentia elementsregtest node"
   -validatepegin=0 -con_blocksubsidy=5000000000 \
   -signblockscript=51 -blindedaddresses=0 -con_default_blinded_addresses=0 \
   -fallbackfee=0.0001 -walletrbf=1 -txindex=1 -acceptnonstdtxn=1 \
-  -con_any_asset_fees=1 -server -daemon -printtoconsole=0
+  -con_any_asset_fees=1 -evbparams=simplicity:-1::: -server -daemon -printtoconsole=0
 for _ in $(seq 1 100); do seqcli getblockcount >/dev/null 2>&1 && break; sleep 0.3; done
 
 seqcli createwallet miner  >/dev/null   # holds the policy asset (block subsidy)
@@ -308,6 +323,16 @@ cat > "$RUN/config.json" <<EOF
       { "domain": $REMOTE_DOMAIN, "name": "Mock Base", "chainId": 84532, "usdc": "$REMOTE_USDC" }
     ]
   },
+  "mintLimiter": {
+    "tool": "$MINT_LIMITER",
+    "operatorMnemonicFile": "$RUN/limiter-operator.words",
+    "coldKey": "$COLD_KEY",
+    "windowBlocks": 20,
+    "recoveryDelay": 2,
+    "defaultAllowance": "100000000000000000",
+    "allowances": { "MUSD.e": "20000000000" }
+  },
+  "seqBlockMs": 1200,
   "apiHost": "127.0.0.1",
   "apiPort": $API_PORT,
   "pollIntervalMs": 1500,
@@ -330,6 +355,7 @@ OWNER_KEY=$OWNER_KEY GUARDIAN_KEY=$GUARDIAN_KEY RELEASE_DELAY=$RELEASE_DELAY REJ
 IRIS_PORT=$IRIS_PORT TRANSMITTER=$TRANSMITTER MESSENGER=$MESSENGER REMOTE_DOMAIN=$REMOTE_DOMAIN \
 REMOTE_MESSENGER=$REMOTE_MESSENGER REMOTE_USDC=$REMOTE_USDC \
 USDC_ETH=$USDC_ETH USDC_SOL=$USDC_SOL \
+MINT_LIMITER="$MINT_LIMITER" COLD_WORDS="$RUN/limiter-cold.words" \
 SEQ_RPC=$SEQ_RPC API_PORT=$API_PORT ANVIL_PORT=$ANVIL_PORT FAULT_PORT=$FAULT_PORT \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" \
 REGISTRY_URL=$REGISTRY_URL SOL_RPC=http://127.0.0.1:$SOL_PORT \

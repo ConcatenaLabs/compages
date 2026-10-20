@@ -27,6 +27,7 @@
   "guardianKeyFile": "",
   "alertUrl": "",
   "breachMinutes": 10,
+  "limiterSpentMinutes": 15,
   "daemonDownMinutes": 10,
   "largePayout": {
     "0x0000000000000000000000000000000000000000": "100000000000000000",

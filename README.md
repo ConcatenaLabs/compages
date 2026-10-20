@@ -48,6 +48,11 @@ Within that assumption, the design removes every failure mode it can:
 - A payout the recipient cannot accept (a contract that rejects ether, a
   blocklisted address) never blocks a redemption: the vault records the
   amount as owed and the recipient claims it to any address it chooses.
+- Minting on Sequentia is limited the same way. Each asset's reissuance token
+  sits in a mint limiter covenant (see "The mint limiter"): the daemon's hot
+  key mints at most an allowance per window of blocks, and a cold key that
+  never reaches the bridge host can brake it and recover the token. A leaked
+  operator key cannot mint an unbounded supply.
 - Every deposit of the same ERC-20 mints the **same** Sequentia asset; the
   mapping from token contract to Sequentia asset id is created exactly once
   (on the first deposit for an ordinary token, in the issuance ceremony for a
@@ -530,6 +535,36 @@ guardian cancel can never make a user's escrow burnable. The burn uses the
 token's own `burn`, so on USDC the issuer first makes the vault a minter; see
 "Rehearsing the hand-off to Circle".
 
+### The mint limiter
+
+Whoever holds a Sequentia asset's reissuance token can mint any amount of it.
+Compages keeps each token in a mint limiter, a covenant from
+[sequentia-contracts](https://github.com/ConcatenaLabs/sequentia-contracts)
+(`templates/mint_limiter`). The covenant lets the operator key mint at most an
+allowance per window of blocks, the count carried in the covenant's own coin,
+and lets a cold key stop it: the cold key's signature over a message that names
+no coin applies a brake to whichever coin is current, the cold key lifts it,
+and once the brake has held a long delay the cold key can take the token. The
+daemon holds the operator key's mnemonic; the cold key never reaches the host.
+It mirrors, on Sequentia, what the vault's rate limit and guardian do on
+Ethereum.
+
+Every reissuance is a spend of the covenant, built and signed by
+`mint-limiter` (sequentia-contracts, `tools/mint-limiter`) with no node access
+and no credential: the daemon hands it the coins, has the wallet sign the fee
+coin, records the transaction id, then broadcasts. A mint the covenant would
+refuse waits instead: over the window's allowance until the next window, on a
+braked limiter until the brake is lifted. A new asset's first deposit issues
+the asset and moves its new token straight into a limiter; a unified
+stablecoin's ceremony does the same. The daemon follows the limiter's coin
+through spends it did not make (the brake, its release, a recovery) and halts
+an asset whose limiter was spent by a mint it did not sign. Each asset's
+limiter (address, coin, state, allowance, window, brake) is in `/api/assets`
+and `/api/por`.
+
+[`docs/mint-limiter.md`](docs/mint-limiter.md) is the runbook: making the keys,
+moving a token in, the brake, lifting it, and recovery.
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
 Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
@@ -760,6 +795,8 @@ Configuration reference (`daemon/config.example.json`):
 | `registryUrl`, `registryAdminToken`, `assetDomain` | Asset Registry endpoint, optional admin token, and the entity domain written into asset contracts |
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
+| `mintLimiter` | Every reissuance through a mint limiter (see "The mint limiter" and [`docs/mint-limiter.md`](docs/mint-limiter.md)): `tool` (the `mint-limiter` binary, in the sequentia-contracts checkout it was built in), `operatorMnemonicFile`, `coldKey` (the cold key's x-only public key), `windowBlocks`, `recoveryDelay` (units of 512 seconds), `defaultAllowance` and `allowances` (atoms per window, by ticker, symbol or mapping key). Unset, the daemon reissues from its wallet |
+| `seqBlockMs` | The Sequentia block interval in milliseconds (default 60000), used to time a mint that waits for the next window |
 | `sbtcBridgeUrl`, `sbtcBridgeToken` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg); it decides when a deposit is credited, and reports it per address |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |
 | `solGenesisHash` | Expected cluster genesis hash, verified before the leg acts (the Ethereum chain-id check's Solana equivalent) |
@@ -848,6 +885,10 @@ node admin.js retire redemptions <txid:vout> "recipient can never accept ether"
 node admin.js retire-asset <mappingKey> "issued before the chain reset"   # the token's next deposit issues a fresh asset
 node admin.js halt <assetId> mint "investigating"
 node admin.js unhalt <assetId>
+node admin.js limiters                                  # each asset's mint limiter
+node admin.js limiter-move <mappingKey> [allowance]     # move an asset's token into a new limiter
+                                                        # (limiter-move.js does it with the daemon stopped)
+node admin.js limiter-arm <mappingKey> <armSignature>   # brake a limiter with the cold key's arm signature
 ```
 
 `retry` is for when you have checked the chain and nothing from the stopped
@@ -874,6 +915,14 @@ chains through its own endpoints and, once a minute:
   never the bridge wallet) may not exceed what the source chains hold. A gap
   must persist for `breachMinutes` before it counts, since a redemption is
   paid out seconds before its burn.
+- **Checks the mint limiters**: for every asset, the coin the daemon names
+  must be the limiter in the state the daemon reports, by a script the
+  watcher derives itself from the descriptor (`watcher/vendor/`, pinned to a
+  sequentia-contracts commit by `PIN.json`), must hold the reissuance token,
+  and must hold every unit of it the chain has issued: a token unit anywhere
+  else could mint without limit. A braked or recovered limiter is reported;
+  a limiter coin spent while the daemon still names it is reported after
+  `limiterSpentMinutes` (default 15).
 - **Checks the daemon**: its `/api/health` must answer, and not "failing",
   within `daemonDownMinutes`.
 
@@ -1149,7 +1198,7 @@ Solana read close to H. A failed run shows as a failed unit
 | Path | What it is |
 |---|---|
 | `contracts/` | Foundry project: `src/CompagesVault.sol`, `src/CompagesOftReceiver.sol` (USDT0 and other LayerZero OFT arrivals into the vault), unit tests, the deploy script, `script/SafeOwner.s.sol` (moves the owner role to a Safe), `forge-std` as a git submodule, and `deployments/sepolia.json`, the deployed vaults |
-| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/porhistory.js` (serves the reserve snapshot history), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI |
+| `daemon/` | `compagesd.js`, the Node.js bridge daemon: `lib/bridge.js` (core logic), `lib/limiter.js` (the mint limiter), `lib/eth.js` (Ethereum side), `lib/sol.js` (Solana side: RPC client, keys, transaction builder), `lib/cctp-sol.js` (Circle CCTP V2 on Solana: burn and receive instructions, message parsing, attestation lookup), `lib/seqrpc.js` (Sequentia RPC), `lib/state.js` (persistence), `lib/api.js` (HTTP API + static server), `lib/porhistory.js` (serves the reserve snapshot history), `lib/alerts.js` (push alerts); `admin.js` is the operator CLI and `limiter-move.js` moves tokens into their mint limiters with the daemon stopped |
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `reserves/` | The signed reserve snapshots (see "Signed reserve snapshots"): `snapshot.mjs` takes one, `verify.mjs` checks them, `keygen.mjs` creates the attestation key; `lib/format.mjs` is the format itself (canonical JSON, hashing, signature and chain checks), with unit tests and an end-to-end test against stand-in nodes |
@@ -1185,7 +1234,8 @@ discarded or CCTP payout does to a redemption or refund, and how a payout
 the vault already took on is read back from its queue and events); the
 Bitcoin-anchor finality gate; an operator's retry and resolve decisions;
 per-client rate limits, including IPv6 /64 grouping and trusted proxies; the
-redaction of RPC URLs from API errors; and alert cooldowns:
+redaction of RPC URLs from API errors; alert cooldowns; and the mint
+limiter's window rule, as the covenant computes it:
 
 ```
 cd daemon
@@ -1195,7 +1245,8 @@ npm test
 
 Watcher unit tests: rebuilding a vault's books from its events, backing net
 of owed, queued and cancelled reservations, how long a reserve gap must last
-before it is a breach, and what the brake pauses and halts:
+before it is a breach, what the brake pauses and halts, and the mint limiter
+checks, with the vendored descriptor reproducing every golden vector:
 
 ```
 cd watcher
@@ -1234,20 +1285,32 @@ destruction, automatic refund of an undeliverable deposit, the Solana leg
 (wrap, reissue, sweep, unwrap, and the cross-leg wrong-network guards),
 fee-asset independence (the bridge wallet never touches the policy asset),
 the unified-asset ceremony (USDC from Ethereum and from Solana landing on one
-`USDC.e`), registry metadata binding, and fault injection: the daemon reaches
-the node through `e2e/fault-proxy.mjs`, which makes the node go silent right
-after a reissuance or a delivery is broadcast, drops the answer to a burn the
-node accepted, and the suite kills and restarts the daemon mid-mint. After
-each, the user must hold exactly what they deposited and the supply the chain
-reports must equal the daemon's ledger. Requires foundry, node >= 20, the
-daemon's dependencies (`npm ci` in `daemon/`) and the Sequentia node
+`USDC.e`), registry metadata binding, fault injection, and the mint limiter.
+For the faults, the daemon reaches the node through `e2e/fault-proxy.mjs`,
+which makes the node go silent right after a mint or a delivery is broadcast,
+drops the answer to a burn the node accepted, and the suite kills and
+restarts the daemon mid-mint. After each, the user must hold exactly what
+they deposited and the supply the chain reports must equal the daemon's
+ledger. Every mint is a spend of the asset's mint limiter, on a node started
+with Simplicity active: the suite checks that every token sits whole in its
+limiter and none in the wallet, that a deposit over the window's allowance
+waits for the next window, that the brake applied with a signature the cold
+key made in advance stops minting, and that a release of the brake the
+daemon did not make is followed and the waiting deposit then mints. Requires
+foundry, node >= 20, the daemon's dependencies (`npm ci` in `daemon/`),
+`mint-limiter` from a sequentia-contracts checkout (`MINT_LIMITER` names the
+binary; by default `$CONTRACTS_REPO/tools/mint-limiter/target/release/mint-limiter`,
+with `CONTRACTS_REPO` defaulting to `~/sequentia-contracts`) and the Sequentia node
 (`sequentiad`/`sequentia-cli`): either a release from the
 [download page](https://sequentiatestnet.com/download/core/), with
 `SEQ_BIN_DIR` set to the `bin/` directory of the unpacked tarball, or a build
 of the [Sequentia repo](https://github.com/ConcatenaLabs/Sequentia), with
 `SEQ_REPO` set to the checkout (the script looks in `build-linux/src`, then
 `src`). The registry checks are skipped unless `REGISTRY_REPO` points at a
-checkout of `sequentia-registry`. The suite takes about a quarter of an hour.
+checkout of `sequentia-registry`. Every port it uses can be moved with an
+environment variable of the same name (`ANVIL_PORT`, `SEQ_RPC`, `SEQ_P2P`,
+`API_PORT`, `SOL_PORT`, `FAULT_PORT`, `IRIS_PORT`, `REGISTRY_PORT`). The suite
+takes about a quarter of an hour.
 
 ```
 SEQ_BIN_DIR=~/sequentia-core-<version>/bin e2e/run-e2e.sh
@@ -1257,7 +1320,8 @@ GitHub Actions runs all of the above on every pull request and every push to
 `main` (`.github/workflows/ci.yml`): `forge build` and `forge test`, the
 daemon, watcher and reserve snapshot unit tests on Node 22, and the
 end-to-end suite against the Sequentia node release named in the workflow,
-whose tarball it checks against a pinned SHA-256. No job needs a secret; the
+whose tarball it checks against a pinned SHA-256, with `mint-limiter` built
+from the sequentia-contracts commit the workflow pins. No job needs a secret; the
 Sepolia fork rehearsals and the real-auditor reserve test are not run there.
 
 The keys in the e2e script are anvil's standard, publicly known development
@@ -1350,8 +1414,17 @@ the circulating supply, is in
 - **Testnet only.** Sepolia, Bitcoin testnet4, the Solana devnet and the
   Sequentia public testnet; all tokens are worthless.
 - **Single hot key and single process.** The operator keys (Ethereum,
-  Solana) sit on the bridge host; state is one JSON file
-  (`daemon/lib/state.js`), fine for a PoC, not for volume.
+  Solana, and the mint limiter's operator key) sit on the bridge host; state
+  is one JSON file (`daemon/lib/state.js`), fine for a PoC, not for volume.
+  The vault's rate limit and the mint limiter bound what a leaked key can
+  move; they do not make it harmless.
+- **A first issuance is not limited.** The first deposit of a new token
+  issues a new asset for the deposit's amount, and only then does its token
+  move into a limiter. A hot key can therefore issue new assets, never more
+  of an existing one.
+- **Mints are at least two blocks apart per asset.** The covenant requires
+  it, so after any mint there is a block in which only the brake can spend
+  the coin; deposits of one asset arriving faster queue behind each other.
 - **Exotic token-2022 extensions are handled honestly but not specially.**
   Transfer-fee mints bridge and release at the actually-received amounts
   (detection reads balance deltas, not instruction amounts); transfer-hook or

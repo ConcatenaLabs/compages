@@ -24,6 +24,7 @@
 import crypto from "node:crypto";
 import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
+import { MintLimiter, mintNext } from "./limiter.js";
 import { unitsToSats, satsToUnits, unitsToAtoms, atomsToUnits } from "./eth.js";
 import {
   transferTx,
@@ -186,6 +187,9 @@ export class Bridge {
     this.burnLock = new Mutex();
     this.recordLocks = new Set();
     this.phases = {};
+    // Every reissuance through a mint limiter covenant, when one is configured
+    // (see limiter.js): the wallet then never holds a reissuance token.
+    this.limiter = cfg.mintLimiter ? new MintLimiter(cfg, seq, log) : null;
   }
 
   /** Run `fn` unless the record `key` is already being driven elsewhere. */
@@ -435,6 +439,14 @@ export class Bridge {
         await this.registerAsset(mapping).catch((e) =>
           this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
         );
+        // The ceremony's one token goes straight into its mint limiter.
+        if (this.limiter) {
+          mapping.limiterAuto = true;
+          this.state.save();
+          await this.limiterHandover(mappingKey).catch((e) =>
+            this.log(`unified ${def.symbol}: moving its token into the mint limiter deferred: ${e.message}`)
+          );
+        }
       }
 
       // Route every configured source at this asset. Adding a source later is
@@ -947,6 +959,17 @@ export class Bridge {
       await this.registerAsset(mapping).catch((e) =>
         this.log(`asset ${mapping.assetId}: registry registration deferred: ${e.message}`)
       );
+      // A new asset's token goes straight into its mint limiter: every later
+      // deposit of this token mints through the covenant.
+      if (this.limiter) {
+        mapping.limiterAuto = true;
+        this.state.save();
+        await this.limiterHandover(mappingKey).catch((e) =>
+          this.log(`asset ${mapping.assetId}: moving its token into the mint limiter deferred: ${e.message}`)
+        );
+      }
+    } else if (this.limiter) {
+      mapping = await this.mintThroughLimiter(dep, mappingKey, mapping, sats);
     } else {
       dep.steps.pendingMint = true;
       this.state.save();
@@ -1049,12 +1072,18 @@ export class Bridge {
     return mapping;
   }
 
-  /** Record a confirmed reissuance: count the supply, clear the marker. */
+  /** Record a confirmed reissuance: count the supply, clear the marker. A
+   *  mint through the limiter also moves the limiter on to its successor. */
   finishReissue(dep) {
     const s = this.state.data;
     const c = dep.steps.mintCandidate;
     const mapping = s.mappings[c.mappingKey];
     mapping.mintedSats = (BigInt(mapping.mintedSats) + BigInt(c.sats)).toString();
+    if (c.limiter && mapping.limiter && mapping.limiter.coin?.txid === c.limiter.from.txid) {
+      mapping.limiter.coin = c.limiter.coin;
+      mapping.limiter.coinHex = c.limiter.hex;
+      mapping.limiter.state = c.limiter.state;
+    }
     delete dep.steps.pendingMint;
     delete dep.steps.mintCandidate;
     dep.steps.mintTxid = c.txid;
@@ -1063,6 +1092,196 @@ export class Bridge {
       `${dep.tag ?? `deposit #${dep.nonce}`}: reissued ${satsToAmount(c.sats)} of existing asset ${mapping.assetId} (${mapping.symbol})`
     );
     return mapping;
+  }
+
+  // ================= The mint limiter =================
+
+  /** Mint `sats` of the mapping's asset through its mint limiter: a spend of
+   *  the covenant coin that holds the token, signed by the operator key and
+   *  checked by the covenant against the window's allowance. Returns the
+   *  mapping, or null when the mint waits (status and markers recorded).
+   *
+   *  The same crash discipline as a bare reissuance: the transaction id is
+   *  recorded before broadcast, and only a proven absence permits a retry. A
+   *  mint the covenant would refuse is refused by the tool before anything
+   *  exists, so a full window waits for the next instead of failing. */
+  async mintThroughLimiter(dep, mappingKey, mapping, sats) {
+    const tag = dep.tag ?? `deposit #${dep.nonce}`;
+    const wait = (why, ms) => {
+      dep.status = "mint_retry";
+      dep.waiting = why;
+      dep.nextAttemptAt = new Date(Date.now() + ms).toISOString();
+      this.state.save();
+      return null;
+    };
+    if (!mapping.limiter?.coin) {
+      // Fail closed: once the bridge mints through limiters, a token still
+      // in the wallet is moved in first, never reissued bare.
+      return wait(
+        mapping.limiter?.recovered
+          ? `the ${mapping.symbol} token was recovered from its mint limiter by the cold key; minting waits for a new limiter`
+          : `the ${mapping.symbol} reissuance token is not in its mint limiter yet (admin: limiter-move ${mappingKey})`,
+        5 * 60_000
+      );
+    }
+    return this.limiter.exclusive(mappingKey, async () => {
+      const L = mapping.limiter;
+      const now = await this.limiterReconcile(mappingKey, mapping);
+      if (!now) return wait("the mint limiter's coin is being resolved", 30_000);
+      const verdict = mintNext(L.instance, L.state, now.confirmations, sats);
+      if (verdict.refused) {
+        this.log(`${tag}: ${verdict.refused}`);
+        if (verdict.never) {
+          dep.status = "failed_manual";
+          dep.error = verdict.refused;
+          this.state.save();
+          return null;
+        }
+        const blockMs = this.cfg.seqBlockMs ?? 60_000;
+        return wait(verdict.refused, Math.max(15_000, (verdict.waitBlocks ?? 1) * blockMs));
+      }
+      dep.steps.pendingMint = true;
+      this.state.save();
+      let built;
+      try {
+        built = await this.limiter.buildMint(mapping, now.confirmations, sats);
+      } catch (e) {
+        this.deferMint(dep, "pendingMint", e);
+        return null;
+      }
+      // Everything needed to finish the step is recorded BEFORE the broadcast.
+      dep.steps.mintCandidate = {
+        txid: built.txid,
+        sats: sats.toString(),
+        mappingKey,
+        limiter: {
+          from: { ...L.coin },
+          coin: { txid: built.txid, vout: 0 },
+          hex: built.hex,
+          state: { ...built.reply.next_state, minted: String(built.reply.next_state.minted) },
+        },
+      };
+      this.state.save();
+      try {
+        await this.seq.node("sendrawtransaction", { hexstring: built.hex });
+      } catch (e) {
+        // Refused outright is not "unknown": confirmBroadcast below settles it.
+        this.log(`${tag}: the limiter mint ${built.txid} was refused at broadcast: ${e.message}`);
+      }
+      const fate = await this.confirmBroadcast(built.txid);
+      if (fate === "absent") {
+        delete dep.steps.mintCandidate;
+        this.deferMint(dep, "pendingMint", new Error("the limiter mint never reached the mempool"));
+        return null;
+      }
+      if (fate === "unknown") {
+        this.markUnresolved(dep, `could not establish whether limiter mint ${built.txid} was broadcast`);
+        return null;
+      }
+      this.log(`${tag}: minted through the mint limiter, ${built.txid} (${built.vsize} vB); window state ${JSON.stringify(built.reply.next_state)}`);
+      return this.finishReissue(dep);
+    });
+  }
+
+  /** Move a mapping's reissuance token into a new mint limiter, from the
+   *  wallet: every unit, in one transfer. Idempotent: a mapping whose token is
+   *  already in a limiter is left alone. */
+  async limiterHandover(mappingKey, allowance) {
+    if (!this.limiter) throw new Error("no mintLimiter is configured");
+    const mapping = this.state.data.mappings[mappingKey];
+    if (!mapping) throw Object.assign(new Error("no such mapping"), { status: 404 });
+    return this.limiter.exclusive(mappingKey, async () => {
+      if (mapping.limiter?.coin) return mapping.limiter;
+      const rec = await this.limiter.moveIn(mapping, mappingKey, allowance, (txid) => this.confirmBroadcast(txid));
+      delete mapping.limiterHandoverError;
+      mapping.limiter = rec;
+      this.state.save();
+      this.log(
+        `asset ${mapping.assetId} (${mapping.symbol}): its reissuance token is in mint limiter ${rec.address}, ` +
+          `allowance ${BigInt("0x" + rec.instance.params.ALLOWANCE)} atoms per ${parseInt(rec.instance.params.WINDOW, 16)} blocks`
+      );
+      return rec;
+    });
+  }
+
+  /** The limiter's coin as the chain has it, following any spend this
+   *  daemon did not make: the brake (minting stops until it is lifted), its
+   *  release, a recovery by the cold key (minting stops for good), and a mint
+   *  this daemon did not sign (the operator key is in other hands: minting
+   *  halts). Returns { confirmations } of the unspent coin, or null while a
+   *  spend is still being found. */
+  async limiterReconcile(mappingKey, mapping) {
+    const L = mapping.limiter;
+    for (let step = 0; step < 16; step++) {
+      const now = await this.limiter.coinNow(L.coin);
+      if (!now.spent) return now;
+      // Our own mint, in flight: its deposit's record moves the limiter on.
+      const ours = [...Object.values(this.state.data.deposits), ...Object.values(this.state.data.solDeposits)].find(
+        (d) => d.steps?.mintCandidate?.limiter?.from?.txid === L.coin.txid
+      );
+      if (ours) return null;
+      const hex = await this.limiter.findSpender(L.coin);
+      if (!hex) return null;
+      const f = await this.limiter.follow(mapping, hex);
+      this.log(`asset ${mapping.assetId}: its mint limiter's coin was spent by ${f.successor?.txid ?? f.txid}: ${f.path}`);
+      if (f.path === "recover") {
+        L.recovered = { txid: f.txid, at: new Date().toISOString(), tokenTo: f.token_to };
+        delete L.coin;
+        this.halt(mapping.assetId, "mint", "the cold key recovered the token from the mint limiter");
+        this.state.save();
+        return null;
+      }
+      if (f.path === "mint") {
+        this.halt(mapping.assetId, "mint", `a mint this daemon did not sign spent the mint limiter (${f.successor.txid})`);
+      }
+      L.coin = { txid: f.successor.txid, vout: 0 };
+      L.coinHex = hex;
+      L.state = { minted: String(f.next_state.minted), elapsed: f.next_state.elapsed, armed: f.next_state.armed };
+      this.state.save();
+    }
+    return null;
+  }
+
+  /** One pass over the limiters: move new assets' tokens in, follow coins. */
+  async limiterTick() {
+    if (!this.limiter) return;
+    for (const [key, m] of Object.entries(this.state.data.mappings)) {
+      if (m.retired) continue;
+      if (!m.limiter?.coin) {
+        if (m.limiterAuto && !m.limiter?.recovered) {
+          await this.limiterHandover(key).catch((e) => {
+            m.limiterHandoverError = e.message;
+            this.log(`asset ${m.assetId}: moving its token into the mint limiter failed: ${e.message}`);
+          });
+        }
+        continue;
+      }
+      await this.limiter.exclusive(key, () => this.limiterReconcile(key, m)).catch((e) =>
+        this.log(`asset ${m.assetId}: reading its mint limiter failed: ${e.message}`)
+      );
+    }
+  }
+
+  /** Apply a mapping's limiter brake with the cold key's arm signature: no
+   *  mint is possible until the cold key lifts it. */
+  async limiterArm(mappingKey, armSignature) {
+    const mapping = this.state.data.mappings[mappingKey];
+    if (!mapping?.limiter?.coin) throw Object.assign(new Error("no limiter coin for this mapping"), { status: 404 });
+    return this.limiter.exclusive(mappingKey, async () => {
+      const now = await this.limiterReconcile(mappingKey, mapping);
+      if (!now) throw new Error("the limiter's coin is being resolved; try again");
+      if (mapping.limiter.state.armed) return { already: true, state: mapping.limiter.state };
+      const built = await this.limiter.buildArm(mapping, armSignature);
+      await this.seq.node("sendrawtransaction", { hexstring: built.hex });
+      const fate = await this.confirmBroadcast(built.txid);
+      if (fate !== "visible") throw new Error(`the brake ${built.txid} is ${fate}`);
+      mapping.limiter.coin = { txid: built.txid, vout: 0 };
+      mapping.limiter.coinHex = built.hex;
+      mapping.limiter.state = { ...built.reply.next_state, minted: String(built.reply.next_state.minted) };
+      this.state.save();
+      this.log(`asset ${mapping.assetId}: mint limiter BRAKE applied, ${built.txid}`);
+      return { txid: built.txid, state: mapping.limiter.state };
+    });
   }
 
   /** Park a deposit whose last chain write could not be confirmed either way.
@@ -3403,6 +3622,26 @@ export class Bridge {
         title: `asset ${assetId.slice(0, 12)} halted (${h.scope})`,
         detail: h.reason,
       });
+    }
+    if (this.limiter) {
+      for (const [k, m] of Object.entries(s.mappings)) {
+        if (m.retired) continue;
+        const L = m.limiter;
+        if (L?.state?.armed) {
+          problems.push({ key: `limiter:brake:${m.assetId}`, severity: "critical", title: `the mint limiter of ${m.contract?.ticker ?? m.symbol} is braked`, detail: "no mint until the cold key lifts the brake" });
+        }
+        if (L?.recovered) {
+          problems.push({ key: `limiter:recovered:${m.assetId}`, severity: "critical", title: `the token of ${m.contract?.ticker ?? m.symbol} was recovered from its mint limiter`, detail: `recovery ${L.recovered.txid}` });
+        }
+        if (!L?.coin && !L?.recovered) {
+          problems.push({
+            key: `limiter:none:${m.assetId}`,
+            severity: "warning",
+            title: `the token of ${m.contract?.ticker ?? m.symbol} is not in a mint limiter`,
+            detail: m.limiterHandoverError ?? `deposits of it wait; admin: limiter-move ${k}`,
+          });
+        }
+      }
     }
     for (const miss of this.missingDeposits ?? []) {
       problems.push({ key: `missing:${miss}`, severity: "critical", title: `deposit ${miss} has no record`, detail: "the vault counts it but no log was found" });
