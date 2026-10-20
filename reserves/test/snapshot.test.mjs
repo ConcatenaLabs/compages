@@ -342,6 +342,45 @@ test("the tool refuses a daemon that names a different Solana treasury", async (
   await assert.rejects(run(w), /names Solana treasury/);
 });
 
+test("deposits paid as leaves are recorded: what the bridge held and owed, each board against H, the leaves paid", async (t) => {
+  const w = await world();
+  t.after(w.close);
+  w.chain.tip = 1500;
+  w.eth.finalized = 20000;
+  w.chain.inBlock = { b1: 1430, b2: 1460, b3: null };
+  w.daemon.reconciliation[E] = {
+    bridgeHeldAtoms: "7500",
+    leafWalletAtoms: "7500",
+    owedAtoms: "7500",
+    leaves: {
+      boardsInFlight: [
+        { deposit: "7", txid: "b1", atoms: "2500", status: "leaf_paying" },
+        { deposit: "8", txid: "b2", atoms: "3000", status: "leaf_boarding" },
+        { deposit: "9", txid: "b3", atoms: "2000", status: "leaf_boarding" },
+      ],
+      paidCount: 2,
+      paidAtoms: "3734567792",
+      marginsAtoms: "8",
+    },
+  };
+  const r = await takeSnapshot(w.cfg, { dryRun: true });
+  const ether = r.payload.assets.find((a) => a.assetId === E);
+  const usdc = r.payload.assets.find((a) => a.assetId === U);
+  assert.equal(usdc.leaves, undefined, "an asset with no leaf figures records none");
+  const l = ether.leaves;
+  assert.deepEqual(l.boardsInFlight.map((b) => [b.txid, b.blockHeight, b.atOrBelowH]), [["b1", 1430, true], ["b2", 1460, false], ["b3", null, false]]);
+  assert.equal(l.boardsInFlightAtoms, "7500");
+  assert.deepEqual([l.owedAtoms, l.paidCount, l.paidAtoms, l.marginsAtoms, l.bridgeHeldAtoms], ["7500", 2, "3734567792", "8", "7500"]);
+  assert.match(l.note, /after H/);
+  assert.deepEqual(checkFigures(r.payload), []);
+  // Figures that do not add up are caught.
+  l.boardsInFlight[1].atOrBelowH = true;
+  l.boardsInFlightAtoms = "1";
+  const errs = checkFigures(r.payload);
+  assert.ok(errs.some((e) => /boardsInFlightAtoms/.test(e)));
+  assert.ok(errs.some((e) => /b2 atOrBelowH/.test(e)));
+});
+
 test("a dry run signs and writes nothing", async (t) => {
   const w = await world();
   t.after(w.close);

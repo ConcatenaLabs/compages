@@ -351,9 +351,12 @@ export class MintLimiter {
     }
   }
 
-  /** A mint of `sats` from the mapping's coin to a fresh wallet address. */
-  async buildMint(mapping, age, sats) {
-    const to = await this.spkOf(await this.seq.call("getnewaddress"));
+  /** A mint of `sats` from the mapping's coin to `address`, or to a fresh
+   *  wallet address when none is named. */
+  async buildMint(mapping, age, sats, address = null) {
+    const to = address
+      ? (await this.seq.node("validateaddress", { address })).scriptPubKey
+      : await this.spkOf(await this.seq.call("getnewaddress"));
     return this.build(mapping, "mint", { entropy: mapping.entropy, age, amount: String(sats), mint_to: to },
       this.cfg.operatorMnemonicFile);
   }

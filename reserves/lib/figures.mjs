@@ -108,3 +108,31 @@ export async function lastBlockAtOrBefore(getBlock, t, hi) {
   }
   return loBlock;
 }
+
+/** The leaf route of one asset, as the snapshot records it: the daemon's
+ *  report (`reconciliation` in /api/por) when the snapshot was taken, which is
+ *  after H, and for every board in flight whether its transaction is in a
+ *  block at or below H (`boardHeights` maps txid to its block height, or null
+ *  when it is in no block). The daemon's leaf wallet cannot be read at a past
+ *  height, so its figures are labelled as of the report. Null when the
+ *  daemon pays no leaves. Every amount is a decimal string. */
+export function leafFigures(reconciliation, boardHeights, height, reportedAt) {
+  const l = reconciliation?.leaves;
+  if (!l) return null;
+  const boards = (l.boardsInFlight ?? []).map((b) => {
+    const h = b.txid ? boardHeights[b.txid] ?? null : null;
+    return { deposit: String(b.deposit), txid: b.txid ?? null, atoms: String(b.atoms), status: String(b.status), blockHeight: h, atOrBelowH: h !== null && h <= height };
+  });
+  return {
+    reportedAt,
+    note: "as the bridge reported it when the snapshot was taken, after H: its leaf wallet cannot be read at a past height; each board's block is checked against H",
+    bridgeHeldAtoms: reconciliation.bridgeHeldAtoms ?? null,
+    leafWalletAtoms: reconciliation.leafWalletAtoms ?? null,
+    owedAtoms: String(reconciliation.owedAtoms ?? "0"),
+    boardsInFlight: boards,
+    boardsInFlightAtoms: boards.reduce((a, b) => a + BigInt(b.atoms), 0n).toString(),
+    paidCount: Number(l.paidCount ?? 0),
+    paidAtoms: String(l.paidAtoms ?? "0"),
+    marginsAtoms: String(l.marginsAtoms ?? "0"),
+  };
+}

@@ -53,6 +53,8 @@ import {
   brakeTargets,
   limiterProblems,
   limiterSlots,
+  leafReconciliation,
+  leafProblems,
 } from "./lib/checks.js";
 import { parseDescriptor, derive } from "./vendor/sequentia-address.mjs";
 
@@ -366,6 +368,7 @@ async function checkReserves() {
       const short = reserveShortfall(supply, escrow);
       row.supply = `${supply}`;
       row.escrow = `${escrow}`;
+      problems.push(...(await checkLeaves(m, row, supply, escrow, now)));
       const held = streaks.observe(`reserve:${m.assetId}`, short !== null && short > 0n, now);
       if (reserveBreached(short, held, cfg.breachMinutes ?? 10)) {
         problems.push({
@@ -381,6 +384,45 @@ async function checkReserves() {
     }
   }
   return problems;
+}
+
+// ---- deposits paid as Arca leaves ---------------------------------------------
+
+// The daemon's reserve report counts what its leaf wallet holds, every board
+// in flight and every leaf paid out. The watcher cannot read the leaf wallet,
+// so it takes those figures from the daemon, checks every board it names
+// against its own indexer, and reconciles them against the escrow and supply
+// it read itself.
+async function checkLeaves(m, row, supply, escrow, now) {
+  const por = (await json(`${cfg.daemonUrl.replace(/\/$/, "")}/api/por?asset=${m.assetId}`)).assets?.[0];
+  const rc = por?.reconciliation;
+  if (!rc || !rc.leaves) return [];
+  const esplora = cfg.esploraUrl.replace(/\/$/, "");
+  const boards = {};
+  for (const b of rc.leaves.boardsInFlight ?? []) {
+    if (!b.txid) continue;
+    let seen = { found: false };
+    try {
+      const tx = await json(`${esplora}/tx/${b.txid}`);
+      const out = (tx.vout ?? []).find((o) => o.asset === m.assetId) ?? null;
+      seen = { found: true, asset: out?.asset ?? null, value: out?.value ?? null };
+    } catch {}
+    const wrong = !seen.found || seen.asset !== m.assetId || String(seen.value) !== String(b.atoms);
+    seen.missingForMs = streaks.observe(`leafboard:${b.txid}`, wrong, now);
+    boards[b.txid] = seen;
+  }
+  const recon = leafReconciliation({ escrow, supply, bridgeHeld: rc.bridgeHeldAtoms, owed: rc.owedAtoms, returned: rc.returnedAtoms });
+  const offForMs = streaks.observe(`leafrecon:${m.assetId}`, Boolean(recon && recon.diff !== 0n), now);
+  row.leaves = {
+    bridgeHeld: rc.bridgeHeldAtoms,
+    owed: rc.owedAtoms,
+    returned: rc.returnedAtoms,
+    boardsInFlight: (rc.leaves.boardsInFlight ?? []).length,
+    paidCount: rc.leaves.paidCount,
+    paidAtoms: rc.leaves.paidAtoms,
+    unreconciled: recon ? `${recon.diff}` : null,
+  };
+  return leafProblems(m.assetId, row.symbol, rc.leaves, { boards, recon, offForMs }, cfg.leafMinutes ?? 15);
 }
 
 // ---- the mint limiters --------------------------------------------------------

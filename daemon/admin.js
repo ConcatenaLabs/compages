@@ -24,6 +24,11 @@
 //   limiter-arm <mappingKey> <armSignature>
 //                                   apply the limiter's brake with the cold key's
 //                                   arm signature: no mint until it is lifted
+//   leaf-pay <depositKey> <receiveRequest>
+//                                   pay a deposit's held leaf (status leaf_held:
+//                                   its request lapsed or was refused after the
+//                                   board) to a new receive request the
+//                                   depositor gave
 //
 // Groups: deposits, solDeposits, redemptions, solRedemptions. The admin API
 // is enabled by setting `adminToken` in the daemon config; this tool reads the
@@ -106,7 +111,10 @@ switch (cmd) {
   case "limiter-arm":
     print(await call("POST", "admin/limiter-arm", { mappingKey: a[0], armSignature: a[1] }));
     break;
+  case "leaf-pay":
+    print(await call("POST", "admin/leaf-pay", { key: a[0], request: a[1] }));
+    break;
   default:
-    console.error(fs.readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 30).join("\n"));
+    console.error(fs.readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 36).join("\n"));
     process.exit(2);
 }

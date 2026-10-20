@@ -89,6 +89,12 @@ export function resolveRecord(state, log, group, key, action, body) {
   const r = list[key];
   const before = r.status;
   const isDeposit = group === "deposits" || group === "solDeposits";
+  // A leaf deposit's mint is in the leaf wallet, not the node wallet: once
+  // minted it is moved on by the leaf phase or paid with leaf-pay, never
+  // re-sent or marked delivered by hand.
+  if (isDeposit && r.leaf?.route === "leaf" && (r.steps?.mintTxid || r.steps?.issueTxid) && action !== "retire") {
+    throw Object.assign(new Error("a leaf deposit's mint is in the leaf wallet: pay a held leaf with leaf-pay"), { status: 400 });
+  }
   if (action === "retire") {
     r.retired = { note: String(body.note ?? ""), at: new Date().toISOString() };
   } else if (action === "mark_delivered" && isDeposit) {
@@ -401,6 +407,86 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
     return { units: total, at, staleError };
   }
 
+  // Escrow against where the asset is, for one mapping: what the bridge
+  // holds (its node wallet, and its leaf wallet: on-chain, in boards, in
+  // leaves), what it owes to deposits whose tokens are in escrow and whose
+  // Sequentia side is not delivered (a leaf deposit until its leaf is paid),
+  // and what users have returned to it that is not released yet. Users hold
+  // the chain's supply less what the bridge holds, so the reserve reconciles
+  // when escrow equals users' holdings plus owed plus returned. Every figure
+  // the comparison rests on is measured or read from a wallet; one that could
+  // not be read leaves the verdict null.
+  const RETURNING = new Set(["new", "awaiting_finality", "halted", "awaiting_liquidity", "releasing", "queued", "release_failed_manual"]);
+  const DELIVERED = new Set(["minted", "refunded", "refund_discarded", "ignored_unknown_asset"]);
+  async function reconcile(m, escrowedAtoms, chainSupply) {
+    const out = { bridgeHeldAtoms: null, nodeWalletAtoms: null, leafWalletAtoms: null, owedAtoms: "0", returnedAtoms: "0",
+      usersHoldAtoms: null, reconciles: null, unreconciledAtoms: null, leaves: null, error: null };
+    let owed = 0n;
+    for (const d of [...Object.values(state.data.deposits), ...Object.values(state.data.solDeposits ?? {})]) {
+      // Owed until delivered: on Sequentia, or as a refund on the source chain.
+      if (!d.sats || DELIVERED.has(d.status)) continue;
+      if (d.assetId !== m.assetId && bridge.mappingFor?.(bridge.depositTokenKey(d))?.assetId !== m.assetId) continue;
+      owed += BigInt(d.sats);
+    }
+    let returned = 0n;
+    for (const r of [...Object.values(state.data.redemptions), ...Object.values(state.data.solRedemptions ?? {})]) {
+      if (r.assetId === m.assetId && RETURNING.has(r.status) && r.sats) returned += BigInt(r.sats);
+    }
+    out.owedAtoms = owed.toString();
+    out.returnedAtoms = returned.toString();
+    try {
+      const b = await seq.call("getbalances");
+      const mine = b?.mine ?? {};
+      let node = 0n;
+      for (const part of ["trusted", "untrusted_pending", "immature"]) {
+        const v = mine[part]?.[m.assetId] ?? (m.contract?.ticker ? mine[part]?.[m.contract.ticker] : undefined);
+        if (v !== undefined) node += BigInt(Math.round(Number(v) * 1e8));
+      }
+      out.nodeWalletAtoms = node.toString();
+      let leaf = 0n;
+      if (bridge.leaves) {
+        // A leaf deposit's mint is the leaf wallet's once it confirms; while
+        // it is in the mempool the chain's supply has it and the wallet does
+        // not show it yet, so it is counted here. Read on both sides of the
+        // wallet's figures: a mint that confirmed in between is read again.
+        const unconfirmed = async () => {
+          let a = 0n;
+          for (const d of Object.values(state.data.deposits)) {
+            if (d.leaf?.route !== "leaf" || d.status !== "leaf_minted" || d.assetId !== m.assetId || !d.steps?.mintTxid) continue;
+            const t = await seq.call("gettransaction", { txid: d.steps.mintTxid });
+            if ((t.confirmations ?? 0) === 0) a += BigInt(d.sats);
+          }
+          return a;
+        };
+        let f;
+        let pending;
+        for (let i = 0; i < 3; i++) {
+          const before = await unconfirmed();
+          f = await bridge.leaves.figures(m.assetId);
+          pending = await unconfirmed();
+          if (pending === before) break;
+        }
+        out.leaves = { ...f, mintsInMempoolAtoms: pending.toString() };
+        if (f.walletAtoms === null) throw new Error(`the leaf wallet could not be read: ${f.walletError}`);
+        leaf = BigInt(f.walletAtoms) + pending;
+        out.leafWalletAtoms = leaf.toString();
+      }
+      out.bridgeHeldAtoms = (node + leaf).toString();
+      if (chainSupply !== null) {
+        const users = BigInt(chainSupply) - node - leaf;
+        out.usersHoldAtoms = users.toString();
+        if (escrowedAtoms !== null) {
+          const diff = BigInt(escrowedAtoms) - (users + owed + returned);
+          out.unreconciledAtoms = diff.toString();
+          out.reconciles = diff === 0n;
+        }
+      }
+    } catch (e) {
+      out.error = e.message;
+    }
+    return out;
+  }
+
   const server = http.createServer(async (req, res) => {
     res.setHeader("access-control-allow-origin", "*");
     res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
@@ -472,6 +558,20 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         if (req.method === "GET" && parts[2] === "limiters") {
           return send(200, Object.fromEntries(Object.entries(state.data.mappings).map(([k, m]) => [k, limiterView(m)])));
         }
+        if (req.method === "POST" && parts[2] === "leaf-pay") {
+          const body = parseJson(await readBody(req));
+          if (!body?.key || !body?.request) return send(400, { error: "key and request required" });
+          if (!bridge.leaves) return send(400, { error: "no leafWallet is configured" });
+          try {
+            const r = await bridge.leaves.repay(String(body.key), String(body.request));
+            state.data.adminLog ??= [];
+            state.data.adminLog.push({ at: new Date().toISOString(), key: body.key, action: "leaf-pay" });
+            state.save();
+            return send(200, r);
+          } catch (e) {
+            return send(e.status ?? 500, { error: e.message });
+          }
+        }
         if (req.method === "POST" && parts[2] === "retire-asset") {
           const body = parseJson(await readBody(req));
           if (!body?.mappingKey) return send(400, { error: "mappingKey required" });
@@ -499,6 +599,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         req.method === "POST" &&
         (parts[1] === "redeem" ||
           parts[1] === "cctp" ||
+          (parts[1] === "leaf" && parts[2] === "intent") ||
           (["sol", "btc"].includes(parts[1]) && ["wrap", "unwrap"].includes(parts[2])));
       if (isIntent && overLimit(req)) {
         return send(429, { error: "too many requests from this address; try again in an hour" });
@@ -674,6 +775,7 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           const transit = bridge.cctp?.inTransit(m.assetId) ?? { atoms: 0n, burns: [] };
           if (escrowedAtoms !== null) escrowedAtoms += transit.atoms;
           const comparable = escrowedAtoms !== null && chainSupply !== null;
+          const reconciliation = await reconcile(m, escrowedAtoms, chainSupply);
           out.push({
             assetId: m.assetId,
             symbol: m.symbol,
@@ -698,6 +800,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
             // The mint authority: the limiter coin, its state and its limits.
             mintLimiter: limiterView(m),
+            // What the bridge itself holds of the asset, what it owes to
+            // deposits not delivered yet, and what users hold: escrow is to
+            // equal users' holdings plus what is owed and being returned.
+            reconciliation,
           });
         }
 
@@ -862,6 +968,45 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         return send(200, { ...pub, deposit: dep ? publicDeposit(dep) : null });
       }
 
+      // A deposit paid as an Arca leaf: the receive request is checked and
+      // bound to a fresh Sequentia address, which the deposit names as its
+      // destination (see leaves.js).
+      if (parts[1] === "leaf" && parts[2] === "intent") {
+        if (!bridge.leaves) return send(404, { error: "not found" });
+        if (req.method === "POST" && parts.length === 3) {
+          const body = parseJson(await readBody(req));
+          if (!body) return send(400, { error: "invalid JSON body" });
+          try {
+            const r = await bridge.leaves.createIntent({
+              request: body.request,
+              token: body.token,
+              fallbackAddress: body.fallbackAddress,
+            });
+            return send(200, {
+              ...r,
+              note:
+                `Deposit ${r.symbol}'s token with ${r.seqAddress} as the Sequentia address. Once the deposit is final on ` +
+                `${cfg.ethChainName}, its amount is minted into the bridge's leaf wallet, boarded, and paid to this receive ` +
+                `request out of round, less the transfer's margins (a few atoms the payment leaves for the fees of its ` +
+                `pre-signed transactions). The request is paid once: a later deposit for it takes its fallback. ` +
+                `If the request can no longer be paid when the deposit lands, the deposit is ${r.fallback.note}.`,
+            });
+          } catch (e) {
+            if (e.status) return send(e.status, { error: e.message });
+            throw e;
+          }
+        }
+        if (req.method === "GET" && parts[3]) {
+          const addr = decodeURIComponent(parts[3]);
+          const it = Object.hasOwn(state.data.leafIntents ?? {}, addr) ? state.data.leafIntents[addr] : null;
+          if (!it) return send(404, { error: "unknown leaf deposit address" });
+          const deposits = Object.values(state.data.deposits)
+            .filter((d) => d.leaf?.intent === addr)
+            .map(publicDeposit);
+          return send(200, { seqAddress: addr, ...bridge.leaves.publicIntent(it), deposits });
+        }
+      }
+
       if (req.method === "POST" && parts[1] === "redeem") {
         const raw = parseJson(await readBody(req));
         let ethAddress;
@@ -943,6 +1088,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         const body = parseJson(await readBody(req));
         if (!body) return send(400, { error: "invalid JSON body" });
         if (!body.seqAddress) return send(400, { error: "seqAddress required" });
+        if (state.data.leafIntents?.[String(body.seqAddress)]) {
+          return send(400, { error: "that is a leaf deposit address of this bridge, not a destination" });
+        }
         const r = await sbtcBridge("/pegin", { seq_recipient: String(body.seqAddress) });
         if (!r.ok || !r.deposit_address) return send(502, { error: r.error || "bridge error" });
         return send(200, {

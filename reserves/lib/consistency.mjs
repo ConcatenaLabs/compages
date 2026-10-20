@@ -53,6 +53,16 @@ export function checkFigures(payload) {
     }
     const verdict = backedVerdict({ supply: s, escrowAtoms: a.escrowAtoms, inTransitAtoms: a.inTransitAtoms });
     if (verdict !== a.backed) errors.push(`${name}: backed is ${a.backed}, the figures say ${verdict}`);
+    if (a.leaves) {
+      const l = a.leaves;
+      const sum = l.boardsInFlight.reduce((x, b) => x + BigInt(b.atoms), 0n).toString();
+      if (sum !== l.boardsInFlightAtoms) errors.push(`${name}: boardsInFlightAtoms ${l.boardsInFlightAtoms} should be ${sum}`);
+      for (const b of l.boardsInFlight) {
+        const below = b.blockHeight !== null && b.blockHeight <= payload.height;
+        if (b.atOrBelowH !== below) errors.push(`${name}: board ${b.txid} atOrBelowH is ${b.atOrBelowH}, its height ${b.blockHeight} says ${below}`);
+      }
+      if (BigInt(l.owedAtoms) < BigInt(l.boardsInFlightAtoms)) errors.push(`${name}: owes ${l.owedAtoms}, less than its boards in flight ${l.boardsInFlightAtoms}`);
+    }
   }
   return errors;
 }

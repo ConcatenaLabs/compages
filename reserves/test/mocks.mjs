@@ -63,6 +63,12 @@ export async function mockSequentia({ user = "u", password = "p" } = {}) {
       }
       case "getblockchaininfo":
         return ok({ chain: "test", blocks: chain.tip });
+      case "getrawtransaction": {
+        // chain.inBlock maps a txid to the height of the block that holds it.
+        const h = chain.inBlock?.[params[0]];
+        if (h === undefined) return [200, { id, result: null, error: { code: -5, message: "No such mempool or blockchain transaction" } }];
+        return ok({ txid: params[0], ...(h === null ? {} : { blockhash: hashOf(h) }) });
+      }
       default:
         return [200, { id, result: null, error: { code: -32601, message: `no ${method}` } }];
     }
@@ -194,8 +200,8 @@ export const tokenAccount = (owner, mint, amount) => ({
 
 // ---- the daemon ---------------------------------------------------------------
 
-export async function mockDaemon({ assets = [], intents = { treasury: null, addresses: [] }, inTransit = {}, recentTransfers = null } = {}) {
-  const d = { assets, intents, inTransit, recentTransfers };
+export async function mockDaemon({ assets = [], intents = { treasury: null, addresses: [] }, inTransit = {}, recentTransfers = null, reconciliation = {} } = {}) {
+  const d = { assets, intents, inTransit, recentTransfers, reconciliation };
   const { server, url } = await serve(async (req) => {
     const u = new URL(req.url, "http://x");
     if (u.pathname === "/api/assets") return [200, d.assets];
@@ -204,6 +210,7 @@ export async function mockDaemon({ assets = [], intents = { treasury: null, addr
       const a = u.searchParams.get("asset");
       const row = { inTransit: d.inTransit[a] ?? [] };
       if (d.recentTransfers) row.recentTransfers = d.recentTransfers[a] ?? [];
+      if (d.reconciliation[a]) row.reconciliation = d.reconciliation[a];
       return [200, { assets: [row] }];
     }
     return [404, { error: "not found" }];

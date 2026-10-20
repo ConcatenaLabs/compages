@@ -145,6 +145,17 @@ async function rederive(snap) {
         else bad(`${a.ticker ?? a.symbol}: auditor says ${canonicalize(s)}, snapshot says ${canonicalize(a.supply)}`);
       }
     } else note("supply not re-derived (no --audit-script)");
+    // Each board of a deposit paid as a leaf: in a block at or below H, or not.
+    for (const a of p.assets) {
+      for (const b of a.leaves?.boardsInFlight ?? []) {
+        if (!b.txid) continue;
+        const tx = await seq.call("getrawtransaction", [b.txid, true]).catch(() => null);
+        const h = tx?.blockhash ? (await seq.call("getblockheader", [tx.blockhash])).height : null;
+        const below = h !== null && h <= p.height;
+        if (below === b.atOrBelowH) ok(`${a.ticker ?? a.symbol}: board ${b.txid} ${below ? `in block ${h}, at or below H` : "not in a block at or below H"}`);
+        else bad(`${a.ticker ?? a.symbol}: board ${b.txid} is ${h === null ? "in no block" : `in block ${h}`}, the snapshot says atOrBelowH ${b.atOrBelowH}`);
+      }
+    }
   } else note("Sequentia not re-derived (no --seq-rpc)");
 
   if (p.solana) {
