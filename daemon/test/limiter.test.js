@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mintNext, limits, limiterView, MIN_AGE } from "../lib/limiter.js";
+import { mintNext, limits, limiterView, explicitCoin, MIN_AGE } from "../lib/limiter.js";
 
 // The instance of sequentia-contracts' m1 harness test: a window of 20
 // blocks, an allowance of 1,000,000,000 atoms.
@@ -55,4 +55,12 @@ test("the view names the coin, its state and its limits", () => {
   assert.equal(v.braked, false);
   assert.equal(v.tokenId, "ab".repeat(32));
   assert.equal(limiterView({}), null);
+});
+
+test("only an explicit coin pays a covenant spend's fee", () => {
+  const z = "00".repeat(32);
+  assert.equal(explicitCoin({ amount: 1, amountblinder: z, assetblinder: z }), true);
+  assert.equal(explicitCoin({ amount: 1 }), true);
+  assert.equal(explicitCoin({ amount: 1, amountcommitment: "08ab", amountblinder: "11".repeat(32), assetblinder: "22".repeat(32) }), false);
+  assert.equal(explicitCoin({ amount: 1, amountblinder: "11".repeat(32), assetblinder: z }), false);
 });

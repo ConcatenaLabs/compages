@@ -27,6 +27,12 @@
 import { execFile } from "node:child_process";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
 
+/** Whether a listunspent entry is explicit: no commitment, and zero blinders. */
+export function explicitCoin(u) {
+  const zero = (h) => !h || /^0+$/.test(h);
+  return !u.amountcommitment && !u.assetcommitment && zero(u.amountblinder) && zero(u.assetblinder);
+}
+
 /** The least age, in blocks, of a coin a mint spends. */
 export const MIN_AGE = 2;
 
@@ -285,12 +291,16 @@ export class MintLimiter {
     return Math.ceil((ref * 1e8) / (await this.exchangeRate()));
   }
 
-  /** A confirmed, unlocked wallet coin of the fee asset, largest first. */
+  /** A confirmed, unlocked, explicit wallet coin of the fee asset, largest
+   *  first. The covenant spend is built with every amount visible, so a
+   *  blinded coin (the wallet blinds some of its change) cannot pay its fee. */
   async feeCoin() {
     const coins = await this.seq.call("listunspent", { minconf: 1, query_options: { asset: this.feeAsset } });
     const locked = new Set((await this.seq.call("listlockunspent")).map((l) => `${l.txid}:${l.vout}`));
-    const free = coins.filter((u) => !locked.has(`${u.txid}:${u.vout}`)).sort((a, b) => Number(b.amount) - Number(a.amount));
-    if (!free.length) throw new Error(`the wallet has no confirmed coin of the fee asset ${this.feeAsset}`);
+    const free = coins
+      .filter((u) => explicitCoin(u) && !locked.has(`${u.txid}:${u.vout}`))
+      .sort((a, b) => Number(b.amount) - Number(a.amount));
+    if (!free.length) throw new Error(`the wallet has no confirmed explicit coin of the fee asset ${this.feeAsset}`);
     return free[0];
   }
 
