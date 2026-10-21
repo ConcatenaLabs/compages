@@ -91,3 +91,20 @@ test("the token's supply of a supervised issuance is read from the wallet's reco
   assert.equal(await lim.tokenSupply(mapping), 100_000_000n);
   await assert.rejects(lim.tokenSupply({ ...mapping, reissuanceToken: "ee".repeat(32) }), /does not issue token/);
 });
+
+// A tool that exits before reading its request reports its own error; the
+// write to its closed stdin does not crash the process.
+test("a tool that exits at once is reported, not a crash", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "limiter-tool-"));
+  const tool = path.join(dir, "tool");
+  fs.writeFileSync(tool, "#!/bin/sh\necho 'mint-limiter: refused: an argument it does not know' >&2\nexit 2\n", { mode: 0o755 });
+  try {
+    const lim = new MintLimiter({ seqFeeAsset: "aa".repeat(32), mintLimiter: { tool, operatorMnemonicFile: "f", coldKey: "k", windowBlocks: 1440, recoveryDelay: 1182 } }, {});
+    await assert.rejects(lim.tool(["x"], { big: "y".repeat(1 << 20) }), /refused: an argument it does not know/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
