@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mintNext, limits, limiterView, explicitCoin, MIN_AGE } from "../lib/limiter.js";
+import { mintNext, limits, limiterView, explicitCoin, MIN_AGE, MintLimiter } from "../lib/limiter.js";
 
 // The instance of sequentia-contracts' m1 harness test: a window of 20
 // blocks, an allowance of 1,000,000,000 atoms.
@@ -63,4 +63,31 @@ test("only an explicit coin pays a covenant spend's fee", () => {
   assert.equal(explicitCoin({ amount: 1 }), true);
   assert.equal(explicitCoin({ amount: 1, amountcommitment: "08ab", amountblinder: "11".repeat(32), assetblinder: "22".repeat(32) }), false);
   assert.equal(explicitCoin({ amount: 1, amountblinder: "11".repeat(32), assetblinder: z }), false);
+});
+
+// A supervised asset's issuance, as decoderawtransaction reads it, names other
+// ids than the chain gives the asset; the wallet's own record of the issuance
+// is the one that knows its token.
+test("the token's supply of a supervised issuance is read from the wallet's record", async () => {
+  const mapping = { assetId: "91".repeat(32), reissuanceToken: "f5".repeat(32), issueTxid: "e8".repeat(32) };
+  const seq = {
+    call: async (m, p) => {
+      if (m === "gettransaction") return { hex: "00" };
+      if (m === "listissuances") {
+        assert.equal(p.asset, mapping.assetId);
+        return [
+          { txid: mapping.issueTxid, asset: mapping.assetId, token: mapping.reissuanceToken, isreissuance: false, tokenamount: 1.0 },
+          { txid: "c5".repeat(32), asset: mapping.assetId, isreissuance: true },
+        ];
+      }
+      throw new Error("unexpected " + m);
+    },
+    node: async (m) => {
+      if (m === "decoderawtransaction") return { vin: [{ issuance: { asset: "b7".repeat(32), token: "06".repeat(32), isreissuance: false, tokenamount: 1.0 } }] };
+      throw new Error("unexpected " + m);
+    },
+  };
+  const lim = new MintLimiter({ seqFeeAsset: "aa".repeat(32), mintLimiter: { tool: "t", operatorMnemonicFile: "f", coldKey: "k", windowBlocks: 1440, recoveryDelay: 1182 } }, seq);
+  assert.equal(await lim.tokenSupply(mapping), 100_000_000n);
+  await assert.rejects(lim.tokenSupply({ ...mapping, reissuanceToken: "ee".repeat(32) }), /does not issue token/);
 });

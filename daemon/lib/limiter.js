@@ -202,6 +202,17 @@ export class MintLimiter {
         return amountToSats(iss.tokenamount ?? 0);
       }
     }
+    // A supervised asset's ids are derived with its supervision terms, which
+    // decoderawtransaction does not apply: it names another asset and token
+    // for the same issuance. The wallet that made the issuance records it as
+    // the chain has it.
+    const known = await this.seq.call("listissuances", { asset: mapping.assetId }).catch(() => []);
+    for (const i of known ?? []) {
+      if (i.txid === mapping.issueTxid && i.token === mapping.reissuanceToken && !i.isreissuance) {
+        if (i.tokenamount === undefined || i.tokenamount === null) throw new Error("the token's issuance is blinded; its supply is not knowable");
+        return amountToSats(i.tokenamount);
+      }
+    }
     throw new Error(`issuance ${mapping.issueTxid} does not issue token ${mapping.reissuanceToken}`);
   }
 
