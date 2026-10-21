@@ -139,6 +139,10 @@ export class MintLimiter {
           reject(new Error(`mint-limiter: unreadable reply: ${e.message}`));
         }
       });
+      // The tool may exit before it reads its request (a refused argument):
+      // its own error then comes through the callback above, so a write to the
+      // closed pipe must not crash the daemon.
+      child.stdin.on("error", () => {});
       child.stdin.end(request === undefined ? "" : JSON.stringify(request));
     });
   }
