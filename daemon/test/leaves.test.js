@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { decodeRequest, takesFromRefusal, holdingOf, LeafDeposits } from "../lib/leaves.js";
+import { decodeRequest, takesFromRefusal, holdingOf, LeafDeposits, servedSupervised } from "../lib/leaves.js";
 
 const OP = "a".repeat(64);
 const GEN = "b".repeat(64);
@@ -42,9 +42,11 @@ class FakeWallet {
     this.calls = [];
     this.medianTime = 1_000;
     this.sendBehaviour = "pay";
+    this.servedAs = { asset: ASSET, min_leaf: "1000" };
+    this.landingAddress = "ert1qleaflanding";
   }
   async info() {
-    return { operator: OP, genesis: GEN, medianTime: this.medianTime, served: new Map([[ASSET, { asset: ASSET, min_leaf: "1000" }]]) };
+    return { operator: OP, genesis: GEN, medianTime: this.medianTime, served: new Map([[ASSET, this.servedAs]]), landingAddress: this.landingAddress };
   }
   async address() {
     return "ert1qleafwallet";
@@ -68,6 +70,9 @@ class FakeWallet {
   }
   async send(request, atoms, asset) {
     this.calls.push(["send", String(atoms)]);
+    if (servedSupervised(this.servedAs) && !decodeRequest(request).landing) {
+      return { error: { kind: "refused", message: `refused: asset ${asset} is supervised, and the request names no landing: ask the receiver for a new request` } };
+    }
     const live = this.coinsList.filter((c) => c.asset === asset && c.state === "live");
     const total = live.reduce((a, c) => a + BigInt(c.value), 0n);
     if (BigInt(atoms) > total - 4n) {
@@ -309,4 +314,122 @@ test("whoever binds a request first does not choose another depositor's fallback
   const d2 = { key: "2", tag: "deposit #2", seqAddress: thief.seqAddress, sats: "2500000000", status: "minting", steps: {} };
   assert.equal(await h.leaves.decide(d2, mapping), "fallback");
   assert.match(d2.leaf.fallbackReason, /already used by 1/);
+});
+
+// ---- a supervised asset: its leaves are landing-1 leaves only
+
+const LANDING = "5".repeat(40);
+const SUPERVISED = { asset: ASSET, min_leaf: "1000", supervised: { landing_allowance: "480" } };
+
+function intentHarness() {
+  const h = harness();
+  let n = 0;
+  h.bridge.seq = {
+    node: async () => ({ isvalid: true }),
+    call: async (m) => {
+      if (m === "getnewaddress") return `ert1qintent${++n}`;
+      throw new Error(m);
+    },
+  };
+  return h;
+}
+
+test("a request's landing, when it names one, is a 20-byte key program", () => {
+  assert.equal(decodeRequest(request({ landing: LANDING })).landing, LANDING);
+  assert.equal(decodeRequest(request()).landing, undefined);
+  assert.throws(() => decodeRequest(request({ landing: "5".repeat(64) })), /landing is not a 20-byte key program/);
+  assert.throws(() => decodeRequest(request({ landing: "zz".repeat(20) })), /landing is not a 20-byte key program/);
+  assert.equal(servedSupervised(SUPERVISED), true);
+  assert.equal(servedSupervised({ asset: ASSET, supervised: null }), false);
+  assert.equal(servedSupervised({ asset: ASSET }), false);
+});
+
+test("an asset the operator serves supervised takes a leaf intent only for a request naming its landing", async () => {
+  const h = intentHarness();
+  h.wallet.servedAs = SUPERVISED;
+  const before = Object.keys(h.data.leafIntents).length;
+  await assert.rejects(h.leaves.createIntent({ request: request({ asset: ASSET }) }), (e) => {
+    assert.equal(e.status, 400);
+    assert.match(e.message, /MUSD is a supervised asset: .* the receive request names no landing .*ask the wallet for a new request/);
+    return true;
+  });
+  assert.equal(Object.keys(h.data.leafIntents).length, before, "nothing is recorded for a refused request");
+  const it = await h.leaves.createIntent({ request: request({ asset: ASSET, landing: LANDING }) });
+  assert.equal(it.landing, LANDING);
+  assert.equal(h.data.leafIntents[it.seqAddress].landing, LANDING);
+});
+
+test("an open asset's leaf intent is unchanged: no landing asked for, none recorded", async () => {
+  const h = intentHarness();
+  const it = await h.leaves.createIntent({ request: request({ asset: ASSET }) });
+  assert.ok(it.seqAddress);
+  assert.equal(it.landing, null);
+  assert.equal("landing" in h.data.leafIntents[it.seqAddress], false);
+  // A request that names a landing is paid as before too.
+  assert.ok((await h.leaves.createIntent({ request: request({ asset: ASSET, landing: LANDING, until: 10_000_001 }) })).seqAddress);
+});
+
+test("a supervised asset is refused when the leaf wallet has no landing key, or the operator serves it open", async () => {
+  const h = intentHarness();
+  h.wallet.servedAs = SUPERVISED;
+  h.wallet.landingAddress = null;
+  await assert.rejects(h.leaves.createIntent({ request: request({ asset: ASSET, landing: LANDING }) }), (e) => {
+    assert.equal(e.status, 503);
+    assert.match(e.message, /leaf wallet has no landing key/);
+    return true;
+  });
+  const h2 = intentHarness();
+  h2.data.mappings["31337:0xmusd"].supervision = { supervised: true };
+  await assert.rejects(h2.leaves.createIntent({ request: request({ asset: ASSET, landing: LANDING }) }), (e) => {
+    assert.equal(e.status, 400);
+    assert.match(e.message, /supervised on the chain, and the operator does not serve it as supervised/);
+    return true;
+  });
+});
+
+test("a deposit landing after the operator began serving the asset supervised takes its fallback when the request names no landing", async () => {
+  const h = harness();
+  const dep = intentAndDeposit(h, { fallback: { kind: "address", address: "ert1qfallback" } });
+  h.wallet.servedAs = SUPERVISED;
+  assert.equal(await h.leaves.decide(dep, h.data.mappings["31337:0xmusd"]), "fallback");
+  assert.equal(dep.seqAddress, "ert1qfallback");
+  assert.match(dep.leaf.fallbackReason, /names no landing/);
+  // The same deposit with a request naming the depositor's landing is a leaf.
+  const h2 = harness();
+  h2.wallet.servedAs = SUPERVISED;
+  const dep2 = intentAndDeposit(h2, { request: request({ landing: LANDING }), landing: LANDING });
+  assert.equal(await h2.leaves.decide(dep2, h2.data.mappings["31337:0xmusd"]), "leaf");
+});
+
+test("a freeze of the bridge's landing holds the deposit's leaf; a payment the wallet refuses for want of a landing holds it too", async () => {
+  const h = harness();
+  h.wallet.servedAs = SUPERVISED;
+  const dep = intentAndDeposit(h, { request: request({ landing: LANDING }), landing: LANDING });
+  await h.leaves.decide(dep, h.data.mappings["31337:0xmusd"]);
+  dep.assetId = ASSET;
+  h.leaves.minted(dep);
+  h.wallet.onchain = 2_500_000_000n;
+  await h.leaves.step(dep); // board
+  Object.assign(h.wallet.coinsList[0], { state: "live", landing: "ert1qleaflanding", frozen: { frozen: true, paused: false } });
+  await h.leaves.step(dep);
+  assert.equal(dep.status, "leaf_held");
+  assert.match(dep.leaf.heldReason, /issuer has frozen the bridge's landing \(ert1qleaflanding\)/);
+  assert.equal(h.wallet.calls.filter((c) => c[0] === "send").length, 0, "nothing is sent while the landing is frozen");
+  // The freeze lifted: a new request without a landing is refused by leaf-pay,
+  // one with the depositor's landing is paid.
+  h.wallet.coinsList[0].frozen = { frozen: false, paused: false };
+  await assert.rejects(h.leaves.repay("7", request({ until: 20_000_000 })), /names no landing/);
+  const r = await h.leaves.repay("7", request({ until: 20_000_000, landing: LANDING }));
+  assert.equal(r.status, "minted");
+  assert.equal(h.data.leafIntents["ert1qintent"].landing, LANDING);
+  // An intent recorded before the asset was supervised, paid after: the
+  // wallet's refusal holds the leaf rather than retrying for ever.
+  const h2 = harness();
+  const d2 = await mintedDeposit(h2);
+  await h2.leaves.step(d2);
+  h2.wallet.coinsList[0].state = "live";
+  h2.wallet.servedAs = SUPERVISED;
+  await h2.leaves.step(d2);
+  assert.equal(d2.status, "leaf_held");
+  assert.match(d2.leaf.heldReason, /the leaf wallet refused the payment: .*names no landing/);
 });
