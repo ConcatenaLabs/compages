@@ -84,7 +84,7 @@
     "allowances": { "USDC.e": "<atoms per window>" }
   },
 
-  "_leafWallet_note": "Deposits paid as Arca leaves (docs/leaf-deposits.md): `arca` is the Arca wallet's command line, `datadir` the bridge's own leaf wallet on the operator (never a reserve, treasury or service wallet), `feeAsset` the accepted asset its boards pay fees in, held on its on-chain side. Needs mintLimiter. Leave the block out to offer no leaf deposits.",
+  "_leafWallet_note": "Deposits paid as Arca leaves (docs/leaf-deposits.md): `arca` is the Arca wallet's command line, built at the operator's revision (one with landing keys, to pay a supervised asset), `datadir` the bridge's own leaf wallet on the operator (never a reserve, treasury or service wallet), `feeAsset` the accepted asset its boards pay fees in, held on its on-chain side. Needs mintLimiter. Leave the block out to offer no leaf deposits.",
   "leafWallet": {
     "arca": "/usr/local/bin/arca",
     "datadir": "/var/lib/compages/leaf-wallet",

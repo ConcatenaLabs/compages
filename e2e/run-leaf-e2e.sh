@@ -77,12 +77,17 @@ VAULT=$(forge create src/CompagesVault.sol:CompagesVault --rpc-url http://127.0.
   --constructor-args $OWNER_ADDR $OPERATOR_ADDR $GUARDIAN_ADDR 3600 | awk '/Deployed to:/ {print $3}')
 MUSD=$(forge create test/mocks/MockTokens.sol:MockERC20 --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
   --constructor-args "Mock USD" "MUSD" 6 | awk '/Deployed to:/ {print $3}')
-[ -n "$VAULT" ] && [ -n "$MUSD" ] || { echo "deploy failed"; exit 1; }
+# A stablecoin the bridge issues as a supervised asset, as the testnet's
+# unified stablecoins are: an issuer can freeze a holding of it.
+SUSD=$(forge create test/mocks/MockTokens.sol:MockERC20 --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY --broadcast \
+  --constructor-args "Supervised USD" "SUSD" 6 | awk '/Deployed to:/ {print $3}')
+[ -n "$VAULT" ] && [ -n "$MUSD" ] && [ -n "$SUSD" ] || { echo "deploy failed"; exit 1; }
 cast send "$MUSD" "mint(address,uint256)" $USER_ADDR 1000000000000 --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
+cast send "$SUSD" "mint(address,uint256)" $USER_ADDR 1000000000000 --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OPERATOR_KEY >/dev/null
 cast send "$VAULT" "setReleaseLimit(address,uint256,uint256)" "$MUSD" 1000000000000000000000000 1000000000000000000000 \
   --rpc-url http://127.0.0.1:$ANVIL_PORT --private-key $OWNER_KEY >/dev/null
 cd "$HERE"
-echo "   vault $VAULT, MUSD $MUSD"
+echo "   vault $VAULT, MUSD $MUSD, SUSD $SUSD"
 
 echo "== Bitcoin regtest parent"
 "$ELD" -datadir="$RUN/parent" -chain=regtest -rpcport=$PARENT_RPC -port=$(free_port) -listen=0 -rpcuser=e2e -rpcpassword=e2e \
@@ -129,12 +134,13 @@ mkdir -p "$RUN/pgsock"
 "$PG_BIN_DIR/createdb" -h 127.0.0.1 -p $PG_PORT -U arca arca
 
 echo "== Arca operator (signer, arcad on $ARCAD_PORT)"
-( umask 077; openssl rand -hex 32 > "$RUN/arca/operator.key" )
+( umask 077; openssl rand -hex 32 > "$RUN/arca/operator.key"; echo "e2e:e2e" > "$RUN/arca/node.cookie" )
 S=$("$ARCA_BIN_DIR/arca-signer" --key-file "$RUN/arca/operator.key" --pubkey)
 "$ARCA_BIN_DIR/arca-signer" --key-file "$RUN/arca/operator.key" --genesis "$GENESIS" --record "$RUN/arca/signer.record" \
   --create-record --no-keepers >/dev/null
 "$ARCA_BIN_DIR/arca-signer" --key-file "$RUN/arca/operator.key" --genesis "$GENESIS" --record "$RUN/arca/signer.record" \
-  --socket "$RUN/arca/signer.sock" > "$RUN/signer.log" 2>&1 &
+  --socket "$RUN/arca/signer.sock" --supervision-node "http://127.0.0.1:$SEQ_RPC/" --supervision-cookie "$RUN/arca/node.cookie" \
+  > "$RUN/signer.log" 2>&1 &
 SIGNER_PID=$!
 for _ in $(seq 1 50); do [ -S "$RUN/arca/signer.sock" ] && break; sleep 0.2; done
 ( umask 077; echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" > "$RUN/arca/wallet.mnemonic" )
@@ -216,6 +222,17 @@ cat > "$RUN/config.json" <<EOF
   "intentLimitPerHour": 1000,
   "invariantIntervalMs": 5000,
   "ethTxWaitMs": 20000,
+  "unified": {
+    "SUSD": {
+      "name": "Supervised USD (Compages e2e)",
+      "ticker": "SUSD.e",
+      "precision": 6,
+      "supervision": { "enabled": true, "pause": true },
+      "sources": {
+        "31337:$(echo "$SUSD" | tr 'A-Z' 'a-z')": { "chainId": 31337, "token": "$SUSD", "decimals": 6 }
+      }
+    }
+  },
   "mintLimiter": {
     "tool": "$MINT_LIMITER",
     "operatorMnemonicFile": "$RUN/limiter-operator.words",
@@ -261,7 +278,7 @@ c = json.load(open(p)); c["leafWallet"]["arca"] = wrap; json.dump(c, open(p, "w"
 PY
 
 echo "== running the leaf driver"
-VAULT=$VAULT MUSD=$MUSD USER_KEY=$USER_KEY FEEX=$FEEX GENESIS=$GENESIS OPERATOR_S=$S \
+VAULT=$VAULT MUSD=$MUSD SUSD=$SUSD USER_KEY=$USER_KEY FEEX=$FEEX GENESIS=$GENESIS OPERATOR_S=$S \
 ANVIL_PORT=$ANVIL_PORT API_PORT=$API_PORT ARCAD_PORT=$ARCAD_PORT ARCAD_PID=$ARCAD_PID \
 RUN_DIR=$RUN DAEMON_JS="$REPO/daemon/compagesd.js" ARCA="$ARCA" ARCA_BIN_DIR="$ARCA_BIN_DIR" \
 SEQ_RPC=$SEQ_RPC REPO_DIR="$REPO" AUDIT_SCRIPT="${AUDIT_SCRIPT:-}" \

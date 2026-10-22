@@ -141,6 +141,12 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   crash (a board coin, a coin spent by a transfer); never re-run `arca board`
   or `arca send` for a deposit without looking first. The leaf route is
   reachable through the API only; `web/` never names it.
+- **A supervised asset is paid only into a `landing-1` leaf at the depositor's own landing key.**
+  When the operator serves an asset under the supervised profile (`info`'s `assets[].supervised`),
+  a leaf intent whose request names no `landing` is refused before anything is locked, and the
+  leaf wallet must be an `arca` with a landing key (`info`'s `landing_address`). Never pay one to a
+  request without a landing, nor let an operator serve a chain-supervised asset in plain leaves:
+  either puts the coin's exit where the issuer's freeze does not follow.
 - **Every Sequentia fee is paid in the configured asset, never the policy asset by default.** This
   was a specific fix; Sequentia has an open fee market and no privileged unit.
 - Chain ids, RPC endpoints, the vault address and confirmation depths are all configuration, and

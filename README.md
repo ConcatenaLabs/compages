@@ -298,7 +298,8 @@ the API and the wallets' developer mode; the web page does not offer it.
    refused before anything is locked when it is for another operator or
    chain, names an amount, asks for another asset, is for a token not
    bridged yet or an asset the operator does not serve, or lapses within
-   `leafWallet.intentLapseSeconds` (two days by default). The answer is a
+   `leafWallet.intentLapseSeconds` (two days by default). For a supervised
+   asset it is also refused when it names no landing (see below). The answer is a
    fresh Sequentia address of the bridge's wallet and the fallback the
    deposit takes if the request cannot be paid when it lands: an on-chain
    delivery to the `fallbackAddress` the depositor named, or else a refund
@@ -307,7 +308,8 @@ the API and the wallets' developer mode; the web page does not offer it.
    vault's event carries the short address, and the daemon maps it to the
    request.
 3. When the deposit lands, the request is checked again: the bridge's leaf
-   wallet still on its operator and chain, the asset served, the request
+   wallet still on its operator and chain, the asset served (and, for a
+   supervised asset, the request naming its landing), the request
    unused and not lapsing within `leafWallet.landingLapseSeconds` (six hours
    by default), the amount above the operator's smallest leaf. A request
    that fails takes the stated fallback, with the reason on the record. A
@@ -333,6 +335,28 @@ whose request lapses, or is refused by the operator, after its board is
 `leaf_held`: its leaf stays in the bridge's wallet, counted as owed to the
 deposit, until an operator pays a new request of the depositor's
 (`admin.js leaf-pay`). The runbook is [`docs/leaf-deposits.md`](docs/leaf-deposits.md).
+
+**A supervised asset** (one its issuer can freeze, as the unified
+stablecoins are) is held in an Arca operator's tree only in `landing-1`
+leaves: each leaf names a landing key, a P2WPKH key of its holder's own,
+where the leaf's exit pays and where the issuer's freeze follows it. The
+operator says which assets it serves so (`info`'s `assets[].supervised`,
+with its `landing_allowance`). Such a deposit is paid into a `landing-1`
+leaf for the depositor's leaf key and the depositor's landing key, which
+the receive request names (`landing`, the hex of a 20-byte P2WPKH program;
+every current Arca wallet's request carries it). A request without one is
+refused at the intent, before anything is locked: the depositor asks the
+wallet for a new request. Between the board and the payment the bridge's
+own leaf wallet holds the deposit in a `landing-1` leaf at the leaf
+wallet's own landing key, so the leaf wallet must be an `arca` new enough
+to have one (its `info` shows `landing_address`); until it is, intents for
+a supervised asset are refused and the start-up log says why. A freeze of
+the bridge's landing by the issuer stops the payment: the deposit goes
+`leaf_held` until the issuer lifts it (the runbook says what to do).
+
+Supervision changes nothing in the reserves: supply, escrow and the
+reconciliation are counted for a supervised asset exactly as for any other,
+and its leaves are minted per deposit like every leaf.
 
 ### Sequentia → Ethereum (return, then release)
 
@@ -852,7 +876,7 @@ Configuration reference (`daemon/config.example.json`):
 | `esploraUrl` | Indexer used to read the circulating supply of assets this bridge did not issue (SBTC on the reserves page). Without it their supply is reported as unknown, never as zero |
 | `seqFeeAsset` | Asset id or label the bridge pays all Sequentia fees in (any accepted fee asset the wallet holds) |
 | `mintLimiter` | Every reissuance through a mint limiter (see "The mint limiter" and [`docs/mint-limiter.md`](docs/mint-limiter.md)): `tool` (the `mint-limiter` binary, in the sequentia-contracts checkout it was built in), `operatorMnemonicFile`, `coldKey` (the cold key's x-only public key), `windowBlocks`, `recoveryDelay` (units of 512 seconds), `defaultAllowance` and `allowances` (atoms per window, by ticker, symbol or mapping key). Unset, the daemon reissues from its wallet |
-| `leafWallet` | Deposits paid as Arca leaves (see "Deposits paid as Arca leaves" and [`docs/leaf-deposits.md`](docs/leaf-deposits.md)): `arca` (the `arca` command line), `datadir` (the bridge's own leaf wallet, made with `arca create` on the operator), `feeAsset` (the accepted asset its boards pay fees in, held on the chain by the leaf wallet; default `seqFeeAsset`), `feeTopUpBoards` (when `feeAsset` is `seqFeeAsset`, the daemon keeps the leaf wallet's fee coins at this many 1,000-vbyte fees at the node's rate, about three boards each, from the node wallet's own stock, topping up when they fall below a quarter of it; default 50, 0 to fund it by hand) and `feeCheckMs` (default 300000), `intentLapseSeconds` (default 172800), `landingLapseSeconds` (default 21600), `syncMinMs`, `syncMaxMs`, `syncBusyMs`, `timeoutMs`. Needs `mintLimiter`. Unset, `/api/leaf/*` answers 404 |
+| `leafWallet` | Deposits paid as Arca leaves (see "Deposits paid as Arca leaves" and [`docs/leaf-deposits.md`](docs/leaf-deposits.md)): `arca` (the `arca` command line, at the operator's revision; one with landing keys to pay a supervised asset), `datadir` (the bridge's own leaf wallet, made with `arca create` on the operator), `feeAsset` (the accepted asset its boards pay fees in, held on the chain by the leaf wallet; default `seqFeeAsset`), `feeTopUpBoards` (when `feeAsset` is `seqFeeAsset`, the daemon keeps the leaf wallet's fee coins at this many 1,000-vbyte fees at the node's rate, about three boards each, from the node wallet's own stock, topping up when they fall below a quarter of it; default 50, 0 to fund it by hand) and `feeCheckMs` (default 300000), `intentLapseSeconds` (default 172800), `landingLapseSeconds` (default 21600), `syncMinMs`, `syncMaxMs`, `syncBusyMs`, `timeoutMs`. Needs `mintLimiter`. Unset, `/api/leaf/*` answers 404 |
 | `seqBlockMs` | The Sequentia block interval in milliseconds (default 60000), used to time a mint that waits for the next window |
 | `sbtcBridgeUrl`, `sbtcBridgeToken` | The sbtc-bridge custody service behind `/api/btc/*` (omit the URL to disable the Bitcoin leg); it decides when a deposit is credited, and reports it per address |
 | `solRpcUrl`, `solChainName`, `solChainLabel` | Solana JSON-RPC endpoint and naming for the Solana leg (omit the URL to disable it) |
@@ -1409,7 +1433,9 @@ anchored to a Bitcoin regtest parent (its blocks certified by the test
 committee, so an Arca operator's finality holds), PostgreSQL, an Arca
 operator (`arca-signer` and `arcad` from
 [ConcatenaLabs/arca](https://github.com/ConcatenaLabs/arca)), the bridge's
-leaf wallet and a depositor's `arca` wallet, then checks that: an asset
+leaf wallet and a depositor's `arca` wallet (the three binaries from one
+revision of arca, one with `landing-1` leaves; the workflow pins it), then
+checks that: an asset
 bridged on the chain is served once the operator reloads; requests for
 another operator or chain, naming an amount or another asset, or for a token
 not bridged are refused before any deposit; a deposit for the depositor's
@@ -1420,10 +1446,15 @@ before, during and after; the daemon killed right after the wallet paid and
 before it recorded the payment finds the payment on restart and pays nothing
 twice; a second deposit to a used request is refunded on Ethereum; and a
 request that has lapsed when its deposit lands is delivered on the chain to
-the intent's fallback address. With `AUDIT_SCRIPT` set to the node
+the intent's fallback address. It also issues a supervised stablecoin
+through the unified-asset ceremony, has the operator serve it under the
+supervised profile (its signer reading freezes from the node), refuses a
+request whose landing was stripped, and checks that a deposit arrives as a
+`landing-1` leaf landing at the depositor's own landing key, held by the
+bridge at its own landing in between. With `AUDIT_SCRIPT` set to the node
 repository's `contrib/asset-supply-audit/audit.py` it also takes a reserve
 snapshot (a dry run) and checks its leaf figures. Every port is chosen free;
-the run lives in `e2e/run-leaf` and takes about two minutes.
+the run lives in `e2e/run-leaf` and takes about three minutes.
 
 GitHub Actions runs all of the above on every pull request and every push to
 `main` (`.github/workflows/ci.yml`): `forge build` and `forge test`, the

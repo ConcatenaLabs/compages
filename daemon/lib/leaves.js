@@ -32,11 +32,23 @@
 // by the wallet itself before it asks the operator, so after a crash the
 // wallet answers whether they happened: a board shows in `boards`; a payment
 // shows as the deposit's coin spent by a transfer.
+//
+// A supervised asset (one whose issuer can freeze a holding by consensus
+// rule, as the bridge's unified stablecoins are) is held in the tree only in
+// `landing-1` leaves: every leaf of it names a landing key, a P2WPKH of its
+// holder's own, where its exit pays and where the issuer's freeze follows it.
+// The operator says which assets it serves so (`info`'s `assets[].supervised`).
+// A deposit of such an asset is paid only to a request that names the
+// depositor's landing (`landing`, which every current wallet's request
+// carries), and only through a leaf wallet that has a landing key of its own
+// (`info`'s `landing_address`): between the board and the payment the bridge
+// holds the deposit in a landing-1 leaf at its own landing.
 
 import { execFile } from "node:child_process";
 import { satsToAmount } from "./seqrpc.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const HEX20 = /^[0-9a-f]{40}$/;
 
 /** A refusal for the caller of the intent API, with its HTTP status. */
 const refuse = (status, message) => Object.assign(new Error(message), { status, badRequest: status === 400 });
@@ -66,7 +78,51 @@ export function decodeRequest(text) {
   }
   if (v.asset !== undefined && !HEX64.test(v.asset)) throw refuse(400, "the receive request names an asset that is not an asset id");
   if (v.until !== undefined && !Number.isSafeInteger(v.until)) throw refuse(400, "the receive request's lapse is not a time");
+  if (v.landing !== undefined && !HEX20.test(v.landing)) {
+    throw refuse(400, "the receive request's landing is not a 20-byte key program");
+  }
   return v;
+}
+
+/** Whether the operator serves an asset (its `info.assets[]` entry) under
+ *  the supervised profile, which holds it in landing-1 leaves only. */
+export function servedSupervised(served) {
+  return Boolean(served?.supervised && served.supervised.landing_allowance !== undefined && served.supervised.landing_allowance !== null);
+}
+
+/** Why a leaf of `mapping`'s asset, served as `served`, cannot be paid into
+ *  the request `req` through a leaf wallet whose `info` is `info`, or null.
+ *  `{ status, message }`: 400 is the request's to mend, 503 the bridge's. */
+export function landingProblem(req, served, mapping, info) {
+  const name = mapping?.symbol ?? served?.asset;
+  if (servedSupervised(served)) {
+    if (!info?.landingAddress) {
+      return {
+        status: 503,
+        message:
+          `the operator serves ${name} as a supervised asset, held in landing-1 leaves only, and the bridge's leaf wallet ` +
+          `has no landing key (its arca predates them): deposit it to a Sequentia address instead`,
+      };
+    }
+    if (!req.landing) {
+      return {
+        status: 400,
+        message:
+          `${name} is a supervised asset: its leaf lands only at its receiver's own landing key, and the receive request ` +
+          `names no landing (it is from an older wallet); ask the wallet for a new request`,
+      };
+    }
+    return null;
+  }
+  if (mapping?.supervision?.supervised) {
+    return {
+      status: 400,
+      message:
+        `${name} is supervised on the chain, and the operator does not serve it as supervised: a leaf of it would exit ` +
+        `where the issuer's freeze does not follow, so it is not paid as a leaf here`,
+    };
+  }
+  return null;
 }
 
 /** The atoms a refused send says paying `paid` would take, or null. */
@@ -144,6 +200,9 @@ export class LeafWallet {
       medianTime: i.tip?.median_time ?? null,
       served,
       fees: i.server_info?.fees ?? null,
+      // Where the wallet's coins of a supervised asset land: the wallet's
+      // landing key. An arca too old for landing-1 leaves shows none.
+      landingAddress: i.landing_address ?? null,
     };
     return this._info;
   }
@@ -242,6 +301,8 @@ export class LeafDeposits {
     }
     const served = info.served.get(mapping.assetId);
     if (!served) throw refuse(400, `the operator does not serve ${mapping.symbol} (${mapping.assetId})`);
+    const landing = landingProblem(req, served, mapping, info);
+    if (landing) throw refuse(landing.status, landing.message);
     if (req.until === undefined) throw refuse(400, "the receive request names no lapse; ask the wallet for a new one");
     const need = this.c.intentLapseSeconds ?? 2 * 86_400;
     if (info.medianTime === null || req.until < info.medianTime + need) {
@@ -276,6 +337,7 @@ export class LeafDeposits {
       genesis: req.genesis_hash,
       owner: req.owner,
       until: req.until,
+      ...(servedSupervised(served) ? { landing: req.landing } : {}),
       assetId: mapping.assetId,
       mappingKey,
       symbol: mapping.symbol,
@@ -295,6 +357,7 @@ export class LeafDeposits {
       operator: it.operator,
       owner: it.owner,
       until: it.until,
+      landing: it.landing ?? null,
       fallback: it.fallback,
       usedBy: it.usedBy ?? null,
       createdAt: it.createdAt,
@@ -325,6 +388,7 @@ export class LeafDeposits {
     } else if (!this.bridge.limiter) {
       why = "the bridge mints without a mint limiter, and a leaf is minted only through one";
     } else {
+      let landing = null;
       try {
         const info = await this.wallet.info(true);
         const served = info.served.get(it.assetId);
@@ -333,6 +397,8 @@ export class LeafDeposits {
           why = "the bridge's leaf wallet is no longer on the operator and chain the request names";
         } else if (!served) {
           why = `the operator no longer serves ${it.symbol}`;
+        } else if ((landing = landingProblem(decodeRequest(it.request), served, mapping, info))) {
+          why = landing.message;
         } else if (info.medianTime === null || it.until < info.medianTime + margin) {
           why = `the receive request lapses at ${it.until} (the chain's median time is ${info.medianTime}), too soon for the mint and the board to finish`;
         } else if (BigInt(dep.sats) < BigInt(served.min_leaf ?? 0) + 1000n) {
@@ -637,6 +703,13 @@ export class LeafDeposits {
       this.bridge.state.save();
       return;
     }
+    if (coin.frozen?.frozen || coin.frozen?.paused) {
+      return this.hold(
+        dep,
+        `${coin.frozen.paused ? "the issuer has paused the asset" : "the issuer has frozen the bridge's landing"}` +
+          `${coin.landing ? ` (${coin.landing})` : ""}: the operator co-signs no payment of the deposit's coin until it lifts it`
+      );
+    }
     const info = await this.wallet.info(true);
     if (info.medianTime !== null && it.until <= info.medianTime + 60) {
       return this.hold(dep, `the receive request lapsed at ${it.until} (the chain's median time is ${info.medianTime}) before the board was final`);
@@ -652,6 +725,9 @@ export class LeafDeposits {
     const value = BigInt(coin.value);
     const probe = await this.wallet.send(it.request, value + 1n, dep.assetId);
     const t = probe.error ? takesFromRefusal(probe.error.message) : null;
+    if (!t && /names no landing/.test(String(probe.error?.message ?? ""))) {
+      return this.hold(dep, `the leaf wallet refused the payment: ${probe.error.message}`);
+    }
     if (!t) {
       throw new Error(`the wallet did not price the margins (${probe.error?.message ?? "the probe was paid"})`);
     }
@@ -735,12 +811,21 @@ export class LeafDeposits {
     if (req.operator !== info.operator || req.genesis_hash !== info.genesis) throw refuse(400, "the request is for another operator or chain");
     if (req.asset !== undefined && req.asset !== dep.assetId) throw refuse(400, "the request asks for another asset");
     if (req.value !== undefined) throw refuse(400, "the request names an amount; ask the depositor for one without");
+    const landing = landingProblem(req, info.served.get(dep.assetId), this.mappingOfAsset(dep.assetId)?.[1], info);
+    if (landing) throw refuse(landing.status, landing.message);
     const need = this.c.landingLapseSeconds ?? 6 * 3600;
     if (req.until === undefined || info.medianTime === null || req.until < info.medianTime + need) {
       throw refuse(400, `the request lapses at ${req.until ?? "no time"}, too soon (the chain's median time is ${info.medianTime})`);
     }
     const addr = dep.leaf.intent;
-    this.s.leafIntents[addr] = { ...this.s.leafIntents[addr], request: String(request).trim(), owner: req.owner, until: req.until, repaidAt: new Date().toISOString() };
+    this.s.leafIntents[addr] = {
+      ...this.s.leafIntents[addr],
+      request: String(request).trim(),
+      owner: req.owner,
+      until: req.until,
+      landing: req.landing,
+      repaidAt: new Date().toISOString(),
+    };
     dep.leaf.owner = req.owner;
     dep.leaf.until = req.until;
     delete dep.leaf.heldReason;

@@ -13,7 +13,12 @@
 //     the payment: the restarted daemon finds the payment, pays nothing twice;
 //  5. a second deposit to a used request takes its fallback (a refund);
 //  6. a request that has lapsed when its deposit lands takes its fallback (an
-//     on-chain delivery to the address the intent named).
+//     on-chain delivery to the address the intent named);
+//  7. a supervised asset (issued so by the bridge's unified-asset ceremony,
+//     served by the operator under the supervised profile): a request with
+//     its landing stripped is refused at the intent, and a deposit for a
+//     fresh request arrives as a landing-1 leaf landing at the depositor's
+//     own landing key, held by the bridge at its own landing in between.
 
 import { ethers } from "ethers";
 import fs from "node:fs";
@@ -28,6 +33,7 @@ const provider = new ethers.JsonRpcProvider(`http://127.0.0.1:${E.ANVIL_PORT}`, 
 const user = new ethers.Wallet(E.USER_KEY, provider);
 const vault = new ethers.Contract(E.VAULT, ["function depositToken(address token, uint256 amount, string sequentiaAddress)"], user);
 const musd = new ethers.Contract(E.MUSD, ["function approve(address,uint256) returns (bool)", "function balanceOf(address) view returns (uint256)"], user);
+const susd = new ethers.Contract(E.SUSD, ["function approve(address,uint256) returns (bool)", "function balanceOf(address) view returns (uint256)"], user);
 
 let failures = 0;
 const record = [];
@@ -128,7 +134,13 @@ async function deposit(units, seqAddress) {
   return (await vault.depositToken(E.MUSD, units, seqAddress)).wait();
 }
 
-/** A receive request's text with fields of its JSON changed. */
+async function depositOf(token, units, seqAddress) {
+  await (await token.approve(E.VAULT, units)).wait();
+  return (await vault.depositToken(await token.getAddress(), units, seqAddress)).wait();
+}
+
+/** A receive request's text with fields of its JSON changed (a field set to
+ *  undefined is left out). */
 function editRequest(text, changes) {
   const i = text.indexOf(":");
   const v = JSON.parse(Buffer.from(text.slice(i + 1), "hex").toString());
@@ -325,6 +337,62 @@ try {
   check("it is delivered on the chain to the fallback address, with the reason",
     Boolean(fb.steps.sendTxid) && fb.leaf.route === "fallback" && got6 - before6 === 500_000_000, `${fb.leaf.fallbackReason}; received ${got6 - before6}`);
   await reconciles("after the fallback delivery", A, { owedAtoms: 0, leafWalletAtoms: 0 });
+
+  // ---------------- 7. a supervised asset
+  console.log(`\n-- ${at()} 7. a supervised asset: paid only into a landing-1 leaf at the depositor's landing`);
+  const S = await waitFor("the supervised asset issued and its token in its mint limiter", async () => {
+    const m = (await api("assets")).body.find((x) => x.unified && x.symbol === "SUSD");
+    return m?.mintLimiter?.coin ? m : null;
+  }, 180_000);
+  check("the ceremony issued SUSD.e as a supervised asset, its token in its mint limiter", S.supervised === true,
+    `${S.assetId}, supervised ${S.supervised}`);
+  const listed = await seq("getsupervisedassets");
+  check("the node lists it as supervised", listed.some((a) => a.asset === S.assetId), JSON.stringify(listed.map((a) => a.asset)));
+  const conf7 = fs.readFileSync(`${RUN}/arca/arcad.toml`, "utf8");
+  fs.writeFileSync(`${RUN}/arca/arcad.toml`, conf7 + `[[assets]]\nasset = "${S.assetId}"\nmin_leaf = "1000"\n`);
+  process.kill(Number(fs.existsSync(`${RUN}/arcad.pid`) ? fs.readFileSync(`${RUN}/arcad.pid`, "utf8") : E.ARCAD_PID), "SIGHUP");
+  const servedS = await waitFor("the operator to serve it supervised",
+    async () => (arca("leaf", "info").server_info?.assets ?? []).find((a) => a.asset === S.assetId && a.supervised?.landing_allowance !== undefined) ?? null, 30_000);
+  check("the operator serves it under the supervised profile", true, `landing allowance ${servedS.supervised.landing_allowance}`);
+  const leafLanding = arca("leaf", "info").landing_address;
+  const aliceLanding = arca("alice", "info").landing_address;
+  check("both wallets have a landing key", Boolean(leafLanding) && Boolean(aliceLanding), `bridge ${leafLanding}, alice ${aliceLanding}`);
+  const reqS = arca("alice", "receive", "--asset", S.assetId).request;
+  const decoded = JSON.parse(Buffer.from(reqS.slice(reqS.indexOf(":") + 1), "hex").toString());
+  check("alice's request names her landing", /^[0-9a-f]{40}$/.test(decoded.landing ?? ""), decoded.landing);
+  const intents7 = Object.keys(stateNow().leafIntents ?? {}).length;
+  r = await post("leaf/intent", { request: editRequest(reqS, { landing: undefined }), token: E.SUSD });
+  check("a request with its landing stripped is refused at the intent", r.status === 400 && /names no landing/.test(r.body.error), `${r.status} ${r.body.error}`);
+  check("no intent was recorded for it", Object.keys(stateNow().leafIntents ?? {}).length === intents7);
+  const it7 = (await post("leaf/intent", { request: reqS, token: E.SUSD })).body;
+  check("the request naming her landing binds", Boolean(it7.seqAddress) && it7.assetId === S.assetId && it7.landing === decoded.landing,
+    `${it7.seqAddress}, landing ${it7.landing}`);
+  const d7 = await depositOf(susd, 30_000_000n, it7.seqAddress);
+  const SATS7 = 30_000_000n; // precision 6: one atom a token unit
+  // The bridge holds the deposit in a landing-1 leaf at its own landing
+  // between the board and the payment.
+  const held7 = await waitFor("the bridge's board of the deposit", async () => {
+    const d = depByTx(d7.hash);
+    const id = d?.steps?.leafBoard?.leafId;
+    const c = id ? arca("leaf", "coins").find((x) => x.leaf_id === id) : null;
+    return c && c.landing ? c : d?.status === "minted" ? { late: true } : null;
+  }, 240_000, 200);
+  check("the bridge's board of it is a landing-1 leaf at the bridge's own landing", held7.landing === leafLanding,
+    held7.late ? "paid before the board could be read" : `${held7.leaf_id} ${held7.state}, landing ${held7.landing}, frozen ${JSON.stringify(held7.frozen)}`);
+  const paid7 = await waitFor("the supervised leaf paid", async () => {
+    const d = depByTx(d7.hash);
+    return d?.status === "minted" && d.leaf?.paid ? d : null;
+  }, 240_000);
+  check("the deposit was paid as a leaf", BigInt(paid7.leaf.paid.value) + BigInt(paid7.leaf.paid.margins) === SATS7,
+    `leaf ${paid7.leaf.paid.value} + margins ${paid7.leaf.paid.margins} = ${SATS7}`);
+  arca("alice", "sync");
+  const coinsS = arca("alice", "coins").filter((c) => c.asset === S.assetId);
+  fs.writeFileSync(`${RUN}/alice-supervised-coins.json`, JSON.stringify(coinsS, null, 1));
+  check("alice's coin is a landing-1 leaf landing at her own landing key",
+    coinsS.length === 1 && coinsS[0].state === "live" && coinsS[0].value === paid7.leaf.paid.value && coinsS[0].landing === aliceLanding &&
+      coinsS[0].frozen?.frozen === false,
+    `${coinsS.map((c) => `${c.value} ${c.state} landing ${c.landing} frozen ${JSON.stringify(c.frozen)}`).join("; ")}; info.landing_address ${aliceLanding}`);
+  await reconciles("after the supervised payment", S.assetId, { owedAtoms: 0, leafWalletAtoms: 0, paidAtoms: paid7.leaf.paid.value });
 
   check("the fee coins were topped up once over the whole run", stateNow().leafFeeTopUps.length === 1, `${stateNow().leafFeeTopUps.length}`);
   const st = await api("health");
