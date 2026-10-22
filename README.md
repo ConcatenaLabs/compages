@@ -1338,7 +1338,7 @@ Solana read close to H. A failed run shows as a failed unit
 | `web/` | Static web front-end (no framework, no external dependencies), served by the daemon |
 | `watcher/` | `compages-watch.js`, the independent checker (see "The watcher"), with `lib/checks.js` and unit tests |
 | `reserves/` | The signed reserve snapshots (see "Signed reserve snapshots"): `snapshot.mjs` takes one, `verify.mjs` checks them, `keygen.mjs` creates the attestation key; `lib/format.mjs` is the format itself (canonical JSON, hashing, signature and chain checks), with unit tests and an end-to-end test against stand-in nodes |
-| `e2e/` | Full-stack end-to-end tests: `run-e2e.sh` (anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts) and `run-leaf-e2e.sh` (deposits paid as Arca leaves, on an anchored proof-of-stake regtest chain with an Arca operator; `leaf-chain.mjs` produces its blocks) |
+| `e2e/` | Full-stack end-to-end tests: `run-e2e.sh` (anvil + a mock Solana RPC + Sequentia `elementsregtest` + the real daemon and contracts) and `run-leaf-e2e.sh` (deposits paid as Arca leaves, on an anchored proof-of-stake regtest chain with an Arca operator; `leaf-chain.mjs` produces its blocks) and `run-issuer-e2e.sh` (an asset an Arca operator serves issuer-operated, checked by the daemon, the watcher through `mini-esplora.mjs`, and the snapshot tool) |
 | `docs/` | Runbooks: [`mint-limiter.md`](docs/mint-limiter.md), [`leaf-deposits.md`](docs/leaf-deposits.md), and the bridged USDC standard |
 | `contrib/` | `handover-rehearsal.sh`, the Circle hand-off rehearsal on a Sepolia fork (see "Rehearsing the hand-off to Circle"); `safe-owner.md`, the runbook for moving the vault owner to a Safe, and `safe-owner-rehearsal.sh`, its rehearsal on a Sepolia fork |
 
@@ -1490,6 +1490,30 @@ bridge at its own landing in between. With `AUDIT_SCRIPT` set to the node
 repository's `contrib/asset-supply-audit/audit.py` it also takes a reserve
 snapshot (a dry run) and checks its leaf figures. Every port is chosen free;
 the run lives in `e2e/run-leaf` and takes about three minutes.
+
+An asset an Arca operator serves issuer-operated has a suite of its own:
+
+```
+SEQUENTIAD_EXEC=~/sequentia-core-<version>/bin/sequentiad ARCA_BIN_DIR=<dir holding arca, arcad, arca-signer> \
+  PG_BIN_DIR=/usr/lib/postgresql/16/bin MINT_LIMITER=<mint-limiter with sign> \
+  AUDIT_SCRIPT=<Sequentia checkout>/contrib/asset-supply-audit/audit.py e2e/run-issuer-e2e.sh
+```
+
+It brings up the same chains and operator, the watcher (reading
+`e2e/mini-esplora.mjs`, a small stand-in for the indexer over the node's RPC)
+and the snapshot tool, and serves the bridged asset issuer-operated, the
+operator's signer minting through the asset's mint limiter beside the daemon.
+It checks that a refresh minting into a round passes every reserve check
+(the daemon follows its limiter through the round, its invariants and
+`/api/por`, the watcher and a signed snapshot taken after the round, which
+`verify.mjs --rederive` re-reads); that the batch's sweep burns it, the
+abandoned leaf with it, and the accounting follows; that a snapshot at a
+height before the sweep, taken after it, still counts the batch output,
+naming its spender; that a reorg across the round and its sweep keeps the
+asset backed while both are out and once both are back; and that a limiter
+mint to a coin of the minter's own halts the asset in the daemon, trips its
+supply invariant and makes the watcher halt it too. The run lives in
+`e2e/run-issuer` and takes about ten minutes.
 
 GitHub Actions runs all of the above on every pull request and every push to
 `main` (`.github/workflows/ci.yml`): `forge build` and `forge test`, the
