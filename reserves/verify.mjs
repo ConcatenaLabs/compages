@@ -26,6 +26,16 @@
 //   --seq-rpc URL        block H's hash and the genesis hash (http://user:pass@host:port)
 //   --audit-script PATH  with --seq-rpc: rerun the supply auditor to H and
 //                        compare every supply figure (a full scan)
+//                        With --seq-rpc (a node with -txindex), an
+//                        issuer-operated asset's units under burn-only sweeps
+//                        are re-derived output by output: made at or below
+//                        H, holding what the snapshot says, and live at H
+//                        (unspent now, or spent in a block above H)
+//   --operator URL       with --seq-rpc: the asset's Arca operator, to check
+//                        each of those outputs against its batch's published
+//                        tree as well
+//   --max-scan N         blocks above H searched for the spender of an output
+//                        spent since the snapshot (default 5000)
 //   --sol-rpc URL        the cluster's genesis hash and every listed CCTP
 //                        transfer's burn; with --eth-rpc as well, whether each
 //                        was still in flight at block B (its CCTP nonce, from
@@ -46,6 +56,8 @@ import { checkFigures } from "./lib/consistency.mjs";
 import { supplyFromAudit } from "./lib/figures.mjs";
 import { runAudit } from "./lib/audit.mjs";
 import { seqClient, ethProvider, vaultFigures, solClient, checkBurn, checkTransfer } from "./lib/chains.mjs";
+import { nodeReader, operatorClient, Trees } from "./lib/burnonly.mjs";
+import { issuedOf, burnedOf } from "../daemon/lib/burnonly.js";
 
 function parseArgs(argv) {
   const o = { target: null };
@@ -91,6 +103,80 @@ function checkIndex(index, snaps) {
   const expected = canonicalize(buildIndex(snaps));
   if (canonicalize(index) === expected) ok(`index lists all ${snaps.length} snapshots and their hashes`);
   else bad("index.json does not match the snapshots it lists");
+}
+
+// Each output an issuer-operated asset's snapshot counts as live under a
+// burn-only sweep at H, read again on the node.
+async function rederiveBurnOnly(seq, p, a) {
+  const name = a.ticker ?? a.symbol;
+  const reader = nodeReader(seq.call);
+  const trees = opts.operator ? new Trees(operatorClient(opts.operator)) : null;
+  if (!trees) note(`${name}: outputs under burn-only sweeps not checked against their trees (no --operator)`);
+  const maxScan = Number(opts.maxScan ?? 5000);
+  let sum = 0n;
+  for (const o of a.burnOnly.outputs) {
+    const [txid, vs] = o.outpoint.split(":");
+    const vout = Number(vs);
+    const made = await reader.tx(txid);
+    const out = made?.vout?.[vout];
+    if (!made?.inChain || made.height > p.height) {
+      bad(`${name}: ${o.outpoint} is ${made?.inChain ? `made at ${made.height}, above H` : "in no block"}`);
+      continue;
+    }
+    if (out?.asset !== a.assetId || String(out.value) !== String(o.value)) {
+      bad(`${name}: ${o.outpoint} holds ${out?.value} of ${out?.asset}, the snapshot says ${o.value}`);
+      continue;
+    }
+    let live = false;
+    if (o.spentBy) {
+      const sp = await reader.tx(o.spentBy);
+      live = Boolean(sp?.inChain && sp.height > p.height && sp.vin.some((i) => i.txid === txid && i.vout === vout));
+      if (!live) bad(`${name}: ${o.outpoint} is not spent by ${o.spentBy} in a block above H`);
+    } else if (await reader.utxo(txid, vout)) {
+      live = true;
+    } else {
+      const tip = await seq.call("getblockcount", []);
+      for (let h = p.height + 1; h <= Math.min(tip, p.height + maxScan) && !live; h++) {
+        const block = await seq.call("getblock", [await seq.call("getblockhash", [h]), 2]);
+        if (block.tx.some((t) => (t.vin ?? []).some((i) => i.txid === txid && i.vout === vout))) live = true;
+      }
+      if (!live) bad(`${name}: ${o.outpoint} is spent, and not in the ${maxScan} blocks above H`);
+    }
+    if (live && trees) {
+      const [rt, rv] = o.round.split(":");
+      const t = await trees.get(rt, Number(rv)).catch(() => null);
+      const levels = t?.nodes ?? [];
+      let placed = t?.burn === true && t.asset === a.assetId;
+      if (placed && o.kind === "batch") placed = txid === rt && vout === Number(rv) && out.script === levels[levels.length - 1]?.[0]?.script_pubkey;
+      else if (placed && o.kind === "node") placed = out.script === levels[o.level]?.[o.index]?.script_pubkey;
+      else if (placed && o.kind === "entry") {
+        placed = false;
+        for (const i of made.vin) {
+          const ps = i.txid ? (await reader.tx(i.txid))?.vout?.[i.vout]?.script : null;
+          if ((levels[0] ?? []).some((n) => n.script_pubkey === ps)) placed = true;
+        }
+      }
+      if (!placed) {
+        bad(`${name}: ${o.outpoint} is not where the operator's published tree ${o.round} puts a ${o.kind}`);
+        continue;
+      }
+    }
+    if (live) sum += BigInt(o.value);
+  }
+  if (sum.toString() === a.burnOnly.liveAtoms) ok(`${name}: ${a.burnOnly.outputs.length} output(s) under burn-only sweeps, ${sum} atoms, live at H`);
+  else bad(`${name}: the outputs live at H hold ${sum}, the snapshot says ${a.burnOnly.liveAtoms}`);
+  // The operator's mints and burns it counts: each in a block at or below H,
+  // minting or burning what the snapshot says.
+  for (const [list, read, what] of [[a.burnOnly.mints, issuedOf, "mints"], [a.burnOnly.burns, burnedOf, "burns"]]) {
+    let good = 0;
+    for (const x of list) {
+      const t = await reader.tx(x.txid);
+      const amount = t ? read(t, a.assetId) : null;
+      if (t?.inChain && t.height <= p.height && amount !== null && amount.toString() === x.amount) good++;
+      else bad(`${name}: ${x.txid} ${t?.inChain ? `is in block ${t.height} and ${what} ${amount}` : "is in no block"}, the snapshot says ${x.amount} at or below H`);
+    }
+    if (good === list.length) ok(`${name}: the operator's ${list.length} ${what} counted, each in a block at or below H`);
+  }
 }
 
 async function rederive(snap) {
@@ -156,6 +242,7 @@ async function rederive(snap) {
         else bad(`${a.ticker ?? a.symbol}: board ${b.txid} is ${h === null ? "in no block" : `in block ${h}`}, the snapshot says atOrBelowH ${b.atOrBelowH}`);
       }
     }
+    for (const a of p.assets) if (a.burnOnly) await rederiveBurnOnly(seq, p, a);
   } else note("Sequentia not re-derived (no --seq-rpc)");
 
   if (p.solana) {

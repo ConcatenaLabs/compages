@@ -17,6 +17,11 @@
 //      the explorer's indexer counts it) may not exceed what the source chains
 //      hold for it. A gap has to persist for `breachMinutes` before it counts,
 //      because a redemption is paid out a few seconds before its burn.
+//      For an asset an Arca operator serves issuer-operated
+//      (`issuerOperated`), the smaller of the units live under its burn-only
+//      sweeps and what its rounds minted less what it burned is deducted
+//      first, each item of the operator's report read again on the indexer
+//      (../daemon/lib/burnonly.js).
 //   3. The mint limiters: each asset's reissuance token must sit, whole, in
 //      the mint limiter coin the daemon names, and that coin must be the
 //      limiter in the state the daemon reports, by a script derived here from
@@ -57,6 +62,7 @@ import {
   leafProblems,
 } from "./lib/checks.js";
 import { parseDescriptor, derive } from "./vendor/sequentia-address.mjs";
+import { operatorClient, Trees, esploraReader, checkBurnOnly, burnOnlyJson } from "../daemon/lib/burnonly.js";
 
 // The mint limiter's descriptor, vendored from sequentia-contracts with its
 // address mirror (vendor/PIN.json), so the coin the daemon names is checked
@@ -296,14 +302,35 @@ async function json(url, opts = {}) {
   return res.json();
 }
 
-async function supplyAtoms(assetId) {
+async function supplyAtoms(assetId, { blocksOnly = false } = {}) {
   const a = await json(`${cfg.esploraUrl.replace(/\/$/, "")}/asset/${assetId}`);
   const c = a.chain_stats ?? {};
   if (c.has_blinded_issuances) return null; // not knowable; never guess
-  const m = a.mempool_stats ?? {};
   // Mempool issuances count too: a mint the chain has not confirmed yet is
-  // still supply someone holds.
+  // still supply someone holds. Not for an issuer-operated asset, whose
+  // operator lists its rounds and burns once they are in a block: there
+  // both sides of the comparison are read in blocks.
+  const m = blocksOnly ? {} : a.mempool_stats ?? {};
   return BigInt(c.issued_amount ?? 0) + BigInt(m.issued_amount ?? 0) - BigInt(c.burned_amount ?? 0) - BigInt(m.burned_amount ?? 0);
+}
+
+// Assets an Arca operator serves issuer-operated, from this watcher's own
+// configuration (never the daemon's word): asset id -> operator URL.
+const issuerOps = new Map(
+  Object.entries(cfg.issuerOperated ?? {}).map(([asset, url]) => {
+    const op = operatorClient(url);
+    return [asset, { url, op, trees: new Trees(op) }];
+  })
+);
+
+/** The units of `assetId` live under burn-only sweeps, checked on the
+ *  watcher's indexer; null for an asset no operator serves so. */
+async function burnOnly(assetId) {
+  const io = issuerOps.get(assetId);
+  if (!io) return null;
+  const report = await io.op("issuer_supply", { asset: assetId });
+  const esplora = cfg.esploraUrl.replace(/\/$/, "");
+  return checkBurnOnly({ assetId, report, trees: io.trees, reader: esploraReader((p) => json(`${esplora}${p}`)) });
 }
 
 async function solRpc(method, params) {
@@ -344,7 +371,13 @@ async function checkReserves() {
     const row = { symbol: m.ticker ?? m.symbol, assetId: m.assetId };
     report.assets[m.assetId] = row;
     try {
-      const supply = await supplyAtoms(m.assetId);
+      let supply = await supplyAtoms(m.assetId, { blocksOnly: issuerOps.has(m.assetId) });
+      const bo = await burnOnly(m.assetId);
+      if (bo && supply !== null) {
+        row.chainSupply = `${supply}`;
+        supply -= bo.deductAtoms;
+        row.burnOnly = { operator: issuerOps.get(m.assetId).url, ...burnOnlyJson(bo) };
+      }
       let escrow = 0n;
       for (const src of m.sources) {
         let units;
@@ -374,7 +407,7 @@ async function checkReserves() {
         problems.push({
           key: `reserve:${m.assetId}`,
           severity: "critical",
-          title: `${row.symbol} circulating supply exceeds its escrow`,
+          title: `${row.symbol} circulating supply${bo ? " outside burn-only batches" : ""} exceeds its escrow`,
           detail: `supply ${supply} atoms, escrow ${escrow} atoms, for ${Math.round(held / 60_000)} min`,
           assetId: m.assetId,
         });

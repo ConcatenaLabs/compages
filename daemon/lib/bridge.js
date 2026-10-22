@@ -26,6 +26,7 @@ import { ethers } from "ethers";
 import { amountToSats, satsToAmount } from "./seqrpc.js";
 import { MintLimiter, mintNext } from "./limiter.js";
 import { LeafDeposits } from "./leaves.js";
+import { operatorClient, Trees, nodeReader, checkBurnOnly, issuedOf } from "./burnonly.js";
 import { unitsToSats, satsToUnits, unitsToAtoms, atomsToUnits } from "./eth.js";
 import {
   transferTx,
@@ -194,6 +195,32 @@ export class Bridge {
     // Deposits paid as Arca leaves, when the bridge has a leaf wallet (see
     // leaves.js).
     this.leaves = cfg.leafWallet ? new LeafDeposits(this) : null;
+    // Assets an Arca operator serves issuer-operated (see burnonly.js): the
+    // operator's report of each, checked against this daemon's node.
+    this.issuerOps = new Map();
+    for (const [assetId, url] of Object.entries(cfg.issuerOperated ?? {})) {
+      const op = operatorClient(url);
+      this.issuerOps.set(assetId, { url, op, trees: new Trees(op), last: null });
+    }
+  }
+
+  /** The units of an issuer-operated asset that live under burn-only sweeps,
+   *  and what the operator minted and burned of it, each checked on this
+   *  daemon's node (burnonly.js); null for an asset no operator serves so.
+   *  Read again at most every `burnOnlyRefreshMs`. Throws when the operator's
+   *  report cannot be read: without it the asset's supply is not known. */
+  async burnOnly(assetId, { fresh = false } = {}) {
+    const io = this.issuerOps.get(assetId);
+    if (!io) return null;
+    const every = this.cfg.burnOnlyRefreshMs ?? 5_000;
+    if (!fresh && io.last && Date.now() - io.last.at < every) return io.last.value;
+    const report = await io.op("issuer_supply", { asset: assetId });
+    const reader = nodeReader((method, params) => this.seq.node(method, params));
+    const value = await checkBurnOnly({ assetId, report, trees: io.trees, reader });
+    value.operator = io.url;
+    value.limiterUnavailable = report.limiter_unavailable ?? null;
+    io.last = { at: Date.now(), value };
+    return value;
   }
 
   /** The token key of an Ethereum token named by address or "eth", or null. */
@@ -594,6 +621,21 @@ export class Bridge {
       atoms += amt;
     }
     const burned = await this.burnedAtoms(assetId);
+    // Mints of the limiter this daemon did not make and no operator lists
+    // (each one halted minting when it was followed), while the chain has
+    // them: the wallet never sees them, the supply holds them.
+    const L = Object.values(this.state.data.mappings).find((m) => m.assetId === assetId)?.limiter;
+    if (L?.foreignMints) {
+      const reader = nodeReader((method, params) => this.seq.node(method, params));
+      for (const [txid, amount] of Object.entries(L.foreignMints)) {
+        if (amount === null) throw new Error(`the foreign mint ${txid} hides its amount; supply is not knowable`);
+        if ((await reader.tx(txid))?.inChain) atoms += BigInt(amount);
+      }
+    }
+    // An issuer-operated asset is also minted in the operator's rounds and
+    // burned by its sweeps and claims; those the node confirms count.
+    const bo = await this.burnOnly(assetId);
+    if (bo) return atoms - burned + bo.mintedAtoms - bo.burnedAtoms;
     return atoms - burned;
   }
 
@@ -1268,7 +1310,24 @@ export class Bridge {
         return null;
       }
       if (f.path === "mint") {
-        this.halt(mapping.assetId, "mint", `a mint this daemon did not sign spent the mint limiter (${f.successor.txid})`);
+        // An issuer-operated asset is also minted by its Arca operator's
+        // rounds, through the same limiter: such a mint is expected once
+        // the operator lists it and the node shows it minting what the list
+        // says. Until it is listed (a round is listed once it is in a
+        // block) the coin is not followed; past the grace, it halts.
+        const verdict = await this.operatorRoundMint(mapping, f.successor.txid);
+        if (verdict === "wait") return null;
+        if (verdict !== "round") {
+          // Its units are supply no deposit backs: counted from now on, so
+          // the supply invariants see them too.
+          const t = await nodeReader((method, params) => this.seq.node(method, params)).tx(f.successor.txid).catch(() => null);
+          const minted = t ? issuedOf(t, mapping.assetId) : null;
+          L.foreignMints ??= {};
+          L.foreignMints[f.successor.txid] = minted === null ? null : minted.toString();
+          this.halt(mapping.assetId, "mint", `a mint this daemon did not sign spent the mint limiter (${f.successor.txid})${verdict ? `: ${verdict}` : ""}`);
+        } else {
+          this.log(`asset ${mapping.assetId}: the limiter minted in the operator's round ${f.successor.txid}, which the operator lists and the node confirms`);
+        }
       }
       L.coin = { txid: f.successor.txid, vout: 0 };
       L.coinHex = hex;
@@ -1276,6 +1335,34 @@ export class Bridge {
       this.state.save();
     }
     return null;
+  }
+
+  /** Whether the limiter mint `txid` is a round of the asset's Arca
+   *  operator: "round" when the operator lists it among its mints and the
+   *  node shows it in a block minting exactly that; "wait" while it is not
+   *  listed yet and the grace (`issuerMintGraceMs`, default 30 minutes from
+   *  when this daemon first saw it) has not run out; otherwise why not, or
+   *  null when the asset is not served issuer-operated. */
+  async operatorRoundMint(mapping, txid) {
+    if (!this.issuerOps.has(mapping.assetId)) return null;
+    let bo;
+    try {
+      bo = await this.burnOnly(mapping.assetId, { fresh: true });
+    } catch (e) {
+      bo = { mints: [], problems: [e.message] };
+    }
+    const listed = bo.mints.find((m) => m.txid === txid);
+    if (listed?.ok) {
+      if (mapping.limiter.roundWait?.txid === txid) delete mapping.limiter.roundWait;
+      return "round";
+    }
+    if (listed && !listed.ok) return `the operator lists it, and ${listed.why}`;
+    const w = (mapping.limiter.roundWait = mapping.limiter.roundWait?.txid === txid ? mapping.limiter.roundWait : { txid, since: Date.now() });
+    if (Date.now() - w.since < (this.cfg.issuerMintGraceMs ?? 30 * 60_000)) {
+      this.state.save();
+      return "wait";
+    }
+    return "the asset's Arca operator does not list it among its rounds' mints";
   }
 
   /** One pass over the limiters: move new assets' tokens in, follow coins. */
@@ -3473,9 +3560,23 @@ export class Bridge {
         report[key] = row;
         continue;
       }
+      // Units live under burn-only sweeps are burned when their batch is
+      // swept; until then they are supply that no deposit backs. Deducted
+      // is the smaller of those and what the operator's rounds minted less
+      // what it burned (burnonly.js): every unit issued outside a deposit
+      // must be a listed round's, and every unit outside the batches backed.
+      const bo = await this.burnOnly(m.assetId).catch(() => null);
+      if (bo) {
+        supply -= bo.deductAtoms;
+        row.underBurnOnlySweeps = bo.liveAtoms.toString();
+        row.deducted = bo.deductAtoms.toString();
+        row.roundMints = bo.mintedAtoms.toString();
+        row.operatorBurns = bo.burnedAtoms.toString();
+        if (bo.problems.length) row.burnOnlyProblems = bo.problems;
+      }
       const pending = pendingMint[m.assetId] ?? 0n;
       if (supply > ledger + pending) {
-        breach(m.assetId, "supply", `chain supply ${supply} exceeds the ledger ${ledger}`);
+        breach(m.assetId, "supply", `chain supply ${supply}${bo ? " outside burn-only batches" : ""} exceeds the ledger ${ledger}`);
       }
       if (m.sources && Object.values(m.sources).every((src) => src.escrowedUnits !== undefined)) {
         let escrow = 0n;
@@ -3496,7 +3597,7 @@ export class Bridge {
         row.inTransit = transit.toString();
         row.inFlight = inFlight.toString();
         if (supply - inFlight - pending > escrow) {
-          breach(m.assetId, "escrow", `circulating ${supply - inFlight} exceeds escrow ${escrow}`);
+          breach(m.assetId, "escrow", `circulating ${supply - inFlight}${bo ? " outside burn-only batches" : ""} exceeds escrow ${escrow}`);
         }
       }
       report[key] = row;

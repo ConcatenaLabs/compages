@@ -147,6 +147,15 @@ chain anchored to Bitcoin proper. Do not lower the deployed value to make redemp
   leaf wallet must be an `arca` with a landing key (`info`'s `landing_address`). Never pay one to a
   request without a landing, nor let an operator serve a chain-supervised asset in plain leaves:
   either puts the coin's exit where the issuer's freeze does not follow.
+- **Units under an Arca operator's burn-only sweeps are deducted, never ignored.** For an
+  asset served issuer-operated (`issuerOperated`; `daemon/lib/burnonly.js`,
+  `docs/issuer-operated.md`) every reserve check compares escrow with supply less the smaller
+  of the units live under burn-only sweeps and the operator's mints less its burns, and each
+  mint, burn and live output of the operator's report is read again on the chain before it
+  counts. Never deduct the operator's `in_batches` figure as given, never deduct the live
+  units alone (holders' leaves in a batch would hide a mint), never stop counting the
+  operator's mints in the supply, and never let a limiter mint the operator does not list
+  pass without a halt.
 - **Every Sequentia fee is paid in the configured asset, never the policy asset by default.** This
   was a specific fix; Sequentia has an open fee market and no privileged unit.
 - Chain ids, RPC endpoints, the vault address and confirmation depths are all configuration, and

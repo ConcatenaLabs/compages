@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { payloadHash, signSnapshot, verifyChain } from "./format.mjs";
 import { readAll, writeSnapshotOnce, writeIndex } from "./store.mjs";
-import { chooseHeight, unitsToAtoms, supplyFromAudit, backedVerdict, lastBlockAtOrBefore, leafFigures } from "./figures.mjs";
+import { chooseHeight, unitsToAtoms, supplyFromAudit, backedVerdict, lastBlockAtOrBefore, leafFigures, burnOnlyFigures } from "./figures.mjs";
+import { burnOnlyAtHeight, operatorClient, Trees } from "./burnonly.mjs";
 import { runAudit, fileSha256, gitCommitOf } from "./audit.mjs";
 import { seqClient, ethProvider, vaultFigures, solClient, escrowAccounts, readSolanaAccounts, heldUnits, checkTransfer } from "./chains.mjs";
 
@@ -200,6 +201,17 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
       }
       leaves = leafFigures(rc, heights, height, now().toISOString());
     }
+    // An asset an Arca operator serves issuer-operated: what its batches and
+    // rounds deduct from the supply at H (./burnonly.mjs).
+    let burnOnly = null;
+    const opUrl = cfg.issuerOperated?.[m.assetId];
+    if (opUrl) {
+      const op = operatorClient(opUrl);
+      const readAt = now().toISOString();
+      const report = await op("issuer_supply", { asset: m.assetId });
+      const at = await burnOnlyAtHeight({ rpc: seq.call, assetId: m.assetId, report, trees: new Trees(op), height });
+      burnOnly = burnOnlyFigures(opUrl, at, readAt);
+    }
     out.push({
       assetId: m.assetId,
       symbol: m.symbol ?? null,
@@ -211,8 +223,9 @@ export async function takeSnapshot(cfg, { signer = null, dryRun = false, log = (
       escrowAtoms: escrow,
       inTransitAtoms: inTransitAtoms.toString(),
       inTransit,
-      backed: backedVerdict({ supply, escrowAtoms: escrow, inTransitAtoms: inTransitAtoms.toString() }),
+      backed: backedVerdict({ supply, escrowAtoms: escrow, inTransitAtoms: inTransitAtoms.toString(), deductedAtoms: burnOnly?.deductedAtoms ?? "0" }),
       ...(leaves ? { leaves } : {}),
+      ...(burnOnly ? { burnOnly } : {}),
     });
   }
 

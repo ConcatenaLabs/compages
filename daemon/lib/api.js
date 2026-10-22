@@ -14,6 +14,7 @@ import { tokenKeyOf, sourcesOf, SEQ_MAX_SATS } from "./bridge.js";
 import { unitsToAtoms } from "./eth.js";
 import { porHistory } from "./porhistory.js";
 import { limiterView } from "./limiter.js";
+import { burnOnlyJson } from "./burnonly.js";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -218,6 +219,10 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
       // Who can mint more: the mint limiter that holds the token, its
       // allowance per window and where its count stands.
       mintLimiter: limiterView(m),
+      // The Arca operator that serves the asset issuer-operated, minting its
+      // batches in its rounds and burning them at their sweeps; null when
+      // none does.
+      issuerOperated: bridge.issuerOps?.has(m.assetId) ? { operator: bridge.issuerOps.get(m.assetId).url } : null,
       createdAt: m.createdAt,
     };
   }
@@ -774,8 +779,25 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
           // asset. Listed with the burns, so each can be checked on chain.
           const transit = bridge.cctp?.inTransit(m.assetId) ?? { atoms: 0n, burns: [] };
           if (escrowedAtoms !== null) escrowedAtoms += transit.atoms;
-          const comparable = escrowedAtoms !== null && chainSupply !== null;
-          const reconciliation = await reconcile(m, escrowedAtoms, chainSupply);
+          // An asset an Arca operator serves issuer-operated: before the
+          // comparison, the smaller of the units live under its burn-only
+          // sweeps and what its rounds minted less what it burned is deducted
+          // (burnonly.js), each item checked on the node.
+          let burnOnly = null;
+          let liability = chainSupply;
+          if (bridge.issuerOps?.has(m.assetId)) {
+            try {
+              const bo = await bridge.burnOnly(m.assetId);
+              burnOnly = { operator: bo.operator, ...burnOnlyJson(bo), limiterUnavailable: bo.limiterUnavailable };
+              if (chainSupply !== null) liability = (BigInt(chainSupply) - bo.deductAtoms).toString();
+            } catch (e) {
+              burnOnly = { error: e.message };
+              liability = null;
+            }
+          }
+          const comparable = escrowedAtoms !== null && liability !== null;
+          // Users hold what escrow must cover less what the bridge holds.
+          const reconciliation = await reconcile(m, escrowedAtoms, liability);
           out.push({
             assetId: m.assetId,
             symbol: m.symbol,
@@ -792,12 +814,16 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
             ledgerCirculatingAtoms: ledger.toString(),
             chainCirculatingAtoms: chainSupply,
             chainSupplyError: chainError,
-            backed: comparable ? escrowedAtoms >= BigInt(chainSupply) : null,
+            // What escrow must cover: the chain's supply, less for an
+            // issuer-operated asset what burnOnly deducts.
+            liabilityAtoms: liability,
+            burnOnly,
+            backed: comparable ? escrowedAtoms >= BigInt(liability) : null,
             // An asset the operator has retired (for example one issued
             // before a chain reset, whose tokens no longer exist) is listed
             // with the reason rather than hidden.
             retired: m.retired ?? null,
-            ledgerMatchesChain: chainSupply === null ? null : ledger === BigInt(chainSupply),
+            ledgerMatchesChain: liability === null ? null : ledger === BigInt(liability),
             // The mint authority: the limiter coin, its state and its limits.
             mintLimiter: limiterView(m),
             // What the bridge itself holds of the asset, what it owes to

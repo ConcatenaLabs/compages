@@ -51,7 +51,30 @@ export function checkFigures(payload) {
       const c = BigInt(s.issuedAtoms) + BigInt(s.reissuedAtoms) - BigInt(s.burnedAtoms);
       if (c.toString() !== s.circulatingAtoms) errors.push(`${name}: circulating ${s.circulatingAtoms} should be ${c}`);
     }
-    const verdict = backedVerdict({ supply: s, escrowAtoms: a.escrowAtoms, inTransitAtoms: a.inTransitAtoms });
+    let deducted = "0";
+    if (a.burnOnly) {
+      const b = a.burnOnly;
+      const sum = (list, f) => list.reduce((x, o) => x + BigInt(o[f]), 0n);
+      const live = sum(b.outputs, "value");
+      if (live.toString() !== b.liveAtoms) errors.push(`${name}: liveAtoms ${b.liveAtoms} should be ${live}`);
+      const outpoints = new Set();
+      for (const o of b.outputs) {
+        if (outpoints.has(o.outpoint)) errors.push(`${name}: output ${o.outpoint} is counted twice`);
+        outpoints.add(o.outpoint);
+        if (!(o.height <= payload.height)) errors.push(`${name}: output ${o.outpoint} is made at ${o.height}, above H`);
+        if (o.spentBy && !(o.spentAt > payload.height)) errors.push(`${name}: output ${o.outpoint} is spent at ${o.spentAt}, not above H`);
+      }
+      for (const [list, total, label] of [[b.mints, b.mintedAtoms, "mintedAtoms"], [b.burns, b.burnedAtoms, "burnedAtoms"]]) {
+        const t = sum(list, "amount");
+        if (t.toString() !== total) errors.push(`${name}: ${label} ${total} should be ${t}`);
+        for (const x of list) if (!(x.height <= payload.height)) errors.push(`${name}: ${x.txid} is in block ${x.height}, above H`);
+      }
+      const net = BigInt(b.mintedAtoms) - BigInt(b.burnedAtoms);
+      const want = (live < net ? live : net).toString();
+      if (b.deductedAtoms !== want) errors.push(`${name}: deductedAtoms ${b.deductedAtoms} should be ${want}`);
+      deducted = b.deductedAtoms;
+    }
+    const verdict = backedVerdict({ supply: s, escrowAtoms: a.escrowAtoms, inTransitAtoms: a.inTransitAtoms, deductedAtoms: deducted });
     if (verdict !== a.backed) errors.push(`${name}: backed is ${a.backed}, the figures say ${verdict}`);
     if (a.leaves) {
       const l = a.leaves;
