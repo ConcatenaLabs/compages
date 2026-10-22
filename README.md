@@ -639,6 +639,27 @@ and `/api/por`.
 [`docs/mint-limiter.md`](docs/mint-limiter.md) is the runbook: making the keys,
 moving a token in, the brake, lifting it, and recovery.
 
+### An asset an Arca operator serves issuer-operated
+
+An Arca operator can serve a bridged asset issuer-operated: it mints each
+batch's value in the round that makes the batch, through the asset's mint
+limiter, and every sweep of such a batch only burns. Until a batch is swept
+its units sit beside the coins its holders gave up for it, with no deposit
+behind them. Every reserve check therefore deducts, before comparing supply
+with escrow, the smaller of the units live under the operator's burn-only
+sweeps and what its rounds minted less what it burned (sweeps, claims, the
+holders' fees and abandoned coins burned with them): so every unit issued
+outside a deposit must be a listed round's, and every unit outside the
+batches must be backed. Each figure comes from the operator's
+`issuer_supply` report and is read again on the chain: each mint, burn and
+live output, the output where the batch's published tree puts it.
+The daemon follows a limiter mint of the operator's once the operator lists
+it; any other mint it did not make halts the asset as before, and counts in
+the supply. [`docs/issuer-operated.md`](docs/issuer-operated.md) says what
+each check reads, what the deduction cannot see, and how to set it up
+(`issuerOperated` in the daemon's, the watcher's and the snapshot tool's
+configuration).
+
 ### Finality: measured against Bitcoin, not Sequentia blocks
 
 Releasing on Ethereum or Solana is irreversible, so the burn that triggers it
@@ -995,7 +1016,10 @@ chains through its own endpoints and, once a minute:
   block explorer's indexer counts it (`esploraUrl`, issuances minus burns,
   never the bridge wallet) may not exceed what the source chains hold. A gap
   must persist for `breachMinutes` before it counts, since a redemption is
-  paid out seconds before its burn.
+  paid out seconds before its burn. For an asset its own `issuerOperated`
+  names, supply is read in blocks and what the operator's burn-only batches
+  and rounds account for is deducted first, each item of its report read
+  again on the indexer ([`docs/issuer-operated.md`](docs/issuer-operated.md)).
 - **Checks the mint limiters**: for every asset, the coin the daemon names
   must be the limiter in the state the daemon reports, by a script the
   watcher derives itself from the descriptor (`watcher/vendor/`, pinned to a
@@ -1071,7 +1095,14 @@ A snapshot describes one Sequentia height H:
   circulating total, and whether it is exact. Also recorded: the auditor's
   exit status (0 when every figure is exact, 2 when a blinded issuance or burn
   makes one only a bound), its arguments, the commit it came from and the
-  sha256 of the file that ran.
+  sha256 of the file that ran. For an asset an Arca operator serves
+  issuer-operated (`issuerOperated` in the configuration), what its batches
+  and rounds account for at H (`burnOnly`): each output live under its
+  burn-only sweeps at H (made at or below H, and unspent when read or spent
+  in a block above H, its spender named), each of its mints and burns in a
+  block at or below H, and the deduction the verdict makes, the smaller of
+  the live units and the mints less the burns
+  ([`docs/issuer-operated.md`](docs/issuer-operated.md)).
 - **Ethereum.** Block B, its hash and time, and for every configured vault and
   every token the bridge escrows there: the balance at B, a version-3 vault's
   reservations at B (`owedTotal`, `queuedTotal`, `cancelledTotal`), and the
@@ -1201,7 +1232,11 @@ node verify.mjs https://sequentiatestnet.com/bridge --attester <address> --reder
 `--eth-rpc` checks B's hash, that B is the last block at or before H's time,
 and every vault figure at B (an old snapshot needs an archive node).
 `--seq-rpc` checks H's hash and the genesis hash, and with `--audit-script`
-reruns the auditor to H and compares every supply figure. `--sol-rpc` checks
+reruns the auditor to H and compares every supply figure; for an
+issuer-operated asset it reads each output under a burn-only sweep again
+(made at or below H, holding what the snapshot says, live at H; the node
+needs `-txindex`), and `--operator <url>` checks each against its batch's
+published tree as well. `--sol-rpc` checks
 the cluster and every listed CCTP burn, and with `--eth-rpc` as well whether
 each transfer was still in flight at B (`--iris-url` and `--transmitter`
 override Circle's attestation service and MessageTransmitterV2). The Solana

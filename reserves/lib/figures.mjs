@@ -81,10 +81,37 @@ export function supplyFromAudit(report, assetId) {
 /** The verdict: backed when escrow plus verified in-transit amounts covers
  *  circulating supply. Given only when every figure it rests on was measured
  *  exactly; otherwise null, never a guess. */
-export function backedVerdict({ supply, escrowAtoms, inTransitAtoms = "0" }) {
+export function backedVerdict({ supply, escrowAtoms, inTransitAtoms = "0", deductedAtoms = "0" }) {
   if (!supply || supply.circulatingAtoms === null || !supply.exact) return null;
-  if (escrowAtoms === null || escrowAtoms === undefined) return null;
-  return BigInt(escrowAtoms) + BigInt(inTransitAtoms) >= BigInt(supply.circulatingAtoms);
+  if (escrowAtoms === null || escrowAtoms === undefined || deductedAtoms === null) return null;
+  return BigInt(escrowAtoms) + BigInt(inTransitAtoms) >= BigInt(supply.circulatingAtoms) - BigInt(deductedAtoms);
+}
+
+/** What a snapshot records of an issuer-operated asset at H: the operator,
+ *  each output live at H under its burn-only sweeps (made at or below H, and
+ *  unspent when read or spent in a block above H, its spender named) and
+ *  their sum, each of its mints and burns in a block at or below H and their
+ *  sums, and the deduction the verdict makes: the smaller of the live units
+ *  and the mints less the burns. The operator's own figures now, and every
+ *  item of its report the chain did not confirm, are kept beside them. Every
+ *  amount is a decimal string. */
+export function burnOnlyFigures(operator, at, readAt) {
+  const c = at.check;
+  const done = (list) => list.filter((x) => x.ok).map((x) => ({ txid: x.txid, kind: x.kind, amount: x.amount, height: x.height }));
+  return {
+    operator,
+    readAt,
+    note: "deducted is the smaller of the units live under the operator's burn-only sweeps at H and what its rounds minted less what it burned at or below H",
+    liveAtoms: at.liveAtoms.toString(),
+    outputs: at.outputs,
+    mintedAtoms: c.mintedAtoms.toString(),
+    mints: done(c.mints),
+    burnedAtoms: c.burnedAtoms.toString(),
+    burns: done(c.burns),
+    deductedAtoms: at.deductAtoms.toString(),
+    operatorNow: { inBatchesAtoms: c.reportedInBatches.toString(), mintedAtoms: c.reportedMinted.toString(), burnedAtoms: c.reportedBurned.toString() },
+    problems: c.problems,
+  };
 }
 
 /** Binary search for the last block whose timestamp is at or before `t`,

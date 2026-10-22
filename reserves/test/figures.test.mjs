@@ -125,6 +125,55 @@ test("the consistency check recomputes every derived figure", () => {
   assert.match(bad((a) => (a.escrowAtoms = "30000000")), /escrowAtoms 30000000 should be 20000000/);
   assert.match(bad((a) => (a.supply.burnedAtoms = "1")), /circulating 20000000 should be 19999999/);
   assert.match(bad((a) => (a.inTransit = [{ counted: true, amount: "5" }])), /inTransitAtoms 0 should be 5/);
+
+  // An issuer-operated asset: the units live under burn-only sweeps at H are
+  // deducted, each output made at or below H, one spent above it.
+  const io = structuredClone(payload);
+  io.height = 100;
+  const a = io.assets[0];
+  a.supply.reissuedAtoms = a.supply.circulatingAtoms = "23000000";
+  a.burnOnly = {
+    liveAtoms: "3000000",
+    outputs: [
+      { outpoint: "r1:1", value: "2000000", kind: "batch", round: "r1:1", height: 90 },
+      { outpoint: "r0:1", value: "1000000", kind: "batch", round: "r0:1", height: 80, spentBy: "s", spentAt: 101 },
+    ],
+    mintedAtoms: "3000000",
+    mints: [{ txid: "r0", amount: "1000000", height: 80 }, { txid: "r1", amount: "2000000", height: 90 }],
+    burnedAtoms: "0",
+    burns: [],
+    deductedAtoms: "3000000",
+  };
+  assert.deepEqual(checkFigures(io), []);
+  const badIo = (f) => {
+    const p = structuredClone(io);
+    f(p.assets[0]);
+    return checkFigures(p).join("; ");
+  };
+  assert.match(badIo((x) => (x.burnOnly.liveAtoms = "4000000")), /liveAtoms 4000000 should be 3000000/);
+  assert.match(badIo((x) => (x.burnOnly.deductedAtoms = "2000000")), /deductedAtoms 2000000 should be 3000000/);
+  // A burn of the operator's at or below H: the smaller figure is deducted.
+  assert.match(badIo((x) => {
+    x.burnOnly.burns = [{ txid: "b", amount: "500000", height: 95 }];
+    x.burnOnly.burnedAtoms = "500000";
+  }), /deductedAtoms 3000000 should be 2500000/);
+  assert.match(badIo((x) => (x.burnOnly.mints[1].height = 101)), /r1 is in block 101, above H/);
+  assert.match(badIo((x) => (x.burnOnly.outputs[0].height = 101)), /made at 101, above H/);
+  assert.match(badIo((x) => (x.burnOnly.outputs[1].spentAt = 100)), /spent at 100, not above H/);
+  assert.match(badIo((x) => x.burnOnly.outputs.push({ ...x.burnOnly.outputs[0] })), /counted twice/);
+  assert.match(badIo((x) => (x.backed = false)), /the figures say true/);
+  // Without the deduction the same figures are short.
+  assert.match(badIo((x) => delete x.burnOnly), /backed is true, the figures say false/);
+});
+
+test("the deduction under burn-only sweeps enters the verdict", () => {
+  const supply = { circulatingAtoms: "1500", exact: true };
+  assert.equal(backedVerdict({ supply, escrowAtoms: "1000" }), false);
+  assert.equal(backedVerdict({ supply, escrowAtoms: "1000", deductedAtoms: "500" }), true);
+  assert.equal(backedVerdict({ supply, escrowAtoms: "1000", deductedAtoms: "499" }), false);
+  assert.equal(backedVerdict({ supply, escrowAtoms: "2000", deductedAtoms: "-500" }), true, "a negative deduction adds");
+  assert.equal(backedVerdict({ supply, escrowAtoms: "1999", deductedAtoms: "-500" }), false);
+  assert.equal(backedVerdict({ supply, escrowAtoms: "1000", deductedAtoms: null }), null);
 });
 
 test("a pinned vault version is used, so a backend without the state cannot make a v3 vault read long", async () => {

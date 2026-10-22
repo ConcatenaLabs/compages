@@ -37,5 +37,6 @@
   "announceEveryPayout": false,
   "intervalMs": 60000,
   "statusPort": 9951,
-  "stateFile": "state/watch-state.json"
+  "stateFile": "state/watch-state.json",
+  "issuerOperated": {}
 }

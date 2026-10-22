@@ -91,6 +91,9 @@
     "feeAsset": "<asset id of an accepted fee asset>"
   },
 
+  "_issuerOperated_note": "Assets an Arca operator serves issuer-operated, minting their batches through the asset's mint limiter (docs/issuer-operated.md): asset id -> the operator's URL. The reserve checks deduct the units live under its burn-only sweeps, each read again on the node, which then needs -txindex. Leave it empty when no asset is served so.",
+  "issuerOperated": {},
+
   "apiHost": "127.0.0.1",
   "apiPort": 9950,
   "porHistoryDir": "/var/lib/compages-reserves",
