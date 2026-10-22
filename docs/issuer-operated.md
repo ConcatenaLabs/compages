@@ -140,3 +140,11 @@ An Arca operator does not serve a supervised asset (USDC.e, EURC.e)
 issuer-operated: its server refuses the two profiles together, since an
 issuer-operated batch is not kept in `landing-1` leaves.
 
+## Testing
+
+`e2e/run-issuer-e2e.sh` runs the whole path on a regtest chain: a refresh
+minting into a round passes every check above, the batch's sweep burns it
+and the accounting follows, a snapshot taken after the sweep at a height
+before it still counts the batch output live at H, a reorg across the mint and its
+burn keeps the asset backed, and a limiter mint to a coin of the minter's
+own halts the asset in the daemon and in the watcher.

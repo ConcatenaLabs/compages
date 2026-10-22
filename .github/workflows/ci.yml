@@ -28,6 +28,11 @@ env:
   ARCA_REF: 401e83ae37fd2a7b160dc135c5bfd26d7fe6132b
   SEQ_LEAF_CORE_VERSION: 25.2.2
   SEQ_LEAF_CORE_SHA256: cea11c046c599177952bdcbeacb067301e509e3e127cc516cf944d27eeac2082
+  # The issuer-operated suite: an Arca operator whose supply report names
+  # each output it counts in batches (arca at this commit), and the mint
+  # limiter's tool with `sign`, which its signer mints a round through.
+  ISSUER_ARCA_REF: e8ceb39e8f1817cd1a1b83c2704ab546d5db9ec5
+  ISSUER_CONTRACTS_REF: 9d3b569a2d36044a37170431c3fab4889032eff0
 
 jobs:
   contracts:
@@ -209,4 +214,79 @@ jobs:
           path: |
             e2e/run-leaf/*.log
             e2e/run-leaf/seq/elementsregtest/debug.log
+          if-no-files-found: ignore
+
+  issuer-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: ${{ env.FOUNDRY_VERSION }}
+      - name: Install the daemon's, the watcher's and the snapshot tool's dependencies
+        run: |
+          (cd daemon && npm ci)
+          (cd watcher && npm ci)
+          (cd reserves && npm ci)
+      - name: Install protoc and PostgreSQL
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler postgresql
+          echo "PG_BIN_DIR=$(ls -d /usr/lib/postgresql/*/bin | tail -1)" >> "$GITHUB_ENV"
+      - name: Download the Sequentia node
+        run: |
+          tarball="sequentia-core-${SEQ_LEAF_CORE_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" "https://sequentiatestnet.com/download/$tarball"
+          echo "${SEQ_LEAF_CORE_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          bin="$RUNNER_TEMP/sequentia-core-${SEQ_LEAF_CORE_VERSION}/bin"
+          "$bin/sequentiad" --version | head -1
+          echo "SEQUENTIAD_EXEC=$bin/sequentiad" >> "$GITHUB_ENV"
+      - name: Check out the node repository's supply auditor
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ConcatenaLabs/Sequentia
+          ref: v${{ env.SEQ_LEAF_CORE_VERSION }}
+          path: sequentia-node
+          sparse-checkout: contrib/asset-supply-audit
+      - name: Check out Arca
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ConcatenaLabs/arca
+          ref: ${{ env.ISSUER_ARCA_REF }}
+          path: arca
+      - name: Check out sequentia-contracts for the mint limiter's tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ConcatenaLabs/sequentia-contracts
+          ref: ${{ env.ISSUER_CONTRACTS_REF }}
+          path: sequentia-contracts
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: arca
+      - name: Build arca, arcad, arca-signer and mint-limiter
+        run: |
+          cargo build --locked --manifest-path arca/Cargo.toml -p arca-server --bin arcad --bin arca-signer
+          cargo build --locked --manifest-path arca/Cargo.toml -p arca-cli --bin arca
+          echo "ARCA_BIN_DIR=$GITHUB_WORKSPACE/arca/target/debug" >> "$GITHUB_ENV"
+          cargo build --release --locked --manifest-path sequentia-contracts/tools/mint-limiter/Cargo.toml
+          echo "MINT_LIMITER=$GITHUB_WORKSPACE/sequentia-contracts/tools/mint-limiter/target/release/mint-limiter" >> "$GITHUB_ENV"
+      - name: Run the issuer-operated suite
+        env:
+          AUDIT_SCRIPT: ${{ github.workspace }}/sequentia-node/contrib/asset-supply-audit/audit.py
+        run: e2e/run-issuer-e2e.sh
+      - name: Keep the logs of a failed run
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issuer-e2e-logs
+          path: |
+            e2e/run-issuer/*.log
+            e2e/run-issuer/seq/elementsregtest/debug.log
           if-no-files-found: ignore
