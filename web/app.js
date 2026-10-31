@@ -300,6 +300,47 @@ function showPayTarget(prefix, address, uri, what) {
   if (link && uri) link.href = uri;
 }
 
+// ---------- receive codes ----------
+// A wallet's receive code (BITCOIN:<ADDRESS>?ark=…&sequentia=…, the web
+// wallet's format: sequentia-web-wallet `pay-code.js`) is taken wherever an
+// address is asked for; the bridge reads its address, the same tb1 address on
+// both chains. The same reader is in the faucet and Emissio: change them
+// together. -> { address, ark, sequentia }, or null when `text` is no code.
+function readReceiveCode(text) {
+  const s = String(text ?? "").trim();
+  const m = /^bitcoin:([^?#]*)(?:\?([^#]*))?/i.exec(s);
+  if (!m) return null;
+  const plain = (v) => {
+    try {
+      return decodeURIComponent(v.replace(/\+/g, "%20"));
+    } catch {
+      return null;
+    }
+  };
+  // A bech32 string is all one case; anything else keeps its case.
+  const lower = (v) => (v && (v === v.toUpperCase() || v === v.toLowerCase()) ? v.toLowerCase() : v);
+  const out = { address: lower(plain(m[1])) || null, ark: null, sequentia: null };
+  for (const part of (m[2] || "").split("&")) {
+    const i = part.indexOf("=");
+    if (i < 1) continue;
+    const key = part.slice(0, i).toLowerCase();
+    if ((key === "ark" || key === "sequentia") && out[key] === null) out[key] = lower(plain(part.slice(i + 1))) || null;
+  }
+  return out;
+}
+/** Puts a receive code's address in place of the code in `input`, as it is
+ *  pasted or typed. -> true when it did. */
+function takeCodeAddress(input) {
+  const c = readReceiveCode(input.value);
+  if (!c || !c.address) return false;
+  input.value = c.address;
+  return true;
+}
+for (const id of ["unwrap-btcaddr", "btc-track-input"]) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener("input", () => takeCodeAddress(el));
+}
+
 // ---------- Sequentia address checks ----------
 // Every Sequentia destination is checked against the node before any funds
 // move. Both forms are valid: the default transparent address (tb1…) and the
@@ -352,7 +393,11 @@ class SeqAddrField {
     this.checked = null;
     this.seq = 0;
     this.timer = null;
-    this.input.addEventListener("input", () => this.schedule());
+    this.fromCode = false;
+    this.input.addEventListener("input", () => {
+      this.fromCode = takeCodeAddress(this.input);
+      this.schedule();
+    });
   }
   get value() {
     return this.input.value.trim();
@@ -416,7 +461,7 @@ class SeqAddrField {
       o.textContent = note("Confidential (blinded) address");
       o.classList.add("info");
     } else if (state === "valid") {
-      o.textContent = "Valid Sequentia address.";
+      o.textContent = this.fromCode ? "Valid Sequentia address, read from your receive code." : "Valid Sequentia address.";
       o.classList.add("ok");
     } else if (state === "invalid") {
       o.textContent = "This is not a valid Sequentia address.";
