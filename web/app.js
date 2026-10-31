@@ -338,7 +338,10 @@ function takeCodeAddress(input) {
 }
 for (const id of ["unwrap-btcaddr", "btc-track-input"]) {
   const el = document.getElementById(id);
-  if (el) el.addEventListener("input", () => takeCodeAddress(el));
+  if (el) {
+    el.addEventListener("input", () => takeCodeAddress(el));
+    takeCodeAddress(el); // pasted before this script ran, or restored by the browser
+  }
 }
 
 // ---------- Sequentia address checks ----------
@@ -401,6 +404,13 @@ class SeqAddrField {
   }
   get value() {
     return this.input.value.trim();
+  }
+  /** Takes up what the field held before its listener was attached: a value
+   *  pasted while the page was still loading, or one the browser restored. */
+  adopt() {
+    if (!this.value || this.state !== "empty") return;
+    this.fromCode = takeCodeAddress(this.input);
+    this.schedule();
   }
   schedule() {
     clearTimeout(this.timer);
@@ -3223,6 +3233,7 @@ function wireStatic() {
     },
     () => usdcAsset()
   );
+  for (const f of Object.values(seqFields)) f.adopt();
   // Claim buttons live inside lists that re-render on every poll, so one
   // listener on the document serves them all.
   document.addEventListener("click", (e) => {
