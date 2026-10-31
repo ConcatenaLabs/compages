@@ -131,7 +131,9 @@ code pins it to a particular network. It has only ever run on testnets.
    bridge** of that token (your deposit issues a brand-new Sequentia asset) or
    whether it **mints more of an existing asset**.
 3. Enter the amount and your Sequentia address. The default `tb1...` address
-   from any Sequentia wallet works. A confidential (blinded) `tsqb1...`
+   from any Sequentia wallet works, and so does a wallet's receive code
+   (`BITCOIN:<ADDRESS>?…`, what the web wallet shows): the page reads its
+   address. A confidential (blinded) `tsqb1...`
    address works too and hides the amount received on chain, except for
    supervised assets (USDC.e, EURC.e): consensus never lets one sit in a
    blinded output, so the bridge delivers it to the same address's

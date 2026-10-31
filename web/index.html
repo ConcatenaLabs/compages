@@ -369,7 +369,7 @@
           <label for="seqaddr-input">Your Sequentia address (receives the asset)</label>
           <button type="button" class="walletfill hide" data-fill="seqaddr-input">Use my Sequentia wallet</button>
         </div>
-        <input class="mono" id="seqaddr-input" data-seqaddr placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="seqaddr-input-check">
+        <input class="mono" id="seqaddr-input" data-seqaddr placeholder="receive code or tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="seqaddr-input-check">
         <div class="addrcheck" id="seqaddr-input-check" aria-live="polite"></div>
       </div>
 
@@ -507,7 +507,7 @@
           <label for="cctp-seqaddr">Your Sequentia address (receives USDC.e)</label>
           <button type="button" class="walletfill hide" data-fill="cctp-seqaddr">Use my Sequentia wallet</button>
         </div>
-        <input class="mono" id="cctp-seqaddr" data-seqaddr placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="cctp-seqaddr-check">
+        <input class="mono" id="cctp-seqaddr" data-seqaddr placeholder="receive code or tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="cctp-seqaddr-check">
         <div class="addrcheck" id="cctp-seqaddr-check" aria-live="polite"></div>
       </div>
 
@@ -551,10 +551,11 @@
   <div class="explainer" id="btc-intro">
     <h2>Bitcoin on Sequentia needs no bridge</h2>
     <p>
-      Every Sequentia wallet holds and spends real bitcoin directly. It uses the
-      same <span class="mono">tb1&hellip;</span> address for bitcoin and for
-      Sequentia assets, so to use your bitcoin with Sequentia, send it to that
-      address as it is. Nothing is wrapped.
+      Every Sequentia wallet holds and spends real bitcoin directly. To use your
+      bitcoin with Sequentia, pay your wallet's receive code from any Bitcoin
+      wallet (a receive code is a Bitcoin payment request), or its
+      <span class="mono">tb1&hellip;</span> address, which is the same for
+      bitcoin and for Sequentia assets. Nothing is wrapped.
     </p>
     <p>SBTC is bitcoin pegged 1:1 on Sequentia, backed by BTC held in a reserve. It is only needed for:</p>
     <ul>
@@ -587,7 +588,7 @@
           <label for="wrap-seqaddr">Your Sequentia address (receives SBTC)</label>
           <button type="button" class="walletfill hide" data-fill="wrap-seqaddr">Use my Sequentia wallet</button>
         </div>
-        <input class="mono" id="wrap-seqaddr" data-seqaddr placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="wrap-seqaddr-check">
+        <input class="mono" id="wrap-seqaddr" data-seqaddr placeholder="receive code or tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="wrap-seqaddr-check">
         <div class="addrcheck" id="wrap-seqaddr-check" aria-live="polite"></div>
       </div>
       <button class="action" id="btn-wrap">Get a Bitcoin deposit address</button>
@@ -622,7 +623,7 @@
           <!-- A Sequentia wallet's tb1 address also receives bitcoin. -->
           <button type="button" class="walletfill hide" data-fill="unwrap-btcaddr" data-btc>Use my Sequentia wallet</button>
         </div>
-        <input class="mono" id="unwrap-btcaddr" placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off">
+        <input class="mono" id="unwrap-btcaddr" placeholder="receive code or tb1&hellip; address" spellcheck="false" autocomplete="off">
       </div>
       <button class="action" id="btn-unwrap">Get an SBTC return address</button>
       <div class="statusline" id="unwrap-status" aria-live="polite"></div>
@@ -682,7 +683,7 @@
           <label for="sol-wrap-seqaddr">Your Sequentia address (receives the asset)</label>
           <button type="button" class="walletfill hide" data-fill="sol-wrap-seqaddr">Use my Sequentia wallet</button>
         </div>
-        <input class="mono" id="sol-wrap-seqaddr" data-seqaddr placeholder="tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="sol-wrap-seqaddr-check">
+        <input class="mono" id="sol-wrap-seqaddr" data-seqaddr placeholder="receive code or tb1&hellip; address" spellcheck="false" autocomplete="off" aria-describedby="sol-wrap-seqaddr-check">
         <div class="addrcheck" id="sol-wrap-seqaddr-check" aria-live="polite"></div>
       </div>
       <button class="action" id="btn-sol-wrap">Get a Solana deposit address</button>
