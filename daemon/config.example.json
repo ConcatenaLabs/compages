@@ -12,6 +12,7 @@
   "seqRpcUrl": "http://user:pass@127.0.0.1:18443",
   "seqWallet": "compages",
   "seqChainLabel": "sequentia-testnet",
+  "walletConnectors": ["webwallet"],
   "seqConfirmations": 1,
   "btcAnchorConfirmations": 3,
 

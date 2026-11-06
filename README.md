@@ -892,6 +892,7 @@ Configuration reference (`daemon/config.example.json`):
 | `seqRpcUrl` | Sequentia node RPC, `http://user:pass@host:port` |
 | `seqWallet` | Node wallet name; auto-loaded at startup if on disk |
 | `seqChainLabel` | Label mixed into redemption ids (prevents cross-chain replay) |
+| `walletConnectors` | The wallets an address field offers to fill itself from, in order: `webwallet` (the web wallet open in another tab of this origin), `extension` (the browser extension), `phone` (a wallet on a phone, paired by a code), `local` (Sequentia Core through the `sequentia-connect` daemon). Default `["webwallet"]`. A wallet that injects `window.sequentia` fills the fields whether or not it is listed |
 | `seqConfirmations` | Sequentia confirmations; also the finality count under `allowUnanchoredFinality` |
 | `allowUnanchoredFinality` | For a local test chain with no Bitcoin anchoring only: treat a burn as final after `seqConfirmations` blocks. Unset (the default), a node that cannot report or does not validate anchors makes every release wait |
 | `btcAnchorConfirmations` | Bitcoin-anchor depth required before a release (see "Finality") |

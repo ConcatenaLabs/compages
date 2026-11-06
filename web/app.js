@@ -491,47 +491,131 @@ class SeqAddrField {
 }
 const seqFields = {};
 
-// ---------- a Sequentia wallet in the browser ----------
-// When a Sequentia wallet injects its provider (window.sequentia), each
-// address field offers to fill itself from it. A Sequentia wallet uses one
-// tb1 address for Sequentia assets and for bitcoin, so the same address also
-// fills the Bitcoin destination of an unwrap.
+// ---------- a Sequentia wallet ----------
+// Each address field offers to fill itself from the visitor's Sequentia wallet, through the
+// connector layer SeqDEX uses (web/shared, vendored from seqdex-web). The wallets offered are the
+// daemon's setting (`walletConnectors` in /api/status). A wallet that injects window.sequentia
+// fills the fields as well, as it always has, whether or not the setting offers it. A Sequentia
+// wallet uses one tb1 address for Sequentia assets and for bitcoin, so the same address also fills
+// the Bitcoin destination of an unwrap.
 const seqWallet = () => (window.sequentia?.isSequentia ? window.sequentia : null);
+const offeredConnectors = () => (Array.isArray(status?.walletConnectors) ? status.walletConnectors : []);
+let walletDoorP = null;
+function walletDoor() {
+  if (!walletDoorP) {
+    globalThis.SEQ_PROVIDER_SITE = { name: "Compages", choiceKey: "compages.connector", offer: offeredConnectors() };
+    walletDoorP = import("./shared/provider.js");
+  }
+  return walletDoorP;
+}
 function showWalletButtons() {
-  if (!seqWallet()) return;
+  if (!seqWallet() && !offeredConnectors().length) return;
   for (const b of document.querySelectorAll(".walletfill")) b.classList.remove("hide");
 }
-async function fillFromSeqWallet(btn) {
-  const p = seqWallet();
-  if (!p) return;
+function walletNote(btn, msg, bad) {
+  const out = $(`${btn.dataset.fill}-check`);
+  if (out) {
+    out.className = bad ? "addrcheck bad" : "addrcheck";
+    out.textContent = msg;
+  } else {
+    say(btn.dataset.fill === "unwrap-btcaddr" ? "unwrap-status" : "dep-status", msg, bad ? "err" : undefined);
+  }
+}
+function fillAddress(btn, address) {
   const input = $(btn.dataset.fill);
-  const report = (msg) => {
-    const out = $(`${btn.dataset.fill}-check`);
-    if (out) {
-      out.className = "addrcheck bad";
-      out.textContent = msg;
-    } else {
-      say(btn.dataset.fill === "unwrap-btcaddr" ? "unwrap-status" : "dep-status", msg, "err");
-    }
-  };
+  input.value = address;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+// The injected wallet, as it always filled the fields: connect, then its default address.
+async function fillFromInjected(btn, p) {
+  const conn = await p.request({ method: "connect" });
+  let address = conn?.address ?? null;
+  try {
+    const r = await p.request({ method: "getAddress", params: { confidential: false } });
+    if (r?.address) address = r.address;
+  } catch {
+    /* the address from connect is the same default address */
+  }
+  if (!address) throw new Error("it returned no address");
+  fillAddress(btn, address);
+}
+// A wallet on a phone pairs first: a code to scan, or a link on the same phone.
+async function pairPhone(btn, c) {
+  const { uri, paired } = await c.pair();
+  const { default: qrcode } = await import("./shared/vendor/qrcode.mjs");
+  const q = qrcode(0, "L");
+  q.addData(uri);
+  q.make();
+  const box = document.createElement("div");
+  box.className = "walletpair";
+  const img = document.createElement("img");
+  img.src = q.createDataURL(4, 8);
+  img.alt = "Pairing code";
+  const a = document.createElement("a");
+  a.href = uri;
+  a.textContent = "Open in the wallet on this phone";
+  box.append(img, a);
+  btn.closest(".labelrow").after(box);
+  walletNote(btn, "Scan the code with your wallet. Waiting for your wallet\u2026", false);
+  try {
+    await paired;
+  } finally {
+    box.remove();
+  }
+}
+async function fillFromConnector(btn, P, c) {
+  await P.choose(c.id);
+  if (c.id === "webwallet" && !(await c.available())) {
+    c.open();
+    walletNote(btn, "Your web wallet is opening in a new tab. Unlock it there, then press the button again.", false);
+    return;
+  }
+  if (c.id === "phone" && !c.paired()) await pairPhone(btn, c);
+  walletNote(btn, "Approve in your wallet.", false);
+  const acct = await P.connect();
+  if (!acct?.address) throw new Error("it returned no address");
+  walletNote(btn, "", false);
+  fillAddress(btn, acct.address);
+}
+async function fillFromSeqWallet(btn) {
   btn.disabled = true;
   try {
-    const conn = await p.request({ method: "connect" });
-    let address = conn?.address ?? null;
-    try {
-      const r = await p.request({ method: "getAddress", params: { confidential: false } });
-      if (r?.address) address = r.address;
-    } catch {
-      /* the address from connect is the same default address */
+    const injected = seqWallet();
+    if (injected && !offeredConnectors().includes("extension")) return await fillFromInjected(btn, injected);
+    const P = await walletDoor();
+    const conns = P.connectors();
+    if (conns.length === 1) return await fillFromConnector(btn, P, conns[0]);
+    // Several offered: the visitor chooses, under the field's label.
+    document.querySelectorAll(".walletchoices").forEach((el) => el.remove());
+    const list = document.createElement("div");
+    list.className = "walletchoices";
+    for (const c of conns) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "walletfill";
+      b.textContent = c.label;
+      b.addEventListener("click", async () => {
+        list.remove();
+        try {
+          await fillFromConnector(btn, P, c);
+        } catch (e) {
+          walletFailed(btn, e);
+        }
+      });
+      list.append(b);
     }
-    if (!address) throw new Error("it returned no address");
-    input.value = address;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    btn.closest(".labelrow").after(list);
   } catch (e) {
-    report(`Your Sequentia wallet did not share an address: ${e?.message ?? e}`);
+    walletFailed(btn, e);
   } finally {
     btn.disabled = false;
   }
+}
+function walletFailed(btn, e) {
+  const m = e?.message ?? String(e);
+  if (/rejected/.test(m)) walletNote(btn, "You declined in the wallet. Nothing was filled.", true);
+  else if (/locked/.test(m)) walletNote(btn, "Unlock your wallet, then press the button again.", true);
+  else walletNote(btn, `Your Sequentia wallet did not share an address: ${m}`, true);
 }
 
 // ---------- ethereum provider ----------
@@ -3264,6 +3348,7 @@ async function init() {
     showLeg(initialLeg());
     return;
   }
+  showWalletButtons();
   const seqLabel = String(status.seqChainLabel ?? "Sequentia").replace(/-/g, " ");
   $("net-seq").textContent = seqLabel.charAt(0).toUpperCase() + seqLabel.slice(1);
   setupCctp();
