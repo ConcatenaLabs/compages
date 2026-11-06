@@ -19,11 +19,24 @@ import { burnOnlyJson } from "./burnonly.js";
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".svg": "image/svg+xml",
   ".png": "image/png",
   ".ico": "image/x-icon",
 };
+
+// The connectors web/shared/connectors.js defines. `walletConnectors` in the
+// config names the ones the page offers, in order; the web wallet alone when unset.
+export const WALLET_CONNECTORS = ["webwallet", "extension", "phone", "local"];
+export function walletConnectors(cfg) {
+  const list = cfg.walletConnectors ?? ["webwallet"];
+  if (!Array.isArray(list)) throw new Error("walletConnectors must be a list");
+  for (const c of list) {
+    if (!WALLET_CONNECTORS.includes(c)) throw new Error(`walletConnectors: ${c} is not a connector (${WALLET_CONNECTORS.join(", ")})`);
+  }
+  return [...new Set(list)];
+}
 
 /** The /64 an IPv6 address belongs to, as "a:b:c:d::/64", or null when `ip`
  *  is not an IPv6 address this can read. The address is expanded first:
@@ -638,6 +651,9 @@ export function startApi(cfg, eth, seq, state, bridge, log) {
         }
         return send(200, {
           app: "Compages",
+          // The wallets an address field offers to fill itself from, through the
+          // connector layer in web/shared (walletConnectors in the config).
+          walletConnectors: walletConnectors(cfg),
           ethChainId: cfg.ethChainId,
           ethChainName: cfg.ethChainName,
           // The vault the page sends deposits to. `vaultAddress` stays the

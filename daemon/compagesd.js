@@ -11,7 +11,7 @@ import { State } from "./lib/state.js";
 import { Eth } from "./lib/eth.js";
 import { Sol } from "./lib/sol.js";
 import { Bridge } from "./lib/bridge.js";
-import { startApi } from "./lib/api.js";
+import { startApi, walletConnectors } from "./lib/api.js";
 import { servedSupervised } from "./lib/leaves.js";
 import { Alerts } from "./lib/alerts.js";
 import { Cctp } from "./lib/cctp.js";
@@ -19,6 +19,7 @@ import { Cctp } from "./lib/cctp.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const cfgPath = process.argv[2] ?? path.join(here, "config.json");
 const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+walletConnectors(cfg); // refuse a connector the page does not know before anything starts
 
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
