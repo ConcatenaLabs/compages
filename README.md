@@ -342,9 +342,10 @@ deposit, until an operator pays a new request of the depositor's
 stablecoins are) is held in an Arca operator's tree only in landing leaves:
 each leaf names a landing key, a P2WPKH key of its holder's own, where the
 leaf's exit pays and where the issuer's freeze follows it. A `landing-2`
-leaf pays at its own position in the exit, so two of a holder's coins can
-never share one landing; `landing-1`, which an operator makes only until
-every wallet reads `landing-2`, pays output 0. The operator says which assets
+leaf pays at its own position in the exit, so two of a holder's `landing-2`
+coins can never share one landing; `landing-1`, which an operator makes only
+until every wallet reads `landing-2`, pays output 0, which it can share with
+any coin landing at position 0. The operator says which assets
 it serves so (`info`'s `assets[].supervised`, with its `landing_allowance`),
 and which landing it makes (`info.templates.list`, `info.landing_2_only`).
 Such a deposit is paid into a landing leaf for the depositor's leaf key and

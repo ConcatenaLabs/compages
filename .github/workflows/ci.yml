@@ -26,7 +26,7 @@ env:
   # landing-2 leaves, which land at their own index) on a proof-of-stake
   # chain, which takes a 25.x node release, and the node repository's supply
   # auditor at its tag.
-  ARCA_REF: ea442bc7e4471035585be42bf05187eba2d9ca8a
+  ARCA_REF: 959b1391e07c37ae7771e9652b5aaca48b8c79bf
   SEQ_LEAF_CORE_VERSION: 25.2.2
   SEQ_LEAF_CORE_SHA256: cea11c046c599177952bdcbeacb067301e509e3e127cc516cf944d27eeac2082
   # The issuer-operated suite: an Arca operator whose supply report names
