@@ -468,8 +468,9 @@ export class LeafDeposits {
    *  pays every Sequentia fee of the bridge: when they fall below a quarter of
    *  that, the wallet is topped up to it. Only when the leaf wallet's fee
    *  asset is the bridge's own (`seqFeeAsset`); otherwise its operator funds
-   *  it. A top-up that has not confirmed yet is waited for. Every top-up is
-   *  recorded (`leafFeeTopUps`). */
+   *  it. A top-up that has not confirmed yet is waited for, and so is a
+   *  board still in the mempool, whose fee change the wallet does not count
+   *  until it confirms. Every top-up is recorded (`leafFeeTopUps`). */
   async topUpFees() {
     const boards = BigInt(this.c.feeTopUpBoards ?? 50);
     if (!boards || !this.bridge.limiter) return;
@@ -484,6 +485,13 @@ export class LeafDeposits {
       if (last) {
         const t = await this.bridge.seq.call("gettransaction", { txid: last.txid }).catch(() => null);
         if (!t || (t.confirmations ?? 0) < 1) return;
+      }
+      // A board's fee change is on the chain only once the board confirms:
+      // until then the wallet reads its fee coins short. No top-up while a
+      // board of a deposit under way waits in the mempool.
+      for (const d of Object.values(this.s.deposits ?? {}).filter((d) => LEAF_STATES.includes(d.status))) {
+        const txid = d.steps?.leafBoard?.txid;
+        if (txid && (await this.bridge.seq.node("getmempoolentry", { txid }).then(() => true, () => false))) return;
       }
       const target = BigInt(await this.bridge.limiter.feeAtoms(1000)) * boards;
       const have = holdingOf(await this.wallet.balance(), id).onchain;
