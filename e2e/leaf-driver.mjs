@@ -377,8 +377,11 @@ try {
     const c = id ? arca("leaf", "coins").find((x) => x.leaf_id === id) : null;
     return c && c.landing ? c : d?.status === "minted" ? { late: true } : null;
   }, 240_000, 200);
-  check("the bridge's board of it is a landing-2 leaf at the bridge's own landing",
-    held7.landing === leafLanding && held7.template === "landing-2",
+  // A board shows as board-1; its record names the leaf it converts into
+  // (board record format 5: landing-2).
+  const board7 = held7.leaf_id ? arca("leaf", "record", held7.leaf_id) : null;
+  check("the bridge's board of it converts into a landing-2 leaf at the bridge's own landing",
+    held7.landing === leafLanding && board7?.detail?.version === 5,
     held7.late ? "paid before the board could be read" : `${held7.leaf_id} ${held7.state}, landing ${held7.landing}, frozen ${JSON.stringify(held7.frozen)}`);
   const paid7 = await waitFor("the supervised leaf paid", async () => {
     const d = depByTx(d7.hash);
