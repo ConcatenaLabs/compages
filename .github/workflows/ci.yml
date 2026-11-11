@@ -22,10 +22,11 @@ env:
   # The mint limiter's tool: sequentia-contracts at this commit, built here.
   CONTRACTS_REF: bc0ee3ea6948aae634fc279cab863aa5a9e52f5f
   # The leaf-deposit suite: an Arca operator and wallets (ConcatenaLabs/arca
-  # at this commit, built here; one with landing-1 leaves, which a supervised
-  # asset needs) on a proof-of-stake chain, which takes a 25.x node release,
-  # and the node repository's supply auditor at its tag.
-  ARCA_REF: 401e83ae37fd2a7b160dc135c5bfd26d7fe6132b
+  # at this commit, built here; one whose wallet holds a supervised asset in
+  # landing-2 leaves, which land at their own index) on a proof-of-stake
+  # chain, which takes a 25.x node release, and the node repository's supply
+  # auditor at its tag.
+  ARCA_REF: c5501f2139bcb10fa6bc10ad150fa7566a49083c
   SEQ_LEAF_CORE_VERSION: 25.2.2
   SEQ_LEAF_CORE_SHA256: cea11c046c599177952bdcbeacb067301e509e3e127cc516cf944d27eeac2082
   # The issuer-operated suite: an Arca operator whose supply report names

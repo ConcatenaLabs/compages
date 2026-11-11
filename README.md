@@ -339,17 +339,21 @@ deposit, until an operator pays a new request of the depositor's
 (`admin.js leaf-pay`). The runbook is [`docs/leaf-deposits.md`](docs/leaf-deposits.md).
 
 **A supervised asset** (one its issuer can freeze, as the unified
-stablecoins are) is held in an Arca operator's tree only in `landing-1`
-leaves: each leaf names a landing key, a P2WPKH key of its holder's own,
-where the leaf's exit pays and where the issuer's freeze follows it. The
-operator says which assets it serves so (`info`'s `assets[].supervised`,
-with its `landing_allowance`). Such a deposit is paid into a `landing-1`
-leaf for the depositor's leaf key and the depositor's landing key, which
+stablecoins are) is held in an Arca operator's tree only in landing leaves:
+each leaf names a landing key, a P2WPKH key of its holder's own, where the
+leaf's exit pays and where the issuer's freeze follows it. A `landing-2`
+leaf pays at its own position in the exit, so two of a holder's coins can
+never share one landing; `landing-1`, which an operator makes only until
+every wallet reads `landing-2`, pays output 0. The operator says which assets
+it serves so (`info`'s `assets[].supervised`, with its `landing_allowance`),
+and which landing it makes (`info.templates.list`, `info.landing_2_only`).
+Such a deposit is paid into a landing leaf for the depositor's leaf key and
+the depositor's landing key, which
 the receive request names (`landing`, the hex of a 20-byte P2WPKH program;
 every current Arca wallet's request carries it). A request without one is
 refused at the intent, before anything is locked: the depositor asks the
 wallet for a new request. Between the board and the payment the bridge's
-own leaf wallet holds the deposit in a `landing-1` leaf at the leaf
+own leaf wallet holds the deposit in a landing leaf at the leaf
 wallet's own landing key, so the leaf wallet must be an `arca` new enough
 to have one (its `info` shows `landing_address`); until it is, intents for
 a supervised asset are refused and the start-up log says why. A freeze of
@@ -1471,7 +1475,8 @@ committee, so an Arca operator's finality holds), PostgreSQL, an Arca
 operator (`arca-signer` and `arcad` from
 [ConcatenaLabs/arca](https://github.com/ConcatenaLabs/arca)), the bridge's
 leaf wallet and a depositor's `arca` wallet (the three binaries from one
-revision of arca, one with `landing-1` leaves; the workflow pins it), then
+revision of arca, one whose wallet makes `landing-2` leaves; the workflow
+pins it), then
 checks that: an asset
 bridged on the chain is served once the operator reloads; requests for
 another operator or chain, naming an amount or another asset, or for a token
@@ -1487,7 +1492,7 @@ the intent's fallback address. It also issues a supervised stablecoin
 through the unified-asset ceremony, has the operator serve it under the
 supervised profile (its signer reading freezes from the node), refuses a
 request whose landing was stripped, and checks that a deposit arrives as a
-`landing-1` leaf landing at the depositor's own landing key, held by the
+`landing-2` leaf landing at the depositor's own landing key, held by the
 bridge at its own landing in between. With `AUDIT_SCRIPT` set to the node
 repository's `contrib/asset-supply-audit/audit.py` it also takes a reserve
 snapshot (a dry run) and checks its leaf figures. Every port is chosen free;

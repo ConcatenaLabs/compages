@@ -129,7 +129,7 @@ async function main() {
           `serving ${[...i.served.keys()].length} asset(s), ${supervised} of them supervised; board fees in ${bridge.leaves.feeAsset}; ` +
           (i.landingAddress
             ? `a supervised asset lands at its landing ${i.landingAddress}`
-            : "WARNING: its arca shows no landing_address (it predates landing-1 leaves), so a leaf intent for a supervised asset is refused until it is rebuilt at the operator's revision")
+            : "WARNING: its arca shows no landing_address (it predates landing leaves), so a leaf intent for a supervised asset is refused until it is rebuilt at the operator's revision")
       );
     } catch (e) {
       log(`WARNING: the leaf wallet cannot be read; leaf deposits wait until it can: ${e.message}`);

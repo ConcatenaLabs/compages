@@ -35,14 +35,16 @@
 //
 // A supervised asset (one whose issuer can freeze a holding by consensus
 // rule, as the bridge's unified stablecoins are) is held in the tree only in
-// `landing-1` leaves: every leaf of it names a landing key, a P2WPKH of its
+// landing leaves (`landing-2`, or `landing-1` from an operator that does not
+// make `landing-2`): every leaf of it names a landing key, a P2WPKH of its
 // holder's own, where its exit pays and where the issuer's freeze follows it.
 // The operator says which assets it serves so (`info`'s `assets[].supervised`).
 // A deposit of such an asset is paid only to a request that names the
 // depositor's landing (`landing`, which every current wallet's request
 // carries), and only through a leaf wallet that has a landing key of its own
 // (`info`'s `landing_address`): between the board and the payment the bridge
-// holds the deposit in a landing-1 leaf at its own landing.
+// holds the deposit in a landing leaf at its own landing. The leaf wallet
+// chooses the template from the operator's `info`; the bridge builds no leaf.
 
 import { execFile } from "node:child_process";
 import { satsToAmount } from "./seqrpc.js";
@@ -85,7 +87,7 @@ export function decodeRequest(text) {
 }
 
 /** Whether the operator serves an asset (its `info.assets[]` entry) under
- *  the supervised profile, which holds it in landing-1 leaves only. */
+ *  the supervised profile, which holds it in landing leaves only. */
 export function servedSupervised(served) {
   return Boolean(served?.supervised && served.supervised.landing_allowance !== undefined && served.supervised.landing_allowance !== null);
 }
@@ -100,7 +102,7 @@ export function landingProblem(req, served, mapping, info) {
       return {
         status: 503,
         message:
-          `the operator serves ${name} as a supervised asset, held in landing-1 leaves only, and the bridge's leaf wallet ` +
+          `the operator serves ${name} as a supervised asset, held in landing leaves only, and the bridge's leaf wallet ` +
           `has no landing key (its arca predates them): deposit it to a Sequentia address instead`,
       };
     }
@@ -201,7 +203,7 @@ export class LeafWallet {
       served,
       fees: i.server_info?.fees ?? null,
       // Where the wallet's coins of a supervised asset land: the wallet's
-      // landing key. An arca too old for landing-1 leaves shows none.
+      // landing key. An arca too old for landing leaves shows none.
       landingAddress: i.landing_address ?? null,
     };
     return this._info;
