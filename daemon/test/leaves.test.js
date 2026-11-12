@@ -289,6 +289,40 @@ test("the leaf wallet's fee coins are topped up from the bridge's own fee asset,
   assert.equal(sent.length, 1);
 });
 
+test("no fee top-up while a board waits in the mempool: its fee change is not counted yet", async () => {
+  const h = harness();
+  const FEE = "f".repeat(64);
+  const sent = [];
+  let pooled = true;
+  h.bridge.cfg.leafWallet.feeCheckMs = 0;
+  h.bridge.limiter = { feeAtoms: async (v) => v };
+  h.bridge.seq = {
+    node: async (m, p) => {
+      if (m === "getmempoolentry") {
+        if (pooled && p.txid === "board1") return { vsize: 400 };
+        throw new Error("Transaction not in mempool");
+      }
+      return {};
+    },
+    call: async (m, p) => {
+      if (m === "sendtoaddress") {
+        sent.push(p);
+        return `tx${sent.length}`;
+      }
+      if (m === "gettransaction") return { confirmations: 1 };
+      throw new Error(m);
+    },
+  };
+  h.data.deposits = { 1: { key: "1", status: "leaf_boarding", steps: { leafBoard: { txid: "board1" } } } };
+  // The board spent the wallet's fee coins; its change waits with it.
+  h.wallet.balance = async () => ({ sequentia_onchain: {} });
+  await h.leaves.topUpFees();
+  assert.equal(sent.length, 0, "no top-up while the board is in the mempool");
+  pooled = false;
+  await h.leaves.topUpFees();
+  assert.equal(sent.length, 1, "topped up once the board is out of the mempool and the coins are still short");
+});
+
 test("whoever binds a request first does not choose another depositor's fallback, and the request is still paid once", async () => {
   const h = harness();
   let n = 0;
