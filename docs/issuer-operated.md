@@ -138,7 +138,7 @@ escrow must cover (`liabilityAtoms`).
 
 An Arca operator does not serve a supervised asset (USDC.e, EURC.e)
 issuer-operated: its server refuses the two profiles together, since an
-issuer-operated batch is not kept in `landing-1` leaves.
+issuer-operated batch is not kept in landing leaves.
 
 ## Testing
 

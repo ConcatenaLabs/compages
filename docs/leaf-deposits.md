@@ -27,13 +27,14 @@ web page does not offer it.
   bridged asset only between a deposit's mint and its payment.
 - **Landing keys, for a supervised asset.** The operator serves an asset
   whose issuer can freeze a holding (a supervised asset: the unified
-  stablecoins are) under the supervised profile, in `landing-1` leaves only,
+  stablecoins are) under the supervised profile, in landing leaves only
+  (`landing-2`, or `landing-1` from an operator that does not make it),
   and says so in `info`'s `assets[].supervised` with its
   `landing_allowance`. Every such leaf names a landing key, a P2WPKH key of
   its holder's own, where its exit pays and where the issuer's freeze
   follows it. The depositor's request must name the depositor's landing
   (`landing`), and the leaf wallet holds the deposit between the board and
-  the payment in a `landing-1` leaf at its own landing key, which the leaf
+  the payment in a landing leaf at its own landing key, which the leaf
   wallet's `info` shows as `landing_address`. An open asset needs neither.
 - **No float.** Nothing is minted ahead of a deposit, so circulating supply
   never exceeds escrow. What the leaf wallet holds at any moment is owed to
@@ -42,7 +43,7 @@ web page does not offer it.
 ## Setting it up
 
 1. Build `arca` from `ConcatenaLabs/arca` at the revision the operator runs.
-   To pay a supervised asset that revision must have `landing-1` leaves
+   To pay a supervised asset that revision must have landing leaves
    (arca's wallet with a landing key; `.github/workflows/ci.yml` pins the
    revision the suite runs): an older `arca` shows no `landing_address`, and
    the daemon then refuses intents for every supervised asset. An existing
@@ -140,8 +141,8 @@ its height.
 
 A supervised asset changes none of this. Its leaves are minted per deposit
 like any other, its supply is read from the chain, its escrow from the vault,
-and the reconciliation adds up the same way; a coin held in a `landing-1`
-leaf is counted where any leaf is. An issuer-operated asset is another
+and the reconciliation adds up the same way; a coin held in a landing leaf
+is counted where any leaf is. An issuer-operated asset is another
 matter, which this page does not cover: its units live under burn-only
 sweeps, counted from the operator's `issuer_supply.in_batches`, and holders'
 fees and abandoned coins in it are burned rather than kept.

@@ -350,7 +350,7 @@ test("whoever binds a request first does not choose another depositor's fallback
   assert.match(d2.leaf.fallbackReason, /already used by 1/);
 });
 
-// ---- a supervised asset: its leaves are landing-1 leaves only
+// ---- a supervised asset: its leaves are landing leaves only
 
 const LANDING = "5".repeat(40);
 const SUPERVISED = { asset: ASSET, min_leaf: "1000", supervised: { landing_allowance: "480" } };

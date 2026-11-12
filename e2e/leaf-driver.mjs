@@ -17,7 +17,7 @@
 //  7. a supervised asset (issued so by the bridge's unified-asset ceremony,
 //     served by the operator under the supervised profile): a request with
 //     its landing stripped is refused at the intent, and a deposit for a
-//     fresh request arrives as a landing-1 leaf landing at the depositor's
+//     fresh request arrives as a landing-2 leaf landing at the depositor's
 //     own landing key, held by the bridge at its own landing in between.
 
 import { ethers } from "ethers";
@@ -339,7 +339,7 @@ try {
   await reconciles("after the fallback delivery", A, { owedAtoms: 0, leafWalletAtoms: 0 });
 
   // ---------------- 7. a supervised asset
-  console.log(`\n-- ${at()} 7. a supervised asset: paid only into a landing-1 leaf at the depositor's landing`);
+  console.log(`\n-- ${at()} 7. a supervised asset: paid only into a landing-2 leaf at the depositor's landing`);
   const S = await waitFor("the supervised asset issued and its token in its mint limiter", async () => {
     const m = (await api("assets")).body.find((x) => x.unified && x.symbol === "SUSD");
     return m?.mintLimiter?.coin ? m : null;
@@ -369,7 +369,7 @@ try {
     `${it7.seqAddress}, landing ${it7.landing}`);
   const d7 = await depositOf(susd, 30_000_000n, it7.seqAddress);
   const SATS7 = 30_000_000n; // precision 6: one atom a token unit
-  // The bridge holds the deposit in a landing-1 leaf at its own landing
+  // The bridge holds the deposit in a landing-2 leaf at its own landing
   // between the board and the payment.
   const held7 = await waitFor("the bridge's board of the deposit", async () => {
     const d = depByTx(d7.hash);
@@ -377,7 +377,11 @@ try {
     const c = id ? arca("leaf", "coins").find((x) => x.leaf_id === id) : null;
     return c && c.landing ? c : d?.status === "minted" ? { late: true } : null;
   }, 240_000, 200);
-  check("the bridge's board of it is a landing-1 leaf at the bridge's own landing", held7.landing === leafLanding,
+  // A board shows as board-1; its record names the leaf it converts into
+  // (board record format 5: landing-2).
+  const board7 = held7.leaf_id ? arca("leaf", "record", held7.leaf_id) : null;
+  check("the bridge's board of it converts into a landing-2 leaf at the bridge's own landing",
+    held7.landing === leafLanding && board7?.detail?.version === 5,
     held7.late ? "paid before the board could be read" : `${held7.leaf_id} ${held7.state}, landing ${held7.landing}, frozen ${JSON.stringify(held7.frozen)}`);
   const paid7 = await waitFor("the supervised leaf paid", async () => {
     const d = depByTx(d7.hash);
@@ -388,8 +392,9 @@ try {
   arca("alice", "sync");
   const coinsS = arca("alice", "coins").filter((c) => c.asset === S.assetId);
   fs.writeFileSync(`${RUN}/alice-supervised-coins.json`, JSON.stringify(coinsS, null, 1));
-  check("alice's coin is a landing-1 leaf landing at her own landing key",
+  check("alice's coin is a landing-2 leaf landing at her own landing key",
     coinsS.length === 1 && coinsS[0].state === "live" && coinsS[0].value === paid7.leaf.paid.value && coinsS[0].landing === aliceLanding &&
+      coinsS[0].template === "landing-2" &&
       coinsS[0].frozen?.frozen === false,
     `${coinsS.map((c) => `${c.value} ${c.state} landing ${c.landing} frozen ${JSON.stringify(c.frozen)}`).join("; ")}; info.landing_address ${aliceLanding}`);
   await reconciles("after the supervised payment", S.assetId, { owedAtoms: 0, leafWalletAtoms: 0, paidAtoms: paid7.leaf.paid.value });
